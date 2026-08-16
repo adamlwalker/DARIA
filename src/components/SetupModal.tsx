@@ -30,25 +30,25 @@ interface Pick {
 }
 
 /**
- * Chaty's own fine-tune — offered in every tier (small + specialised for the
- * on-device web-design workflow, with baked-in Chaty identity and grounding).
+ * Design-oriented 4B fine-tune — offered in every tier (small + specialised
+ * for the on-device web-design workflow, with grounded citations).
  */
 const CHATY_PICK: Pick = {
-  family: "Chaty",
-  label: "Chaty Design 4B",
+  family: "Design",
+  label: "Design 4B",
   quant: "Q4_K_M",
   approxGb: 2.7,
   repos: ["stevenpr/chaty-qwen3.5-4b-design-GGUF"],
   blurbZh:
-    "Chaty 专属微调（基于 Qwen3.5-4B）：单文件网页设计更强、输出更精简，并内置 Chaty 身份与引用规范，轻量设备也跑得动。",
+    "面向单文件网页设计的 Qwen3.5-4B 微调：输出更精简，并带引用规范，轻量设备也跑得动。",
   blurbEn:
-    "Chaty's own fine-tune (Qwen3.5-4B): stronger, leaner single-file web design, with built-in Chaty identity & grounded citations — runs on light machines.",
+    "A Qwen3.5-4B fine-tune for leaner single-file web design, with grounded citations — runs on light machines.",
 };
 
 /**
  * Curated picks per memory budget. Sizes are the Q4_K_M weights; the budget
  * additionally needs room for the KV cache, so tiers are conservative.
- * Every tier also offers the Chaty fine-tune as a specialised option.
+ * Every tier also offers the Design 4B fine-tune as a specialised option.
  */
 function recommend(budgetGb: number): Pick[] {
   if (budgetGb >= 30) {

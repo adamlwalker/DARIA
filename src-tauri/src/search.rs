@@ -1,5 +1,5 @@
 //! Web search + page-content fetching via DuckDuckGo's HTML endpoint (no key).
-//! Grounds answers when the user enables "联网搜索" — like ChatGPT, we don't
+//! Grounds answers when the user enables web search — like ChatGPT, we don't
 //! just hand the model link snippets, we fetch the top pages' actual text.
 
 use std::time::Duration;
@@ -641,21 +641,24 @@ fn extract_title(html: &str) -> Option<String> {
 pub async fn fetch_url(url: String) -> Result<PageContent, String> {
     let url = url.trim().to_string();
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err("无效的链接".into());
+        return Err(crate::agent::tr("无效的链接", "invalid URL"));
     }
     let client = build_client()?;
     let resp = client
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("请求失败: {e}"))?;
+        .map_err(|e| trf!("请求失败: {}", "request failed: {}", e))?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
     let html = resp.text().await.map_err(|e| e.to_string())?;
     let text = extract_main_text(&html, 6000);
     if text.chars().count() < 40 {
-        return Err("该网页正文为空（可能是动态渲染页面）".into());
+        return Err(crate::agent::tr(
+            "该网页正文为空（可能是动态渲染页面）",
+            "this page has no extractable text (it may be dynamically rendered)",
+        ));
     }
     let title = extract_title(&html).unwrap_or_else(|| url.clone());
     Ok(PageContent { title, url, text })

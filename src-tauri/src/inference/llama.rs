@@ -33,6 +33,133 @@ use tauri::ipc::Channel;
 
 use super::{ChatMessage, GenParams, GenRequest, GenStats, InferenceBackend, ModelInfo, Role, StreamEvent};
 
+// ── GPU crash guard (issue #5) ──────────────────────────────────────────────
+// A broken Vulkan driver aborts the whole process DURING model load — no
+// Result to catch, the window just vanishes. The guard turns that one-shot
+// death into a persistent CPU fallback: an `inflight` marker is written just
+// before the load and removed when load() returns (Ok or Err — a clean error
+// is not a crash); if the marker is still there at the NEXT startup, the
+// previous load killed the process, so GPU offload gets blocked for good
+// (GGML_VK_VISIBLE_DEVICES="" → the Vulkan backend registers zero devices)
+// and the UI is told to say so.
+
+const GPU_INFLIGHT: &str = "llama-load.inflight";
+const GPU_BLOCKED: &str = "llama-gpu-blocked";
+
+use crate::errlog::chaty_data_dir;
+
+/// Pure state machine over a base dir (testable): promote a stale inflight
+/// marker to the persistent block, and report whether GPU must stay off.
+/// PURE means no logging — the first version appended to the REAL error log
+/// from in here, so every `cargo test` run stamped a false "gpu crashed"
+/// entry into the dev machine's user log (the errlog-pollution sin, third
+/// occurrence). The production caller logs; the state machine doesn't.
+fn gpu_guard_check(base: &Path) -> bool {
+    let inflight = base.join(GPU_INFLIGHT);
+    let blocked = base.join(GPU_BLOCKED);
+    if inflight.exists() {
+        let _ = std::fs::write(&blocked, "previous model load crashed the process\n");
+        let _ = std::fs::remove_file(&inflight);
+    }
+    blocked.exists()
+}
+
+/// Known bad-conversion tells, per model family. Two cases so far:
+/// * MiniCPM5 is plain llama-arch BY DESIGN — its tell is the tokenizer:
+///   official conversions declare `tokenizer.ggml.pre = "minicpm5"`, while
+///   files made with pre-MiniCPM5 convert scripts fall back to "llama-bpe"
+///   and degenerate (the owner's two downloads: deterministic whitespace on
+///   zh prompts, token salad on en — both with a textbook-perfect prompt).
+/// * MiniCPM 1–3 DO need their own architecture (µP scalers live in the
+///   arch handling), so those exported as plain "llama" are broken.
+fn conversion_suspect(name: &str, arch: &str, tokenizer_pre: &str) -> bool {
+    let _ = tokenizer_pre;
+    let n = name.to_lowercase();
+    // MiniCPM5: even the OFFICIAL GGUF (llama arch, llama-bpe pre) degenerates
+    // on the llama.cpp this build bundles — upstream b10330 runs the same file
+    // fine, so the support gap is in the engine version, not any one file.
+    // Flag the whole family until the bundled engine catches up; the MLX
+    // build runs perfectly through the sidecar meanwhile.
+    if n.contains("minicpm5") {
+        return true;
+    }
+    // MiniCPM 1-3 need their own arch (µP scalers); plain-llama exports are broken.
+    if n.contains("minicpm") {
+        return arch == "llama";
+    }
+    false
+}
+
+/// Call once at process start, BEFORE any llama backend init. Returns true
+/// when GPU offload was blocked because a previous load crashed the process.
+/// Windows-only in effect: the crash class is the Vulkan driver, macOS runs
+/// Metal (which ignores the env), and an active guard off-Windows can only
+/// produce FALSE "gpu crashed" warnings — a cargo-test on the dev Mac once
+/// raced the real app into exactly that.
+pub fn apply_gpu_crash_guard() -> bool {
+    #[cfg(windows)]
+    {
+        let base = chaty_data_dir();
+        let promoted = base.join(GPU_INFLIGHT).exists();
+        let blocked = gpu_guard_check(&base);
+        if promoted && blocked {
+            crate::errlog::append_error(
+                "gpu-crash-guard",
+                "previous model load crashed the process (likely GPU driver abort, issue #5 class); GPU offload disabled — running CPU-only from now on",
+            );
+        }
+        if blocked {
+            // Vulkan backend: zero visible devices = never touches the
+            // driver's allocation/pipeline paths again.
+            std::env::set_var("GGML_VK_VISIBLE_DEVICES", "");
+        }
+        return blocked;
+    }
+    #[cfg(not(windows))]
+    {
+        // Hygiene only: a stale inflight marker (crashed dev build, killed
+        // test run) is removed without promoting it to a block.
+        let _ = std::fs::remove_file(chaty_data_dir().join(GPU_INFLIGHT));
+        false
+    }
+}
+
+/// Whether the guard is currently blocking GPU offload (for the load reply).
+pub fn gpu_crash_blocked() -> bool {
+    #[cfg(windows)]
+    {
+        return chaty_data_dir().join(GPU_BLOCKED).exists();
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+/// Removes the marker when load() returns — normally OR with an error. Only
+/// a process death leaves it behind, which is exactly the signal we want.
+/// Armed on Windows only (see apply_gpu_crash_guard).
+struct LoadGuard(Option<std::path::PathBuf>);
+impl LoadGuard {
+    fn arm_at(base: &Path) -> Self {
+        let p = base.join(GPU_INFLIGHT);
+        let _ = std::fs::write(&p, "loading\n");
+        Self(Some(p))
+    }
+    fn arm() -> Self {
+        if cfg!(windows) {
+            Self::arm_at(&chaty_data_dir())
+        } else {
+            Self(None)
+        }
+    }
+}
+impl Drop for LoadGuard {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 /// Process-wide llama.cpp backend. It may only be initialized once.
 static LLAMA_BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
 static INIT_LOCK: Mutex<()> = Mutex::new(());
@@ -244,6 +371,10 @@ impl LlamaEngine {
     /// `gpu_pref`: `None`/negative = auto‑tune by VRAM, `Some(0)` = force CPU,
     /// `Some(n>0)` = offload exactly `n` layers.
     pub fn load(path: &str, gpu_pref: Option<i32>, n_ctx_pref: Option<u32>) -> Result<(Self, ModelInfo)> {
+        // Armed for the whole load: if the process dies in here (Vulkan
+        // driver abort — issue #5), the marker survives and the next start
+        // falls back to CPU instead of dying again.
+        let _crash_guard = LoadGuard::arm();
         let backend = llama_backend()?;
         if !Path::new(path).exists() {
             bail!("model file not found: {path}");
@@ -387,12 +518,26 @@ impl LlamaEngine {
         if let Some(err) = &mtmd_err {
             eprintln!("mmproj load failed (vision disabled): {err}");
         }
-        let warning = if oom_fallback {
+        let warning = if gpu_crash_blocked() {
+            // A previous load crashed the process (issue #5: broken Vulkan
+            // driver aborts mid-load) — this run is CPU-only by the guard.
+            Some("gpu-crash-cpu".to_string())
+        } else if oom_fallback {
             Some("gpu-oom".to_string())
         } else if mtmd_err.is_some() {
             Some("mmproj-failed".to_string())
         } else if n_ctx < n_ctx_wanted {
             Some("ctx-clamped".to_string())
+        } else if conversion_suspect(
+            &format!(
+                "{} {}",
+                Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or(""),
+                model.meta_val_str("general.name").unwrap_or_default()
+            ),
+            &model.meta_val_str("general.architecture").unwrap_or_default(),
+            &model.meta_val_str("tokenizer.ggml.pre").unwrap_or_default(),
+        ) {
+            Some("conversion-suspect".to_string())
         } else {
             None
         };
@@ -422,7 +567,7 @@ impl LlamaEngine {
         // Qwen3.5/3.6 (arch "qwen35*"/"qwen36*") use the <think> paradigm with
         // no soft switch — the architecture field is authoritative over
         // template text, which community finetunes frequently customize.
-        let is_qwen35plus = arch_lc.starts_with("qwen35") || arch_lc.starts_with("qwen36");
+        let is_qwen35plus = is_qwen3_5_plus_arch(&arch_lc);
         let supports_thinking = is_qwen35plus
             || template_lc.contains("think")
             || template_lc.contains("reasoning")
@@ -466,6 +611,7 @@ impl LlamaEngine {
             .and_then(|s| s.trim().parse::<u32>().ok())
             .map(|ft| quant_name(ft).to_string());
 
+        let effort_levels = effort_levels_of(template.as_deref().unwrap_or(""));
         let info = ModelInfo {
             name,
             path: path.to_string(),
@@ -485,6 +631,7 @@ impl LlamaEngine {
             has_chat_template: template.is_some(),
             supports_thinking,
             think_switch,
+            effort_levels,
             supports_tools,
             multimodal,
             vision_ready,
@@ -719,6 +866,17 @@ fn run_turn(
     } else {
         (build_prompt(model, &req.messages, req.params.think)?, String::new())
     };
+    // Native reasoning-effort rung (Qwen3.8). The template rendered with
+    // llama.cpp's default kwargs already carries the `xhigh` sentence, so a
+    // different rung is a verbatim swap. BOTH renders get it: the body is the
+    // media-cache anchor and must stay a prefix of the full prompt.
+    let (prompt, prompt_body) = match req.params.effort.as_deref() {
+        Some(level) if req.params.think != Some(false) => (
+            apply_effort(&prompt, level),
+            if prompt_body.is_empty() { prompt_body } else { apply_effort(&prompt_body, level) },
+        ),
+        _ => (prompt, prompt_body),
+    };
     // Qwen3.5/3.6-style templates PRE-OPEN the reasoning block: the prompt
     // ends with "<think>\n" and the model starts mid-reasoning, so the UI
     // would never see an opening tag. Emit a synthetic one so the stream is
@@ -928,6 +1086,20 @@ fn run_turn(
         }
 
         n_decoded += 1;
+        // ── Degenerate-output watchdog ── a model that has produced 32
+        // tokens of pure whitespace is not thinking, it is broken (the
+        // MiniCPM5-as-llama case: a GGUF converted under the wrong
+        // architecture loses its embed/logit scalers and deterministically
+        // emits spaces until the token cap). Say so instead of streaming a
+        // silent screenful of nothing — the user reads "no answer", when
+        // the truth is "this model file is a bad conversion".
+        if n_decoded == 32 && out.trim().is_empty() {
+            sink.emit(StreamEvent::Token {
+                text: "⚠️ 模型输出退化(连续空白),已中止。该模型文件很可能转换损坏(常见:预分词器或架构元数据声明错误,如 MiniCPM5 被标成 llama-bpe 预分词)。请改用该模型的官方 GGUF 或 MLX 版本。\n(Model output degenerated into pure whitespace — aborted. The file is likely a broken conversion — commonly a wrong tokenizer-pre or architecture declaration. Use the model's official GGUF or MLX build.)".to_string(),
+            })?;
+            stop_reason = "degenerate";
+            break;
+        }
         // max_tokens == 0 means "no per-reply cap" (the context window still bounds us).
         if req.params.max_tokens > 0 && n_decoded >= req.params.max_tokens {
             stop_reason = "length";
@@ -1376,10 +1548,7 @@ fn build_prompt_pair(
     // even when a finetune ships a legacy/custom template without the markers.
     let qwen35plus = model
         .meta_val_str("general.architecture")
-        .map(|a| {
-            let a = a.to_lowercase();
-            a.starts_with("qwen35") || a.starts_with("qwen36")
-        })
+        .map(|a| is_qwen3_5_plus_arch(&a.to_lowercase()))
         .unwrap_or(false);
     let template_uses_think = qwen35plus
         || model
@@ -1430,6 +1599,61 @@ fn build_prompt_pair(
     // (true for every sane template; guard against odd ones).
     let body = if prompt.starts_with(&body) { body } else { String::new() };
     Ok((prompt, body))
+}
+
+/// Qwen 3.5 and everything after it (3.6, 3.8, …) share one paradigm: no
+/// `/no_think` soft switch, a pre-opened `<think>` block. Parse the minor
+/// version out of the GGUF arch string instead of listing each release —
+/// `qwen35`, `qwen36`, `qwen38` all qualify, `qwen3`/`qwen3moe` do not.
+pub(crate) fn is_qwen3_5_plus_arch(arch_lc: &str) -> bool {
+    let Some(rest) = arch_lc.strip_prefix("qwen3") else { return false };
+    match rest.chars().next() {
+        Some(d) if d.is_ascii_digit() => d >= '5',
+        _ => false,
+    }
+}
+
+/// The three sentences Qwen3.8's chat template injects for its
+/// `reasoning_effort` ladder, verbatim from the official template. `medium`
+/// deliberately injects nothing — it is the neutral baseline.
+pub(crate) const EFFORT_XHIGH: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+pub(crate) const EFFORT_LOW: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
+
+/// The ladder a template offers, weakest first — detected from the template
+/// text, never from the model name (finetunes rename freely, and a template
+/// that takes the kwarg is exactly the set of models that honour it).
+pub(crate) fn effort_levels_of(template: &str) -> Vec<String> {
+    if !template.contains("reasoning_effort") {
+        return Vec::new();
+    }
+    ["low", "medium", "xhigh"]
+        .iter()
+        .filter(|lvl| template.contains(&format!("'{lvl}'")) || template.contains(&format!("\"{lvl}\"")))
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// llama.cpp renders the chat template with DEFAULT kwargs, so a thinking
+/// Qwen3.8 prompt already carries the `xhigh` sentence. Requesting another
+/// rung is therefore a verbatim substitution on the rendered prompt — the
+/// result is byte-identical to what the official template produces for that
+/// rung (`medium` = the sentence removed, its empty-instruction branch).
+/// Anything unexpected (finetuned template, fallback renderer that never
+/// emitted the sentence) leaves the prompt untouched.
+pub(crate) fn apply_effort(prompt: &str, effort: &str) -> String {
+    if !prompt.contains(EFFORT_XHIGH) {
+        return prompt.to_string();
+    }
+    match effort {
+        "xhigh" => prompt.to_string(),
+        "low" => prompt.replace(EFFORT_XHIGH, EFFORT_LOW),
+        // The template emits `instructions + '\n\n'` before the system body,
+        // or a system block holding only the sentence — drop both shapes.
+        "medium" => prompt
+            .replace(&format!("<|im_start|>system\n{EFFORT_XHIGH}<|im_end|>\n"), "")
+            .replace(&format!("{EFFORT_XHIGH}\n\n"), ""),
+        _ => prompt.to_string(),
+    }
 }
 
 /// Gemma 4 uses `<|turn>role\n…<turn|>` turn delimiters (the template string
@@ -1804,7 +2028,113 @@ fn build_sampler(params: &GenParams) -> LlamaSampler {
 
 #[cfg(test)]
 mod tests {
+
+    /// The Qwen3.5+ paradigm test parses the minor version instead of listing
+    /// releases — 3.8 must qualify the day it ships, `qwen3`/`qwen3moe` must
+    /// not (they still use the `/no_think` soft switch).
+    #[test]
+    fn qwen3_family_predicate_reads_the_minor_version() {
+        for a in ["qwen35", "qwen35moe", "qwen36", "qwen38", "qwen39moe"] {
+            assert!(super::is_qwen3_5_plus_arch(a), "{a} should be 3.5+");
+        }
+        for a in ["qwen3", "qwen3moe", "qwen2", "qwen34", "llama", "qwen"] {
+            assert!(!super::is_qwen3_5_plus_arch(a), "{a} should NOT be 3.5+");
+        }
+    }
+
+    /// The effort ladder is detected from the template text (never the model
+    /// name), and a rung request rewrites the rendered prompt to exactly what
+    /// the official template emits for that rung.
+    #[test]
+    fn reasoning_effort_ladder_detect_and_apply() {
+        let tmpl = "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}\
+                    {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}";
+        assert_eq!(super::effort_levels_of(tmpl), vec!["low", "medium", "xhigh"]);
+        // Templates without the kwarg have no ladder — the UI keeps on/off.
+        assert!(super::effort_levels_of("{% if enable_thinking %}<think>{% endif %}").is_empty());
+
+        // A rendered prompt as llama.cpp produces it (default kwargs ⇒ xhigh).
+        let rendered = format!(
+            "<|im_start|>system\n{}\n\nYou are helpful.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n",
+            super::EFFORT_XHIGH
+        );
+        // xhigh is what the template already rendered — byte-identical no-op.
+        assert_eq!(super::apply_effort(&rendered, "xhigh"), rendered);
+        // low swaps the sentence, keeping everything else identical.
+        let low = super::apply_effort(&rendered, "low");
+        assert!(low.contains(super::EFFORT_LOW), "{low}");
+        assert!(!low.contains(super::EFFORT_XHIGH));
+        assert!(low.contains("You are helpful."));
+        assert_eq!(low.matches("<|im_start|>system").count(), 1);
+        // medium is the template's empty-instruction branch: sentence gone,
+        // system body intact.
+        let med = super::apply_effort(&rendered, "medium");
+        assert!(!med.contains("Reasoning effort is set to"), "{med}");
+        assert!(med.contains("<|im_start|>system\nYou are helpful.<|im_end|>"), "{med}");
+        // A system block holding ONLY the sentence disappears entirely.
+        let only = format!(
+            "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n",
+            super::EFFORT_XHIGH
+        );
+        assert_eq!(
+            super::apply_effort(&only, "medium"),
+            "<|im_start|>user\nhi<|im_end|>\n"
+        );
+        // Unknown rungs and prompts the sentence never reached are untouched.
+        assert_eq!(super::apply_effort(&rendered, "bogus"), rendered);
+        assert_eq!(super::apply_effort("plain prompt", "low"), "plain prompt");
+    }
+
     use super::*;
+
+    /// The crash-guard state machine (issue #5): a leftover inflight marker
+    /// means the previous load killed the process → promote it to the
+    /// persistent block; a clean dir stays unblocked; the block persists.
+    /// Broken conversions must be flagged; official files and ordinary
+    /// llama models must not. MiniCPM5's tell is the pre-tokenizer (its
+    /// llama arch is legitimate); MiniCPM 1–3's tell is the arch itself.
+    #[test]
+    fn conversion_suspect_flags_wrong_converter() {
+        // MiniCPM5 GGUFs (official included) degenerate on the bundled
+        // engine — the whole family is flagged until the engine catches up.
+        assert!(conversion_suspect("MiniCPM5-1B-F16.gguf MiniCPM5 1B", "llama", "llama-bpe"));
+        assert!(conversion_suspect("MiniCPM5-1B-F16.gguf MiniCPM5 1B", "llama", "minicpm5"));
+        // Older MiniCPM families need their own arch.
+        assert!(conversion_suspect("minicpm-2b.Q4.gguf ", "llama", "llama-bpe"));
+        assert!(!conversion_suspect("MiniCPM3-4B.gguf MiniCPM3", "minicpm3", "minicpm3"));
+        // Ordinary models never flag.
+        assert!(!conversion_suspect("Llama-3-8B.gguf Meta Llama 3", "llama", "llama-bpe"));
+        assert!(!conversion_suspect("Qwen3.5-0.8B.gguf Qwen", "qwen3", "qwen2"));
+    }
+
+    #[test]
+    fn gpu_crash_guard_state_machine() {
+        let base = std::env::temp_dir().join(format!("chaty-gpu-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        assert!(!gpu_guard_check(&base), "clean dir must not block");
+        std::fs::write(base.join(GPU_INFLIGHT), "loading").unwrap();
+        assert!(gpu_guard_check(&base), "stale inflight must block");
+        assert!(!base.join(GPU_INFLIGHT).exists(), "inflight must be consumed");
+        assert!(base.join(GPU_BLOCKED).exists(), "block must persist");
+        assert!(gpu_guard_check(&base), "block persists across restarts");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// LoadGuard removes its marker on drop — Ok AND Err paths both clean
+    /// up; only a process death leaves it behind. Tested against a TEMP dir:
+    /// the first version armed the REAL app-data dir and raced the running
+    /// app into a false gpu-blocked promotion on the dev machine.
+    #[test]
+    fn load_guard_cleans_up_on_drop() {
+        let base = std::env::temp_dir().join(format!("chaty-loadguard-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let g = LoadGuard::arm_at(&base);
+        let p = g.0.clone().unwrap();
+        assert!(p.exists());
+        drop(g);
+        assert!(!p.exists());
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     #[test]
     fn strips_a_single_channel_span() {
@@ -2085,7 +2415,7 @@ mod agent_e2e {
         }
     }
 
-    const SYS: &str = r#"你是 Chaty 的编程智能体,在工作区目录中完成编码任务。工作区根目录:{WS}
+    const SYS: &str = r#"你是 DARIA 的编程智能体,在工作区目录中完成编码任务。工作区根目录:{WS}
 
 可用工具(路径相对工作区,越界会被拒绝):
 - read_file: {"path": string}
@@ -2104,7 +2434,7 @@ mod agent_e2e {
     /// Richer prompt that documents the two meta-tools (update_plan / ask_user),
     /// mirroring src/lib/agentLoop.ts. Used to verify the real model emits them
     /// as valid JSON that the parser + loop handle correctly.
-    const SYS_META: &str = r#"你是 Chaty 的编程智能体,在工作区目录中完成编码任务。工作区根目录:{WS}
+    const SYS_META: &str = r#"你是 DARIA 的编程智能体,在工作区目录中完成编码任务。工作区根目录:{WS}
 
 可用工具(路径相对工作区,越界会被拒绝):
 - read_file: {"path": string}
@@ -2126,7 +2456,7 @@ mod agent_e2e {
 
     /// Prompt documenting the code-editing tools (merged edit_file / outline),
     /// mirroring src/lib/agentLoop.ts.
-    const SYS_CODE: &str = r#"你是 Chaty 的编程智能体,在工作区目录中完成编码任务。工作区根目录:{WS}
+    const SYS_CODE: &str = r#"你是 DARIA 的编程智能体,在工作区目录中完成编码任务。工作区根目录:{WS}
 
 可用工具(路径相对工作区,越界会被拒绝):
 - read_file: {"path": string, "offset"?: number, "limit"?: number}
@@ -2359,7 +2689,7 @@ if __name__ == "__main__":
     }
 
     /// Prompt documenting the web tools, mirroring src/lib/agentLoop.ts.
-    const SYS_WEB: &str = r#"你是 Chaty 的编程智能体,在工作区目录中完成任务。工作区根目录:{WS}
+    const SYS_WEB: &str = r#"你是 DARIA 的编程智能体,在工作区目录中完成任务。工作区根目录:{WS}
 
 可用工具(路径相对工作区,越界会被拒绝):
 - read_file: {"path": string}
@@ -5100,7 +5430,7 @@ mod real_scenarios_e2e {
     // it just measures this copy.
     fn systemPrompt_for_probe() -> String {
         // A faithful condensation of the shipping browser+web guidance.
-        "你是 Chaty 的浏览器/网页自动化助手,帮用户在真实网页上完成任务。每步只输出一行 <tool_call>{\"name\":..,\"arguments\":{..}}</tool_call> 然后停止,系统会用 <tool_result> 回你。\n\
+        "你是 DARIA 的浏览器/网页自动化助手,帮用户在真实网页上完成任务。每步只输出一行 <tool_call>{\"name\":..,\"arguments\":{..}}</tool_call> 然后停止,系统会用 <tool_result> 回你。\n\
          工具:\n\
          - web_search {query} / web_fetch {url}:联网搜索 / 抓取网址正文。**纯查资料、读文章、找一个事实,优先用它们**(比开浏览器快得多);拿到答案就直接回答,别再开浏览器重复核实。\n\
          - browser_navigate {url}:打开页面,返回页面全部可见文字+可交互元素。\n\

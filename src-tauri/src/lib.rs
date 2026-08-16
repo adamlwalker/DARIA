@@ -13,12 +13,14 @@ pub mod download;
 pub mod gpu;
 pub mod http;
 pub mod inference;
+pub mod errlog;
 pub mod mcp;
 pub mod ocr;
 pub mod search;
 mod state;
 mod store;
 pub mod update;
+pub mod edge_tts;
 pub mod voice;
 pub mod webx;
 
@@ -68,6 +70,20 @@ fn toggle_main_window(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Panics land in the user-attachable error log from the first instant.
+    crate::errlog::install_panic_hook();
+    // Native crashes kill the process before any hook — on macOS, surface
+    // the OS crash reports left behind by the previous run.
+    #[cfg(target_os = "macos")]
+    crate::errlog::sweep_native_crash_reports();
+    // Browsers whose Chaty died without destructors (the exit handler
+    // `_exit()`s, crashes, killed bench bridges) keep running headless —
+    // reap them before this run launches its own.
+    crate::browser::sweep_orphan_browsers();
+    // GPU crash guard: if the previous model load took the whole process
+    // down (broken Vulkan driver aborts mid-load), block GPU offload for
+    // this run BEFORE any llama/ggml init touches the driver.
+    let _gpu_blocked = crate::inference::llama::apply_gpu_crash_guard();
     // ggml's Metal backend keeps every weight buffer in an MTLResidencySet
     // when built against the macOS 15+ SDK, which shows up as a wired-memory
     // balloon the size of the model (and froze machines on big models with
@@ -174,13 +190,13 @@ pub fn run() {
 
             // ---- system tray (labels default to English; the UI syncs the
             // language via `set_tray_language` on startup) ----
-            let show_i = MenuItem::with_id(app, "show", "Show Chaty", true, None::<&str>)?;
+            let show_i = MenuItem::with_id(app, "show", "Show DARIA", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
             if let Some(icon) = app.default_window_icon().cloned() {
                 TrayIconBuilder::with_id("main-tray")
                     .icon(icon)
-                    .tooltip("Chaty")
+                    .tooltip("DARIA")
                     .menu(&menu)
                     .show_menu_on_left_click(false)
                     .on_menu_event(|app, event| match event.id.as_ref() {
@@ -294,6 +310,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::load_model,
+            errlog::log_app_error,
+            errlog::open_error_log,
             commands::eject_model,
             commands::get_model,
             commands::get_hardware_info,
@@ -315,6 +333,8 @@ pub fn run() {
             commands::open_models_dir,
             commands::open_data_dir,
             commands::open_html_report,
+            commands::canvas_session_save,
+            commands::canvas_session_load,
             commands::open_external,
             commands::set_ui_zoom,
             commands::set_tray_language,
@@ -325,6 +345,8 @@ pub fn run() {
             commands::save_file,
             commands::transcribe,
             commands::synthesize,
+            commands::list_edge_voices,
+            commands::synthesize_edge,
             voice::request_mic_permission,
             mic::mic_start,
             mic::mic_level,

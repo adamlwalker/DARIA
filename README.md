@@ -2,30 +2,36 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-<img src="icon.png" width="88" height="88" alt="Chaty" />
+<img src="logo.png" width="128" alt="D.A.R.I.A." />
 
-# Chaty
+# D.A.R.I.A.
 
-### Private, on-device AI — your models, your data, your machine.
+### Discrete AI for Reasoning, Interaction &amp; Automation
 
-Chaty runs open LLMs **100% offline** in a polished desktop app.
+Private, on-device AI — your models, your data, your machine.
+DARIA runs open LLMs **100% offline** in a polished desktop app.
 No account, no cloud, no telemetry — with a local coding agent, a document
 knowledge base, Deep Research, and hands-free voice built right in.
 
-[![Latest release](https://img.shields.io/github/v/release/Fangyuan025/Chaty?label=release&color=19c37d)](../../releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/Fangyuan025/Chaty/total?color=8a63d2)](../../releases)
-[![CI](https://img.shields.io/github/actions/workflow/status/Fangyuan025/Chaty/ci.yml?branch=main&label=CI)](../../actions)
+The name is an acronym for **Discrete AI for Reasoning, Interaction &amp; Automation**:
+discrete as in local, contained, and not phoned home.
+
+[![Latest release](https://img.shields.io/github/v/release/adamlwalker/DARIA?label=release&color=19c37d)](../../releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/adamlwalker/DARIA/total?color=8a63d2)](../../releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/adamlwalker/DARIA/ci.yml?branch=main&label=CI)](../../actions)
 [![Windows · Vulkan](https://img.shields.io/badge/Windows-Vulkan-0078D6?logo=windows&logoColor=white)](../../releases)
 [![macOS · Metal + MLX](https://img.shields.io/badge/macOS-Metal_%2B_MLX-000000?logo=apple&logoColor=white)](../../releases)
-[![100% offline](https://img.shields.io/badge/100%25-offline-19c37d)](https://chaty.ca)
+[![100% offline](https://img.shields.io/badge/100%25-offline-19c37d)](#)
 [![Rust + Tauri 2](https://img.shields.io/badge/Rust_+_Tauri_2-CE412B?logo=rust&logoColor=white)](#architecture)
 [![License: MIT](https://img.shields.io/badge/License-MIT-444)](LICENSE)
 
-[**↓ Download**](../../releases) · [**Website**](https://chaty.ca) · [**Docs**](https://chaty.ca/docs.html) · [**Chaty model on Hugging Face**](https://huggingface.co/stevenpr/chaty-qwen3.5-4b-design-GGUF)
+[**↓ Download**](../../releases)
+
+DARIA is originally based on [Chaty](https://chaty.ca/) by [Fangyuan Lin](https://github.com/Fangyuan025/Chaty).
 
 <br />
 
-<img src="docs/screenshots/demo.gif" width="860" alt="Chaty's local coding agent reading an out-of-workspace file behind a one-click permission grant" />
+<img src="docs/screenshots/demo.gif" width="860" alt="DARIA's local coding agent reading an out-of-workspace file behind a one-click permission grant" />
 
 <sub>A local coding agent — searches GitHub, reads the source, edits your files, and runs the tests. **All on your machine.**</sub>
 
@@ -33,19 +39,19 @@ knowledge base, Deep Research, and hands-free voice built right in.
 
 ---
 
-## Why Chaty
+## Why DARIA
 
 - 🔒 **Truly private** — every model, document, and conversation stays on your device. No sign-up, no server, nothing phoned home.
 - ⚡ **Native and fast** — a Rust + llama.cpp core with **Vulkan / Metal** GPU offload that auto-tunes to your hardware and falls back gracefully to CPU.
 - 🧰 **More than a chat box** — a coding agent, a knowledge base (RAG), Deep Research, hands-free voice, and a self-healing Design Canvas — all offline.
-- 🧠 **Runs almost anything** — Llama 3, Gemma 3 / 4, Qwen 3 / 3.5 / 3.6, *any* GGUF from Hugging Face — and **MLX models natively on Apple Silicon** — plus **Chaty's own fine-tuned model**.
+- 🧠 **Runs almost anything** — Llama 3, Gemma 3 / 4, Qwen 3 / 3.5 / 3.6, *any* GGUF from Hugging Face — and **MLX models natively on Apple Silicon** — plus **DARIA's own fine-tuned model**.
 - 💻 **Friendly to modest hardware** — a first-launch *“Set up for me”* picks a model sized to your RAM and downloads it in one click.
 
 <br />
 
 ## A local coding agent
 
-Flip the **Chat · Code** switch and Chaty becomes an agent for your codebase. Point it
+Flip the **Chat · Code** switch and DARIA becomes an agent for your codebase. Point it
 at a folder, describe the task, and it explores, edits, and verifies the project by
 itself — every step shown live, every change behind an approval + diff.
 
@@ -54,7 +60,7 @@ itself — every step shown live, every change behind an approval + diff.
 - 🧠 **Tools that do the thinking** — `understand_repo` orients in one call, `search_code` ranks files by relevance, `read_file` lifts a single symbol plus its call sites, `validate_change` runs just the tests the change touches. Small models spend their steps on decisions, not grunt work.
 - ✏️ **Precise edits, real shell** — exact-string patches behind a diff preview with a **syntax gate**, plus commands and long **background jobs** (dev servers, builds) sandboxed to the workspace.
 - ⏪ **You stay in control** — per-action approval, a command allowlist, prompt-injection defense on everything it reads, and **one-click checkpoint rewind** that restores files *and* rolls back the conversation.
-- 🔌 **MCP, sized for small models** — connect any Model Context Protocol server (stdio or streamable HTTP), or one-click a **curated, version-pinned store entry** that's live-certified against Chaty's own client. Tool docs are synthesized lean so a 16K context fits as many servers as you like; every result is injection-defended and untrusted servers need per-call approval.
+- 🔌 **MCP, sized for small models** — connect any Model Context Protocol server (stdio or streamable HTTP), or one-click a **curated, version-pinned store entry** that's live-certified against DARIA's own client. Tool docs are synthesized lean so a 16K context fits as many servers as you like; every result is injection-defended and untrusted servers need per-call approval.
 - 📚 **Skills & project memory** — drop a `SKILL.md` of procedural steps in `~/.chaty/skills/` (or per-project) and the agent loads it only when relevant; `remember` saves non-obvious findings to `.chaty/memory/` so the next session starts knowing them. Plain markdown, human-editable, never leaves the machine.
 
 <details>
@@ -77,13 +83,13 @@ One local model for every row — **Qwen3.5-35B-A3B** (MoE, ~3 B active per toke
 
 | SWE-bench Verified — 45-task macOS-validated subset | Resolved |
 | --- | --- |
-| **Chaty agent (v1.9)** — the full tool loop, 16K context | **15/45 (33 %)** |
+| **DARIA agent (v1.9)** — the full tool loop, 16K context | **15/45 (33 %)** |
 | qwen-code 0.20 — the model family's own CLI (needs 32K) | 12/45 (27 %) |
 | pi 0.81 — minimal 4-tool agent CLI | 10/45 (22 %) |
 | opencode 1.18 | 7/45 (16 %) |
 | bare bash agent — single-tool ablation | 6/45 (13 %) |
 
-Same model, same tasks, same grading, one machine — five agent designs. Chaty leads the field, including the model family's own first-party CLI ([qwen-code](https://github.com/QwenLM/qwen-code)) while using **half its context window**, and resolves **2.5×** the bare-bash ablation. That's the design thesis measured: with frontier models a thin scaffold is enough — on small local models, the intelligence has to live in the tools (repo-aware search, symbol reads, precise edits, recovery guards, post-edit diagnostics). Methodology, per-agent configs, and honest-comparison notes (subset, macOS harness — *not* comparable to leaderboard numbers): [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Same model, same tasks, same grading, one machine — five agent designs. DARIA leads the field, including the model family's own first-party CLI ([qwen-code](https://github.com/QwenLM/qwen-code)) while using **half its context window**, and resolves **2.5×** the bare-bash ablation. That's the design thesis measured: with frontier models a thin scaffold is enough — on small local models, the intelligence has to live in the tools (repo-aware search, symbol reads, precise edits, recovery guards, post-edit diagnostics). Methodology, per-agent configs, and honest-comparison notes (subset, macOS harness — *not* comparable to leaderboard numbers): [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 <br />
 
@@ -112,7 +118,7 @@ Same model, same tasks, same grading, one machine — five agent designs. Chaty 
 <table>
 <tr>
 <td width="50%"><img src="docs/screenshots/shot-chat.jpg" alt="Rich chat rendering — syntax-highlighted code, tables, and KaTeX math" /></td>
-<td width="50%"><img src="docs/screenshots/shot-chat-light.jpg" alt="The same conversation in Chaty's light theme" /></td>
+<td width="50%"><img src="docs/screenshots/shot-chat-light.jpg" alt="The same conversation in DARIA's light theme" /></td>
 </tr>
 </table>
 
@@ -123,7 +129,7 @@ Same model, same tasks, same grading, one machine — five agent designs. Chaty 
 
 <br />
 
-## Chaty can see
+## DARIA can see
 
 Load a **vision model** (its weights and `mmproj` encoder live together in one folder, paired automatically) and image understanding turns on everywhere:
 
@@ -136,12 +142,12 @@ Text-only models keep the OCR path, so nothing regresses — and updating from a
 
 <br />
 
-## Models: the store, native MLX — and Chaty's own
+## Models: the store, native MLX — and DARIA's own
 
 - A built-in **model store**: search Hugging Face by name or author, filter **GGUF / MLX**, sort by trending or downloads — then pick a **quantization** from a dropdown and hit download. Models, not file lists.
 - Parameter / architecture / vision badges, the repo's README rendered in-app, and a **"fits fully in memory"** hint sized to your machine. Vision models fetch their encoder automatically; pasting a repo link still works.
 - **MLX runs natively** on Apple Silicon: mlx-community folder models load through Apple's MLX stack in an isolated sidecar — same chat, vision, reasoning controls, Code agent and knowledge-base support as GGUF, and ejecting a model *always* returns its memory.
-- **Chaty's own fine-tune** — a Qwen3.5-4B distilled from a much larger teacher for leaner on-device single-file web design, with a baked-in Chaty identity and grounded citations. A one-click pick in *“Set up for me”*, fully open on **[Hugging Face](https://huggingface.co/stevenpr/chaty-qwen3.5-4b-design-GGUF)**.
+- **DARIA's own fine-tune** — a Qwen3.5-4B distilled from a much larger teacher for leaner on-device single-file web design, with a baked-in DARIA identity and grounded citations. A one-click pick in *“Set up for me”*, fully open on **[Hugging Face](https://huggingface.co/stevenpr/chaty-qwen3.5-4b-design-GGUF)**.
 
 <br />
 
@@ -153,7 +159,7 @@ Text-only models keep the OCR path, so nothing regresses — and updating from a
 
 - Index **PDF, Word, Excel, Markdown, ~90 text/code formats, and images** into an on-device store — one file or a whole folder. Images are read by **OCR *and*, with a vision model, described in words** so you can search what's *in* the picture.
 - **Hybrid retrieval**: bge-m3 vectors + BM25 keywords, fused with RRF, de-duplicated with MMR, expanded with neighbors.
-- **Strict grounding** — answers come only from your files, with **per-file citations** and hover-preview of the source passage. Chaty says when something isn't covered instead of guessing.
+- **Strict grounding** — answers come only from your files, with **per-file citations** and hover-preview of the source passage. DARIA says when something isn't covered instead of guessing.
 - **One-click report** — a cited, NotebookLM-style overview of the whole base, exportable to PDF or Markdown.
 
 </td>
@@ -165,7 +171,7 @@ Text-only models keep the OCR path, so nothing regresses — and updating from a
 
 ## Deep Research & the web
 
-- Give a topic and Chaty plans queries, runs **multiple rounds** of web search interleaved with reasoning, and writes a structured, cited report — **exportable to PDF or Markdown**.
+- Give a topic and DARIA plans queries, runs **multiple rounds** of web search interleaved with reasoning, and writes a structured, cited report — **exportable to PDF or Markdown**.
 - Honest by design: the reference list contains only sources it actually cited.
 - A free, key-less, multi-provider search chain (Brave → Bing → DuckDuckGo → Wikipedia) so one blocked provider never breaks search.
 
@@ -215,18 +221,18 @@ Grab the latest build from the [**Releases**](../../releases) page:
 
 | Platform | File | Notes |
 |---|---|---|
-| Windows x64 | `Chaty_*_x64-setup.exe` | Per-user installer — no admin required |
-| macOS (Apple Silicon) | `Chaty_*_aarch64.dmg` | See the first-launch note below |
+| Windows x64 | `DARIA_*_x64-setup.exe` | Per-user installer — no admin required |
+| macOS (Apple Silicon) | `DARIA_*_aarch64.dmg` | See the first-launch note below |
 
-**macOS first launch.** Chaty is ad-hoc signed but not notarized (there's no paid Apple
+**macOS first launch.** DARIA is ad-hoc signed but not notarized (there's no paid Apple
 Developer account behind it), so Gatekeeper warns on first open. The app is safe — everything
 runs locally. Clear the download quarantine once:
 
 ```sh
-xattr -dr com.apple.quarantine /Applications/Chaty.app
+xattr -dr com.apple.quarantine /Applications/Daria.app
 ```
 
-then open Chaty normally. (Or: open it, dismiss the warning, and choose **System Settings →
+then open DARIA normally. (Or: open it, dismiss the warning, and choose **System Settings →
 Privacy & Security → Open Anyway**.) On macOS the writable models folder lives in app data —
 use **Open models folder** in the model menu.
 

@@ -108,7 +108,7 @@ fn embedder_start(model_path: &PathBuf) -> Result<Embedder, String> {
             let model = match LlamaModel::load_from_file(backend, &path, &params) {
                 Ok(m) => m,
                 Err(e) => {
-                    let _ = init_tx.send(Err(format!("加载嵌入模型失败 (failed to load embedding model): {e:#}")));
+                    let _ = init_tx.send(Err(crate::agent::localize_mixed(&format!("加载嵌入模型失败 (failed to load embedding model): {e:#}"))));
                     return;
                 }
             };
@@ -121,7 +121,7 @@ fn embedder_start(model_path: &PathBuf) -> Result<Embedder, String> {
             let mut ctx = match model.new_context(backend, ctx_params) {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = init_tx.send(Err(format!("创建嵌入上下文失败 (failed to create embedding context): {e:#}")));
+                    let _ = init_tx.send(Err(crate::agent::localize_mixed(&format!("创建嵌入上下文失败 (failed to create embedding context): {e:#}"))));
                     return;
                 }
             };
@@ -183,7 +183,7 @@ fn embedder_start(model_path: &PathBuf) -> Result<Embedder, String> {
     match init_rx.recv() {
         Ok(Ok(())) => Ok(Embedder { tx, worker: Some(worker) }),
         Ok(Err(e)) => Err(e),
-        Err(_) => Err("嵌入线程启动失败 (embedder thread failed to start)".into()),
+        Err(_) => Err(crate::agent::localize_mixed("嵌入线程启动失败 (embedder thread failed to start)")),
     }
 }
 
@@ -203,11 +203,11 @@ fn embed(app: &tauri::AppHandle, texts: Vec<String>) -> Result<Vec<Vec<f32>>, St
         .unwrap()
         .tx
         .send(EmbedJob::Embed { texts, reply: reply_tx })
-        .map_err(|_| "嵌入线程已退出 (embedder exited)".to_string())?;
+        .map_err(|_| crate::agent::localize_mixed("嵌入线程已退出 (embedder exited)"))?;
     drop(guard); // don't hold the lock while embedding
     reply_rx
         .recv()
-        .map_err(|_| "嵌入线程已退出 (embedder exited)".to_string())?
+        .map_err(|_| crate::agent::localize_mixed("嵌入线程已退出 (embedder exited)"))?
 }
 
 fn l2_normalize(v: &mut [f32]) {
@@ -293,7 +293,7 @@ fn extract_text(path: &str) -> Result<String, String> {
         .to_lowercase();
     match ext.as_str() {
         "pdf" => pdf_extract::extract_text(path)
-            .map_err(|e| format!("PDF 解析失败 (PDF extraction failed): {e}")),
+            .map_err(|e| crate::agent::localize_mixed(&format!("PDF 解析失败 (PDF extraction failed): {e}"))),
         "docx" => extract_docx(path),
         "xlsx" => extract_xlsx(path),
         "pptx" => extract_pptx(path),
@@ -317,7 +317,7 @@ fn extract_text(path: &str) -> Result<String, String> {
 pub(crate) fn extract_pptx(path: &str) -> Result<String, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipArchive::new(file)
-        .map_err(|e| format!("PPTX 解析失败 (not a valid .pptx): {e}"))?;
+        .map_err(|e| crate::agent::localize_mixed(&format!("PPTX 解析失败 (not a valid .pptx): {e}")))?;
     let mut slides: Vec<(usize, String)> = Vec::new();
     for i in 0..zip.len() {
         let Ok(mut entry) = zip.by_index(i) else { continue };
@@ -354,11 +354,11 @@ pub(crate) fn extract_pptx(path: &str) -> Result<String, String> {
     slides.sort_by_key(|(n, _)| *n);
     let out = slides
         .into_iter()
-        .map(|(n, t)| format!("[幻灯片 {n}] {t}"))
+        .map(|(n, t)| trf!("[幻灯片 {}] {}", "[slide {}] {}", n, t))
         .collect::<Vec<_>>()
         .join("\n\n");
     if out.is_empty() {
-        return Err("没有从演示文稿中解析到文本 (no text found in the deck)".into());
+        return Err(crate::agent::localize_mixed("没有从演示文稿中解析到文本 (no text found in the deck)"));
     }
     Ok(out)
 }
@@ -370,10 +370,10 @@ pub(crate) fn extract_docx(path: &str) -> Result<String, String> {
     use std::io::Read;
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipArchive::new(file)
-        .map_err(|e| format!("DOCX 解析失败 (not a valid .docx): {e}"))?;
+        .map_err(|e| crate::agent::localize_mixed(&format!("DOCX 解析失败 (not a valid .docx): {e}")))?;
     let mut xml = String::new();
     zip.by_name("word/document.xml")
-        .map_err(|_| "DOCX 缺少 word/document.xml (corrupt .docx)".to_string())?
+        .map_err(|_| crate::agent::localize_mixed("DOCX 缺少 word/document.xml (corrupt .docx)"))?
         .read_to_string(&mut xml)
         .map_err(|e| e.to_string())?;
 
@@ -407,7 +407,7 @@ pub(crate) fn extract_docx(path: &str) -> Result<String, String> {
 pub(crate) fn extract_xlsx(path: &str) -> Result<String, String> {
     use calamine::{open_workbook, Reader, Xlsx};
     let mut wb: Xlsx<_> =
-        open_workbook(path).map_err(|e| format!("XLSX 解析失败 (failed to read .xlsx): {e}"))?;
+        open_workbook(path).map_err(|e| crate::agent::localize_mixed(&format!("XLSX 解析失败 (failed to read .xlsx): {e}")))?;
     let mut out = String::new();
     for name in wb.sheet_names() {
         let range = match wb.worksheet_range(&name) {
@@ -814,10 +814,10 @@ pub async fn rag_add_document(
             .unwrap_or_default();
         // An image with neither a caption nor OCR text has nothing to index.
         if vision_text.is_none() && ocr.is_empty() {
-            return Err(
-                "无法从图片中提取内容：未加载视觉模型且未识别到文字。(Nothing to index from the image — no vision model loaded and no OCR text found.)"
-                    .into(),
-            );
+            return Err(crate::agent::tr(
+                "无法从图片中提取内容：未加载视觉模型且未识别到文字。",
+                "Nothing to index from the image — no vision model loaded and no OCR text found.",
+            ));
         }
         (Some(ocr), vision_text)
     } else {
@@ -836,7 +836,7 @@ pub async fn rag_add_document(
         let mut caps = Vec::new();
         for (i, img) in imgs.iter().enumerate() {
             if let Some(c) = vision_caption(&app, img, &on_progress).await {
-                caps.push(format!("[文档内嵌图片 {} (embedded image)] {c}", i + 1));
+                caps.push(trf!("[文档内嵌图片 {}] {}", "[embedded image {}] {}", i + 1, c));
             }
         }
         caps
@@ -871,11 +871,11 @@ pub async fn rag_add_document(
                 let mut parts: Vec<String> = Vec::new();
                 if let Some(v) = &vision_text {
                     if !v.trim().is_empty() {
-                        parts.push(format!("[图像内容 / Image description]\n{}", v.trim()));
+                        parts.push(trf!("[图像内容]\n{}", "[Image description]\n{}", v.trim()));
                     }
                 }
                 if !ocr.trim().is_empty() {
-                    parts.push(format!("[图中文字 / Text in image]\n{}", ocr.trim()));
+                    parts.push(trf!("[图中文字]\n{}", "[Text in image]\n{}", ocr.trim()));
                 }
                 parts.join("\n\n")
             }
@@ -892,7 +892,7 @@ pub async fn rag_add_document(
         };
         let chunks = chunk_text(&text);
         if chunks.is_empty() {
-            return Err("文档中没有可索引的文本 (no indexable text in document)".into());
+            return Err(crate::agent::localize_mixed("文档中没有可索引的文本 (no indexable text in document)"));
         }
 
         // Replace an existing doc of the same name.
@@ -947,7 +947,7 @@ pub async fn rag_add_document(
         Ok(())
     })
     .await
-    .map_err(|e| format!("索引任务异常 (indexing task panicked): {e}"))?
+    .map_err(|e| crate::agent::localize_mixed(&format!("索引任务异常 (indexing task panicked): {e}")))?
 }
 
 /// File extensions the knowledge base can ingest: documents (PDF/DOCX),
@@ -976,7 +976,7 @@ pub fn rag_list_supported_files(dir: String) -> Result<Vec<String>, String> {
     const MAX_FILES: usize = 5000;
     let root = std::path::PathBuf::from(&dir);
     if !root.is_dir() {
-        return Err("不是有效的文件夹 (not a directory)".into());
+        return Err(crate::agent::localize_mixed("不是有效的文件夹 (not a directory)"));
     }
     let mut out: Vec<String> = Vec::new();
     let mut stack = vec![root];
@@ -1092,7 +1092,7 @@ pub fn rag_corpus(app: tauri::AppHandle, max_chars: Option<usize>) -> Result<Str
         }
         let trimmed: String = out.trim().chars().take(cap).collect();
         if trimmed.is_empty() {
-            return Err("知识库为空或全部文档已禁用 (knowledge base is empty or all documents are disabled)".into());
+            return Err(crate::agent::localize_mixed("知识库为空或全部文档已禁用 (knowledge base is empty or all documents are disabled)"));
         }
         Ok(trimmed)
     })
@@ -1120,7 +1120,7 @@ pub fn rag_corpus_docs(
             .query_row("SELECT COUNT(*) FROM docs WHERE enabled = 1", [], |r| r.get(0))
             .unwrap_or(0);
         if n_docs == 0 {
-            return Err("知识库为空或全部文档已禁用 (knowledge base is empty or all documents are disabled)".into());
+            return Err(crate::agent::localize_mixed("知识库为空或全部文档已禁用 (knowledge base is empty or all documents are disabled)"));
         }
         let per_doc = (cap / n_docs as usize).clamp(800, 8000);
 
@@ -1263,10 +1263,7 @@ pub async fn rag_download_model(
         .map(|u| u.replace(crate::download::HF_OFFICIAL, &base))
         .collect();
 
-    let client = reqwest::Client::builder()
-        .user_agent("Chaty-RAG")
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = crate::http::download_client("DARIA-RAG")?;
     let mut last_err = String::new();
     for url in &urls {
         let resp = match client.get(url).send().await.and_then(|r| r.error_for_status()) {
@@ -1353,7 +1350,7 @@ pub async fn rag_download_model(
     }
     crate::download::clear_cancel("rag-embed");
     let _ = std::fs::remove_file(&tmp);
-    let msg = format!("嵌入模型下载失败 (embedding model download failed): {last_err}");
+    let msg = crate::agent::localize_mixed(&format!("嵌入模型下载失败 (embedding model download failed): {last_err}"));
     let _ = on_progress.send(RagDlProgress::Error { message: msg.clone() });
     Err(msg)
 }
@@ -1361,6 +1358,39 @@ pub async fn rag_download_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Real-embedder semantic probe (the knowledge base's core signal path,
+    /// which nothing else on a CI runner can exercise):
+    ///   CHATY_TEST_EMBED_GGUF=<bge-m3 .gguf> \
+    ///   cargo test --lib rag_embedder_semantic_probe -- --ignored
+    #[test]
+    #[ignore]
+    fn rag_embedder_semantic_probe() {
+        let model = std::env::var("CHATY_TEST_EMBED_GGUF").expect("set CHATY_TEST_EMBED_GGUF");
+        let emb = embedder_start(&PathBuf::from(model)).expect("embedder start");
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        emb.tx
+            .send(EmbedJob::Embed {
+                texts: vec![
+                    "a small kitten playing".into(),
+                    "a young cat".into(),
+                    "a carburetor engine part".into(),
+                ],
+                reply: rtx,
+            })
+            .unwrap();
+        let vs = rrx.recv().unwrap().expect("embed batch");
+        assert_eq!(vs.len(), 3, "one vector per text");
+        assert!(vs[0].len() >= 256, "real embedding dims, got {}", vs[0].len());
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let kitten_cat = dot(&vs[0], &vs[1]);
+        let kitten_carb = dot(&vs[0], &vs[2]);
+        assert!(
+            kitten_cat > kitten_carb + 0.05,
+            "semantic order broken: kitten~cat {kitten_cat} vs kitten~carburetor {kitten_carb}"
+        );
+        drop(emb); // exercises the worker-shutdown path
+    }
 
     #[test]
     fn chunking_overlaps_and_respects_min_len() {

@@ -5,6 +5,6 @@
   <!-- Shown in the macOS permission prompt the first time voice/live mode
        accesses the microphone. Without this key WKWebView crashes on mic use. -->
   <key>NSMicrophoneUsageDescription</key>
-  <string>Chaty uses the microphone for hands-free voice chat and speech-to-text.</string>
+  <string>DARIA uses the microphone for hands-free voice chat and speech-to-text.</string>
 </dict>
 </plist>

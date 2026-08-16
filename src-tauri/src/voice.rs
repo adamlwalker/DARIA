@@ -84,9 +84,9 @@ async fn ensure_extracted(models_dir: &Path, url: &str, dir_name: &str) -> Resul
 
     let bytes = reqwest::get(url)
         .await
-        .with_context(|| format!("下载语音模型失败: {url}"))?
+        .with_context(|| trf!("下载语音模型失败: {}", "failed to download voice model: {}", url))?
         .error_for_status()
-        .with_context(|| format!("下载语音模型失败: {url}"))?
+        .with_context(|| trf!("下载语音模型失败: {}", "failed to download voice model: {}", url))?
         .bytes()
         .await?;
 
@@ -94,13 +94,20 @@ async fn ensure_extracted(models_dir: &Path, url: &str, dir_name: &str) -> Resul
     tokio::task::spawn_blocking(move || -> Result<()> {
         let bz = bzip2::read::BzDecoder::new(&bytes[..]);
         let mut archive = tar::Archive::new(bz);
-        archive.unpack(&target).context("解压语音模型失败")?;
+        archive.unpack(&target).context(crate::agent::tr("解压语音模型失败", "failed to unpack voice model"))?;
         Ok(())
     })
     .await??;
 
     if !(dir.is_dir() && find_in(&dir, ".onnx").is_some()) {
-        bail!("语音模型解压后结构异常: {}", dir.display());
+        bail!(
+            "{}",
+            trf!(
+                "语音模型解压后结构异常: {}",
+                "voice model unpack produced an unexpected layout: {}",
+                dir.display()
+            )
+        );
     }
     Ok(dir)
 }
@@ -111,11 +118,11 @@ fn stt_engine(dir: &Path) -> Result<&'static Mutex<WhisperRecognizer>> {
     }
     let encoder = find_in(dir, "encoder.int8.onnx")
         .or_else(|| find_in(dir, "encoder.onnx"))
-        .ok_or_else(|| anyhow!("未找到 Whisper encoder"))?;
+        .ok_or_else(|| anyhow!(crate::agent::tr("未找到 Whisper encoder", "Whisper encoder not found")))?;
     let decoder = find_in(dir, "decoder.int8.onnx")
         .or_else(|| find_in(dir, "decoder.onnx"))
-        .ok_or_else(|| anyhow!("未找到 Whisper decoder"))?;
-    let tokens = find_in(dir, "tokens.txt").ok_or_else(|| anyhow!("未找到 tokens.txt"))?;
+        .ok_or_else(|| anyhow!(crate::agent::tr("未找到 Whisper decoder", "Whisper decoder not found")))?;
+    let tokens = find_in(dir, "tokens.txt").ok_or_else(|| anyhow!(crate::agent::tr("未找到 tokens.txt", "tokens.txt not found")))?;
 
     let config = WhisperConfig {
         encoder: encoder.to_string_lossy().into_owned(),
@@ -125,7 +132,7 @@ fn stt_engine(dir: &Path) -> Result<&'static Mutex<WhisperRecognizer>> {
         num_threads: Some(voice_threads()),
         ..Default::default()
     };
-    let rec = WhisperRecognizer::new(config).map_err(|e| anyhow!("创建 Whisper 失败: {e}"))?;
+    let rec = WhisperRecognizer::new(config).map_err(|e| anyhow!(trf!("创建 Whisper 失败: {}", "failed to create Whisper: {}", e)))?;
     let _ = STT.set(Mutex::new(rec));
     Ok(STT.get().unwrap())
 }
@@ -136,7 +143,7 @@ fn tts_engine(dir: &Path) -> Result<&'static Mutex<KokoroTts>> {
     }
     let model = find_in(dir, "model.onnx")
         .or_else(|| find_in(dir, ".onnx"))
-        .ok_or_else(|| anyhow!("未找到 Kokoro 模型"))?;
+        .ok_or_else(|| anyhow!(crate::agent::tr("未找到 Kokoro 模型", "Kokoro model not found")))?;
 
     let config = KokoroTtsConfig {
         model: model.to_string_lossy().into_owned(),
@@ -213,7 +220,9 @@ pub async fn synthesize(
     tokio::task::spawn_blocking(move || -> Result<(Vec<f32>, u32)> {
         let engine = tts_engine(&dir)?;
         let mut tts = engine.lock().map_err(|_| anyhow!("TTS lock poisoned"))?;
-        let audio = tts.create(&text, sid, speed).map_err(|e| anyhow!("合成失败: {e}"))?;
+        let audio = tts.create(&text, sid, speed).map_err(|e| {
+            anyhow!(trf!("合成失败: {}", "synthesis failed: {}", e))
+        })?;
         Ok((audio.samples, audio.sample_rate))
     })
     .await?
@@ -237,4 +246,35 @@ fn resample_to_16k(samples: &[f32], sr: u32) -> Vec<f32> {
             a + (b - a) * frac
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Full voice loop on the real CPU engines (Kokoro TTS → Whisper STT),
+    /// using the app's downloaded voice models:
+    ///   CHATY_TEST_VOICE_DIR="$HOME/Library/Application Support/com.chaty.desktop/voice-models" \
+    ///   cargo test --lib voice_tts_stt_roundtrip -- --ignored
+    #[test]
+    #[ignore]
+    fn voice_tts_stt_roundtrip() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("CHATY_TEST_VOICE_DIR").expect("set CHATY_TEST_VOICE_DIR"),
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (samples, rate) = rt
+            .block_on(synthesize(dir.clone(), "hello world, this is a voice test".into(), 1.0, 0))
+            .expect("kokoro synthesis");
+        assert!(rate >= 16000, "sane sample rate: {rate}");
+        assert!(samples.len() as u32 > rate, "at least a second of audio: {}", samples.len());
+        let text = rt
+            .block_on(transcribe(dir, samples, rate))
+            .expect("whisper transcription");
+        let low = text.to_lowercase();
+        assert!(
+            low.contains("hello") && low.contains("world"),
+            "roundtrip lost the words: {text}"
+        );
+    }
 }

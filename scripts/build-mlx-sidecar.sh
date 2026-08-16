@@ -44,5 +44,18 @@ cp -f "$BIN" "$STAGE/chaty-mlx-aarch64-apple-darwin"
 rm -rf "$STAGE"/*.bundle
 find "$PRODUCTS" -maxdepth 1 -name '*.bundle' -exec cp -R {} "$STAGE/" \;
 
+# `tauri dev` does not apply tauri.mlx.conf.json, so the sidecar is not
+# copied next to the debug/release exe. Stage it there too — find_sidecar
+# looks beside current_exe first, and the Metal bundle must sit next to it.
+stage_next_to() {
+  local dest="$1"
+  [[ -d "$dest" ]] || return 0
+  cp -f "$BIN" "$dest/chaty-mlx"
+  cp -f "$BIN" "$dest/chaty-mlx-aarch64-apple-darwin"
+  find "$PRODUCTS" -maxdepth 1 -name '*.bundle' -exec cp -R {} "$dest/" \;
+}
+stage_next_to ../target/debug
+stage_next_to ../target/release
+
 echo "staged:"
 ls -la "$STAGE"

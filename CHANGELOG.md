@@ -756,4 +756,4 @@ Chaty now runs natively on Apple Silicon Macs, alongside Windows.
 
 ## v0.5.x and earlier
 
-See the [release history](https://github.com/Fangyuan025/Chaty/releases) — drag-drop attachments, sampling controls & presets, voices, themes, export/search, model downloader, Mermaid, Qwen3.5 thinking control, and more.
+See the release history — drag-drop attachments, sampling controls & presets, voices, themes, export/search, model downloader, Mermaid, Qwen3.5 thinking control, and more.

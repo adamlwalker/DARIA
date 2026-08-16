@@ -33,21 +33,29 @@ pub(crate) fn hide_console(cmd: &mut Command) -> &mut Command {
 /// opens a folder for the coding session.
 static WORKSPACE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
-/// Language for model-visible tool output. Historically every string carried
-/// both languages ("已写入 … (wrote …)"), which taxes small local models with
-/// tokens on every single step; now the loop sets the session language once
-/// and each string renders in ONE language. Default Zh keeps the existing
-/// Chinese-asserting tests (and old frontends that never call set_lang) green.
+/// Language for model-visible and user-visible backend strings.
+/// Production default is English. Chinese is used only when the UI
+/// language is explicitly Chinese (`zh`). Tests keep Zh as the default
+/// because most existing assertions expect Chinese tool output.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Lang {
     Zh,
     En,
 }
+#[cfg(not(test))]
+static LANG: Mutex<Lang> = Mutex::new(Lang::En);
+#[cfg(test)]
 static LANG: Mutex<Lang> = Mutex::new(Lang::Zh);
 
 #[tauri::command]
 pub fn agent_set_lang(lang: String) {
-    *LANG.lock().unwrap() = if lang == "en" { Lang::En } else { Lang::Zh };
+    // Only an explicit Chinese selection enables Chinese. Anything else
+    // (including empty / unknown) stays English.
+    *LANG.lock().unwrap() = if lang.eq_ignore_ascii_case("zh") {
+        Lang::Zh
+    } else {
+        Lang::En
+    };
 }
 
 /// Hashline anchor mode: read_file prefixes every line with `N:hh→` and the
@@ -87,6 +95,50 @@ macro_rules! trf {
 
 pub(crate) fn lang_is_en() -> bool {
     *LANG.lock().unwrap() == Lang::En
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{4e00}'..='\u{9fff}'
+        | '\u{3400}'..='\u{4dbf}'
+        | '\u{3000}'..='\u{303f}'
+        | '\u{ff00}'..='\u{ffef}'
+    )
+}
+
+/// When the UI is English, prefer the English half of a mixed bilingual
+/// message (`中文 (english)` / `中文 / english`). Used as a last-line
+/// filter so leftover Chinese-first literals never reach the user.
+pub(crate) fn localize_mixed(s: &str) -> String {
+    if !lang_is_en() || !s.chars().any(is_cjk) {
+        return s.to_string();
+    }
+    let mut last_en: Option<String> = None;
+    let mut rest = s;
+    while let Some(start) = rest.find('(') {
+        let after = &rest[start + 1..];
+        if let Some(end) = after.find(')') {
+            let inner = after[..end].trim();
+            if inner.chars().any(|c| c.is_ascii_alphabetic()) && !inner.chars().any(is_cjk) {
+                last_en = Some(inner.to_string());
+            }
+            rest = &after[end + 1..];
+        } else {
+            break;
+        }
+    }
+    if let Some(en) = last_en {
+        return en;
+    }
+    if let Some((left, right)) = s.split_once(" / ") {
+        if left.chars().any(is_cjk)
+            && !right.chars().any(is_cjk)
+            && right.chars().any(|c| c.is_ascii_alphabetic())
+        {
+            return right.trim().to_string();
+        }
+    }
+    s.to_string()
 }
 
 /// Session-scoped extra directories the user granted beyond the workspace
@@ -677,11 +729,27 @@ pub async fn agent_validate_change(files: Option<Vec<String>>) -> Result<String,
         }
     }
     targets.retain(|p| p.is_file());
+    // Empty journal (fresh session, restarted app, or a caller that passed
+    // nothing) must not dead-end: Swift verification is whole-project anyway,
+    // so when the workspace has Swift sources, validate those instead of
+    // bouncing the model back to hand-rolled bash (CalendarApp repro round 2).
+    let mut swift_fallback = false;
     if targets.is_empty() {
-        return Ok(tr(
-            "本轮还没有记录到文件改动;可传 files 参数明确指定要验证的文件",
-            "no tracked changes this turn — pass files explicitly to validate them",
-        ));
+        swift_fallback = walkdir::WalkDir::new(&root)
+            .max_depth(4)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| !e.file_name().to_string_lossy().starts_with('.'))
+            .flatten()
+            .any(|e| {
+                e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "swift")
+            });
+        if !swift_fallback {
+            return Ok(tr(
+                "本轮还没有记录到文件改动;可传 files 参数明确指定要验证的文件",
+                "no tracked changes this turn — pass files explicitly to validate them",
+            ));
+        }
     }
     let stems: Vec<String> = targets
         .iter()
@@ -734,7 +802,14 @@ pub async fn agent_validate_change(files: Option<Vec<String>>) -> Result<String,
     }
 
     let mut ran_any = false;
-    let mut out = trf!("验证目标: {}\n", "validating: {}\n", rels.join(", "));
+    let mut out = if swift_fallback {
+        tr(
+            "验证目标: (本轮无改动记录——验证工作区全部 Swift 源)\n",
+            "validating: (no tracked changes — validating all Swift sources in the workspace)\n",
+        )
+    } else {
+        trf!("验证目标: {}\n", "validating: {}\n", rels.join(", "))
+    };
     let timeout = Duration::from_secs(180);
     let run_cmd = |title: &str, cmd: String, out: &mut String| {
         out.push_str(&format!("\n$ {cmd}\n"));
@@ -750,6 +825,7 @@ pub async fn agent_validate_change(files: Option<Vec<String>>) -> Result<String,
                             || t.starts_with("✗") || t.starts_with("×") || t.contains("FAIL ")
                             || (t.contains("failed") && t.contains("passed"))
                             || t.starts_with("test result:")
+                            || t.contains("error:") || t.contains("BUILD FAILED")
                     })
                     .take(14)
                     .collect();
@@ -817,6 +893,26 @@ pub async fn agent_validate_change(files: Option<Vec<String>>) -> Result<String,
             )),
         }
     }
+    // TypeScript without tests still deserves a COMPILE check — "no related
+    // tests found" on a tsx project bounces the model to hand-rolled bash
+    // (or worse, syntax-only probes). Same pattern as the Swift branch:
+    // whole-project, the project's own config.
+    if !ran_any
+        && targets.iter().any(|p| {
+            p.extension().is_some_and(|e| e == "ts" || e == "tsx" || e == "mts" || e == "cts")
+        })
+        && root.join("tsconfig.json").is_file()
+    {
+        run_cmd("tsc", "npx tsc --noEmit -p tsconfig.json".into(), &mut out);
+        ran_any = true;
+    }
+    // Go: `go build` is cheap and is the compile truth for the module.
+    if targets.iter().any(|p| p.extension().is_some_and(|e| e == "go"))
+        && root.join("go.mod").is_file()
+    {
+        run_cmd("go build", "go build ./...".into(), &mut out);
+        ran_any = true;
+    }
     if root.join("Cargo.toml").is_file()
         && targets.iter().any(|p| p.extension().is_some_and(|e| e == "rs"))
     {
@@ -828,6 +924,110 @@ pub async fn agent_validate_change(files: Option<Vec<String>>) -> Result<String,
             &mut out,
         );
         ran_any = true;
+    }
+
+    // Swift: no test-file convention covers it, and the CalendarApp audit
+    // showed what happens without a real checker here — the model falls back
+    // to `swiftc -parse` (syntax only; type errors sail through) and ships
+    // code that doesn't compile. Prefer a real xcodebuild when a project file
+    // exists (catches pbxproj mistakes too); else `swift build` for SwiftPM;
+    // else whole-set `swiftc -typecheck` (Swift type errors are cross-file,
+    // so checking only the changed files would miss most of them).
+    if swift_fallback
+        || targets.iter().any(|p| p.extension().is_some_and(|e| e == "swift"))
+        || rels.iter().any(|r| r.contains(".xcodeproj"))
+    {
+        let bin_ok = |bin: &str, flag: &str| -> bool {
+            let mut c = Command::new(bin);
+            c.arg(flag).stdout(Stdio::null()).stderr(Stdio::null());
+            hide_console(&mut c);
+            #[cfg(unix)]
+            c.env("PATH", augmented_path());
+            c.status().map(|s| s.success()).unwrap_or(false)
+        };
+        let xcodeproj: Option<PathBuf> = walkdir::WalkDir::new(&root)
+            .max_depth(2)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| !e.file_name().to_string_lossy().starts_with('.'))
+            .flatten()
+            .find(|e| {
+                e.file_type().is_dir() && e.path().extension().is_some_and(|x| x == "xcodeproj")
+            })
+            .map(|e| e.into_path());
+        if let Some(proj) =
+            xcodeproj.filter(|_| cfg!(target_os = "macos") && bin_ok("xcodebuild", "-version"))
+        {
+            let proj_rel = rel_display(&root, &proj);
+            // -disable-sandbox everywhere Swift compiles in here: the macro
+            // plugin server (SwiftData @Model, @Observable…) applies its OWN
+            // sandbox, and nested sandboxing inside the agent's seatbelt dies
+            // with "sandbox_apply: Operation not permitted" → phantom
+            // "external macro implementation could not be found" errors on
+            // perfectly valid code. The seatbelt remains the real boundary.
+            run_cmd(
+                "xcodebuild",
+                format!(
+                    "xcodebuild -project \"{proj_rel}\" -alltargets -configuration Debug build CODE_SIGNING_ALLOWED=NO ENABLE_USER_SCRIPT_SANDBOXING=NO OTHER_SWIFT_FLAGS=-disable-sandbox"
+                ),
+                &mut out,
+            );
+            ran_any = true;
+        } else if root.join("Package.swift").is_file()
+            && root.join("Sources").is_dir()
+            && bin_ok("swift", "--version")
+        {
+            // --disable-sandbox is required: SwiftPM tries to apply its OWN
+            // sandbox to manifest compilation, and nested sandboxing is
+            // forbidden ("sandbox_apply: Operation not permitted") inside the
+            // agent's seatbelt jail — which remains the actual boundary.
+            run_cmd(
+                "swift build",
+                "swift build --disable-sandbox -Xswiftc -disable-sandbox".into(),
+                &mut out,
+            );
+            ran_any = true;
+        } else if bin_ok("swiftc", "--version") {
+            // Skip *Tests dirs: XCTest isn't importable by bare swiftc, and a
+            // false "no such module 'XCTest'" would teach the model to distrust
+            // the tool.
+            let mut swifts: Vec<String> = Vec::new();
+            for entry in walkdir::WalkDir::new(&root)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(|e| {
+                    let name = e.file_name().to_string_lossy();
+                    !(name.starts_with('.') && e.depth() > 0)
+                        && !(e.file_type().is_dir()
+                            && (SKIP_DIRS.contains(&name.as_ref()) || name.ends_with("Tests")))
+                })
+                .flatten()
+            {
+                if swifts.len() >= 120 {
+                    break;
+                }
+                // Package manifests import PackageDescription, which only the
+                // SwiftPM toolchain provides — bare swiftc reports a phantom
+                // "no such module" on perfectly fine projects.
+                let name = entry.file_name().to_string_lossy();
+                if entry.file_type().is_file()
+                    && entry.path().extension().is_some_and(|x| x == "swift")
+                    && !(name == "Package.swift" || name.starts_with("Package@swift-"))
+                {
+                    swifts.push(rel_display(&root, entry.path()));
+                }
+            }
+            if !swifts.is_empty() {
+                let files =
+                    swifts.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(" ");
+                run_cmd(
+                    "swiftc -typecheck",
+                    format!("swiftc -typecheck -disable-sandbox {files}"),
+                    &mut out,
+                );
+                ran_any = true;
+            }
+        }
     }
 
     if !ran_any {
@@ -868,6 +1068,20 @@ pub(crate) fn syntax_check(abs: &Path) -> Option<Result<(), String>> {
         "json" => {
             let text = std::fs::read_to_string(abs).ok()?;
             Some(serde_json::from_str::<serde_json::Value>(&text).map(|_| ()).map_err(|e| e.to_string()))
+        }
+        // Syntax-ONLY parse as a post-edit gate (appbench wave 3: an edit
+        // left an extraneous `}` and the turn capped before any build could
+        // catch it). `-parse` is banned as VERIFICATION — as a brace-balance
+        // tripwire it is exactly right. Declaration files parse as library
+        // (an @main file is not a "main file"); `main.swift` keeps top-level
+        // code semantics.
+        "swift" => {
+            let file = abs.to_string_lossy();
+            if abs.file_name().is_some_and(|n| n == "main.swift") {
+                run("swiftc", &["-parse", &file])
+            } else {
+                run("swiftc", &["-parse-as-library", "-parse", &file])
+            }
         }
         "toml" => {
             let text = std::fs::read_to_string(abs).ok()?;
@@ -1489,14 +1703,129 @@ pub async fn browser_refresh() -> Result<String, String> {
         .map_err(|e| trf!("浏览器任务异常: {e}", "browser task failed: {e}"))?
 }
 
-/// Full-page screenshot (auto-scrolls to trigger lazy content). Returns a temp
-/// PNG path the agent loop attaches to the model's next turn (like view_image).
+/// Tall full-page captures get SEGMENTED, never squeezed: a 1:4 page pushed
+/// through a total-pixel vision budget lands at ~350 px wide — the model
+/// misread prices and invented a product off exactly that strip (owner
+/// walkthrough, the Hello-Kitty page). Tiles are viewport-proportioned so
+/// each one downscales to a fully legible image, and EVERY pixel of the page
+/// stays in the set — full-page semantics, zero information loss. Encode
+/// transients also shrink: N small ViT passes replace one giant one.
+/// Returns the tile bounds (y, height) top-to-bottom.
+fn tile_bounds(width: u32, height: u32) -> Vec<(u32, u32)> {
+    // ~one 2x viewport per tile; a page up to 1.35 tiles stays a single image
+    // (normal pages keep the old behavior byte-for-byte).
+    tile_bounds_with(width, height, None)
+}
+
+/// Same as `tile_bounds`, with an optional content-aware boundary chooser:
+/// given a candidate cut row, return the FLATTEST row nearby (whitespace
+/// between page sections). A hard cut at a fixed offset halved a product
+/// card and the model saw it in NEITHER half; overlapping tiles duplicated
+/// content and diluted multi-image attention (both measured on the owner's
+/// Hello-Kitty page). Cutting in section gaps splits nothing and adds
+/// nothing.
+fn tile_bounds_with(
+    width: u32,
+    height: u32,
+    pick_cut: Option<&dyn Fn(u32) -> u32>,
+) -> Vec<(u32, u32)> {
+    let tile_h = ((width as f64) * 0.72) as u32;
+    if height as f64 <= tile_h as f64 * 1.35 {
+        return vec![(0, height)];
+    }
+    let mut out = Vec::new();
+    let mut y = 0u32;
+    while y < height {
+        let remaining = height - y;
+        // Trailing sliver (<40% of a tile) folds into the final tile.
+        if remaining < tile_h + (tile_h * 2) / 5 {
+            out.push((y, remaining));
+            break;
+        }
+        let target = y + tile_h;
+        let cut = pick_cut.map(|f| f(target)).unwrap_or(target).clamp(y + tile_h / 2, height);
+        out.push((y, cut - y));
+        y = cut;
+    }
+    out
+}
+
+/// The flattest row (lowest horizontal variance ≈ blank/gap) within ±20% of
+/// a tile around `target` — sampled sparsely, cost is negligible even on a
+/// 27 MP capture.
+fn flattest_row_near(img: &image::DynamicImage, target: u32, window: u32) -> u32 {
+    use image::GenericImageView;
+    let (w, h) = (img.width(), img.height());
+    let lo = target.saturating_sub(window).max(1);
+    let hi = (target + window).min(h - 1);
+    let mut best = (u64::MAX, target);
+    let mut row = lo;
+    while row <= hi {
+        let mut sum = 0u64;
+        let mut sum2 = 0u64;
+        let mut n = 0u64;
+        let mut x = 0u32;
+        while x < w {
+            let p = img.get_pixel(x, row);
+            let lum = (p[0] as u64 + p[1] as u64 + p[2] as u64) / 3;
+            sum += lum;
+            sum2 += lum * lum;
+            n += 1;
+            x += 16;
+        }
+        let var = sum2 / n - (sum / n) * (sum / n);
+        if var < best.0 {
+            best = (var, row);
+        }
+        row += 6;
+    }
+    best.1
+}
+
+/// Full-page screenshot (auto-scrolls to trigger lazy content). Returns one
+/// temp PNG path per SEGMENT (newline-joined, top to bottom) — one path for
+/// normal pages, several for tall ones. The agent loop attaches them all.
 #[tauri::command]
 pub async fn browser_screenshot() -> Result<String, String> {
     let png = tokio::task::spawn_blocking(crate::browser::screenshot)
         .await
         .map_err(|e| trf!("浏览器任务异常: {e}", "browser task failed: {e}"))??;
-    write_shot(png)
+    let img = match image::load_from_memory(&png) {
+        Ok(i) => i,
+        // Undecodable capture: hand it over untouched rather than failing.
+        Err(_) => return write_shot(png),
+    };
+    let (w, h) = (img.width(), img.height());
+    let tile_h = ((w as f64) * 0.72) as u32;
+    let window = tile_h / 5;
+    let picker = |target: u32| flattest_row_near(&img, target, window);
+    let tiles = tile_bounds_with(w, h, Some(&picker));
+    if tiles.len() == 1 {
+        return write_shot(png);
+    }
+    let mut paths = Vec::new();
+    for (i, (y, th)) in tiles.iter().enumerate() {
+        let tile = img.crop_imm(0, *y, w, *th);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        tile.to_rgb8()
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .map_err(|e| trf!("截图分段失败: {e}", "screenshot tiling failed: {e}"))?;
+        // Distinct suffix per tile — write_shot's nanosecond name can collide
+        // inside a tight loop.
+        let path = std::env::temp_dir().join(format!(
+            "chaty-browser-shot-{}-{}-t{}.png",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0),
+            i
+        ));
+        std::fs::write(&path, buf.into_inner())
+            .map_err(|e| trf!("写入失败: {e}", "write failed: {e}"))?;
+        paths.push(path.to_string_lossy().to_string());
+    }
+    Ok(paths.join("\n"))
 }
 
 /// Snapshot of just the current viewport (immediate) — for lazy-load pages,
@@ -2583,9 +2912,52 @@ fn seatbelt_profile(root: &Path) -> String {
         .iter()
         .map(|d| format!(" (subpath \"{}\")", d.display()))
         .collect();
+    // Build caches that live OUTSIDE the workspace: xcodebuild unconditionally
+    // writes DerivedData + its log store under ~/Library/Developer, so without
+    // these every xcodebuild dies on "You don't have permission to save
+    // 'Build' in the folder 'Logs'" and the model degrades to syntax-only
+    // checks (CalendarApp audit). SwiftPM keeps its caches under ~/Library too.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let build_caches = if home.is_empty() {
+        String::new()
+    } else {
+        // The full class, not one victim at a time (calculator/minesweeper
+        // audits): every mainstream toolchain keeps registries/caches under
+        // $HOME, and a denied write there reads as "the sandbox forbids this
+        // language" to a model. Tool HOMES (registries, toolchains, stores)
+        // plus per-tool cache dirs — nothing here holds user documents or
+        // credentials; the hard edge (Documents, dotfiles, ~/.ssh, system
+        // paths, other apps' data) stays denied.
+        let tool_homes = [
+            "Library/Developer",          // Xcode DerivedData/logs
+            "Library/org.swift.swiftpm",  // SwiftPM
+            "Library/pnpm",               // pnpm store
+            ".cargo", ".rustup",          // Rust registry + toolchains
+            "go",                         // Go module cache (~/go/pkg/mod)
+            ".gradle", ".m2",             // JVM builds
+            ".pub-cache",                 // Dart/Flutter
+            ".gem",                       // Ruby user gems
+            ".bun", ".cocoapods", ".composer",
+            ".npm",                       // npm (env-redirected too; belt+braces)
+            ".cache",                     // Linux-convention caches (uv, pre-commit, huggingface…)
+        ];
+        let tool_caches = [
+            "com.apple.dt.Xcode", "org.swift.swiftpm", "pip", "go-build",
+            "Yarn", "deno", "uv", "pypoetry", "composer", "CocoaPods",
+            "ms-playwright", "puppeteer", "node-gyp", "pnpm",
+        ];
+        let mut s = String::new();
+        for d in tool_homes {
+            s.push_str(&format!(" (subpath \"{home}/{d}\")"));
+        }
+        for d in tool_caches {
+            s.push_str(&format!(" (subpath \"{home}/Library/Caches/{d}\")"));
+        }
+        s
+    };
     format!(
         "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* \
-         (subpath \"{root}\"){grants} (subpath \"/private/tmp\") (subpath \"/tmp\") \
+         (subpath \"{root}\"){grants}{build_caches} (subpath \"/private/tmp\") (subpath \"/tmp\") \
          (subpath \"/private/var/folders\") (subpath \"/var/folders\") \
          (literal \"/dev/null\") (literal \"/dev/stdout\") (literal \"/dev/stderr\") \
          (literal \"/dev/dtracehelper\") (literal \"/dev/tty\"))",
@@ -2943,11 +3315,41 @@ fn run_bash(
     })
 }
 
+/// SwiftPM and the Swift compiler apply their OWN sandbox to child processes,
+/// and nested sandboxing inside the agent's seatbelt dies with
+/// "sandbox_apply: Operation not permitted" — a raw `swift build` can never
+/// succeed in the jail. validate_change already passes the disable flags;
+/// the model's own bash commands deserve the same ground truth (minesweeper
+/// session audit: the model concluded "the sandbox forbids Swift" and
+/// defected to Electron). The outer seatbelt remains the security boundary.
+#[cfg(target_os = "macos")]
+pub(crate) fn defuse_nested_sandbox(command: &str) -> String {
+    // A command that already carries any disable-sandbox flag is left alone —
+    // the model (or a skill recipe) made its own arrangements.
+    if command.contains("disable-sandbox") {
+        return command.to_string();
+    }
+    let spm = regex::Regex::new(r"\bswift\s+(build|run|test|package)\b").unwrap();
+    let out = spm.replace_all(command, "swift $1 --disable-sandbox").into_owned();
+    let swiftc = regex::Regex::new(r"\bswiftc\s").unwrap();
+    let out = swiftc.replace_all(&out, "swiftc -disable-sandbox ").into_owned();
+    // xcodebuild: script phases run under Xcode's own sandbox (nested death),
+    // and Swift macro expansion needs the compiler flag threaded through.
+    // Skip when the command already sets either knob itself.
+    if out.contains("ENABLE_USER_SCRIPT_SANDBOXING") || out.contains("OTHER_SWIFT_FLAGS") {
+        return out;
+    }
+    let xcb = regex::Regex::new(r"\bxcodebuild\b").unwrap();
+    xcb.replace_all(&out, "xcodebuild ENABLE_USER_SCRIPT_SANDBOXING=NO OTHER_SWIFT_FLAGS=-disable-sandbox")
+        .into_owned()
+}
+
 #[cfg(target_os = "macos")]
 fn build_command(root: &Path, command: &str, sandboxed: bool) -> Command {
     let mut cmd = if sandboxed {
+        let command = defuse_nested_sandbox(command);
         let mut c = Command::new("/usr/bin/sandbox-exec");
-        c.arg("-p").arg(seatbelt_profile(root)).arg("/bin/sh").arg("-c").arg(command);
+        c.arg("-p").arg(seatbelt_profile(root)).arg("/bin/sh").arg("-c").arg(&command);
         c
     } else {
         // Un-sandboxed (approved sudo): a privileged action can't run in the
@@ -2957,6 +3359,7 @@ fn build_command(root: &Path, command: &str, sandboxed: bool) -> Command {
         c
     };
     cmd.env("PATH", augmented_path());
+    redirect_tool_caches(&mut cmd);
     cmd
 }
 
@@ -2966,7 +3369,28 @@ fn build_command(_root: &Path, command: &str, _sandboxed: bool) -> Command {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(command);
     cmd.env("PATH", augmented_path());
+    redirect_tool_caches(&mut cmd);
     cmd
+}
+
+/// Package-manager caches live OUTSIDE the workspace (`~/.npm`,
+/// `~/Library/Caches/electron`), where the seatbelt denies writes — so a
+/// plain `npm install` (or electron's postinstall download) can never work
+/// in-sandbox, and the CalendarApp repro watched the model burn steps
+/// discovering that with EPERMs. Redirect them to temp dirs the profile
+/// already allows. Always override: any inherited value points outside the
+/// jail (npx itself injects npm_config_cache=~/.npm into child env), which
+/// in-sandbox is a guaranteed EPERM — a user who really wants a custom cache
+/// can still env-prefix the command itself, which the shell applies last.
+// Portable (std env + temp_dir only) — the cfg(unix) gate it used to carry
+// is exactly why Windows silently skipped the redirect for its whole life.
+fn redirect_tool_caches(cmd: &mut Command) {
+    for (var, dir) in [
+        ("npm_config_cache", "chaty-npm-cache"),
+        ("ELECTRON_CACHE", "chaty-electron-cache"),
+    ] {
+        cmd.env(var, std::env::temp_dir().join(dir));
+    }
 }
 
 #[cfg(windows)]
@@ -2974,6 +3398,11 @@ fn build_command(_root: &Path, command: &str, _sandboxed: bool) -> Command {
     let mut cmd = Command::new("cmd");
     cmd.arg("/C").arg(command);
     hide_console(&mut cmd); // every agent step would flash a console otherwise
+    // Same cache redirect the unix variants apply — Windows was the one
+    // platform that forgot, caught the first time this test actually RAN on
+    // a Windows CI runner. Keeps agent npm/electron caches self-contained
+    // under %TEMP% instead of scattered through the user profile.
+    redirect_tool_caches(&mut cmd);
     cmd
 }
 
@@ -3023,8 +3452,8 @@ pub async fn agent_bash(
     // password never arrived. When we know it did, say what actually happened.
     if piped_password && res.code != 0 && res.stderr.contains("no password was provided") {
         res.stderr.push_str(&tr(
-            "\n[Chaty] 密码已通过安全通道送达,但被 sudo 拒绝——上面的 \"no password was provided\" 只是 sudo 重试时读到输入结束的提示。请检查密码是否正确后重试。",
-            "\n[Chaty] The password WAS delivered over the secure channel but sudo rejected it — the \"no password was provided\" line above is just sudo hitting end-of-input on retry. Check the password and try again.",
+            "\n[DARIA] 密码已通过安全通道送达,但被 sudo 拒绝——上面的 \"no password was provided\" 只是 sudo 重试时读到输入结束的提示。请检查密码是否正确后重试。",
+            "\n[DARIA] The password WAS delivered over the secure channel but sudo rejected it — the \"no password was provided\" line above is just sudo hitting end-of-input on retry. Check the password and try again.",
         ));
     }
     Ok(res)
@@ -3315,6 +3744,40 @@ pub fn bg_kill_all() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Full-page tiling: normal pages stay ONE image (old behavior intact);
+    /// tall pages split gaplessly, boundaries may shift toward flat rows
+    /// (section gaps) but never below half a tile, and the set always covers
+    /// every pixel with no ribbon at the end.
+    #[test]
+    fn screenshot_tiles_cover_everything_and_spare_normal_pages() {
+        // Normal 2x viewport (2560x1800): single image.
+        assert_eq!(tile_bounds(2560, 1800), vec![(0, 1800)]);
+        // Slightly tall (≤1.35 tiles) still single.
+        assert_eq!(tile_bounds(2560, 2400), vec![(0, 2400)]);
+        // The owner's Hello-Kitty page: 2560x10780, fixed cuts.
+        let tiles = tile_bounds(2560, 10780);
+        assert!(tiles.len() >= 5, "tall page must segment: {tiles:?}");
+        let tile_h = (2560f64 * 0.72) as u32;
+        let mut y = 0;
+        for (ty, th) in &tiles {
+            assert_eq!(*ty, y, "gapless and ordered: {tiles:?}");
+            assert!(*th >= tile_h / 2, "no ribbon tiles: {tiles:?}");
+            y += th;
+        }
+        assert_eq!(y, 10780, "every pixel covered");
+        // A content-aware picker shifts boundaries but coverage must hold —
+        // even against an adversarial picker that always answers "later".
+        let shove = |t: u32| t + tile_h / 5;
+        let smart = tile_bounds_with(2560, 10780, Some(&shove));
+        let mut y = 0;
+        for (ty, th) in &smart {
+            assert_eq!(*ty, y);
+            assert!(*th >= tile_h / 2);
+            y += th;
+        }
+        assert_eq!(y, 10780);
+    }
 
     /// A timed-out command must take its whole tree down. Killing only the
     /// direct child leaves grandchildren (the `python -c` a model just ran)
@@ -3650,7 +4113,7 @@ mod tests {
     }
 
     /// Model-visible strings render in ONE language, driven by the session
-    /// switch. Default stays Zh (every other test asserts Chinese output);
+    /// switch. Tests default to Zh (every other test asserts Chinese output);
     /// this test flips to En, checks a write round-trip, and flips back.
     #[test]
     fn tool_output_language_switch() {
@@ -3668,6 +4131,19 @@ mod tests {
         let msg = agent_write_file("hello2.txt".into(), "hi".into()).unwrap();
         assert!(msg.starts_with("已写入"), "zh output expected after switch back, got: {msg}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn localize_mixed_prefers_english_when_ui_is_english() {
+        let _g = serial();
+        agent_set_lang("en".into());
+        assert_eq!(
+            localize_mixed("未找到 MLX 引擎组件 chaty-mlx，请重新安装应用 (the chaty-mlx sidecar is missing; please reinstall)"),
+            "the chaty-mlx sidecar is missing; please reinstall"
+        );
+        assert_eq!(localize_mixed("No model loaded"), "No model loaded");
+        agent_set_lang("zh".into());
+        assert!(localize_mixed("未找到 MLX (missing sidecar)").contains("未找到"));
     }
 
     /// Windows consoles emit the ANSI codepage (GBK on Chinese systems) — the
@@ -4139,6 +4615,239 @@ mod tests {
         let out = rt.block_on(agent_validate_change(None)).expect("validate 3");
         assert!(out.contains("没有记录到文件改动"), "empty-state message missing: {out}");
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The post-edit syntax gate must catch a brace-broken Swift file the
+    /// moment it is written (wave 3: an extraneous `}` shipped because no
+    /// gate covered .swift), while @main declaration files and top-level
+    /// main.swift both stay clean.
+    #[test]
+    fn syntax_gate_covers_swift() {
+        if std::process::Command::new("swiftc").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("SKIP: swiftc not available");
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("chaty-agent-sgs-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let broken = tmp.join("View.swift");
+        std::fs::write(&broken, "struct V {\n}\n}\n").unwrap();
+        assert!(matches!(syntax_check(&broken), Some(Err(_))), "extra brace must fail");
+        let entry = tmp.join("App.swift");
+        std::fs::write(&entry, "import SwiftUI\n@main struct A: App { var body: some Scene { WindowGroup { Text(\"x\") } } }\n").unwrap();
+        assert!(matches!(syntax_check(&entry), Some(Ok(()))), "@main entry must pass");
+        let script = tmp.join("main.swift");
+        std::fs::write(&script, "print(\"hi\")\n").unwrap();
+        assert!(matches!(syntax_check(&script), Some(Ok(()))), "top-level main.swift must pass");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// validate_change on a Swift workspace: a TYPE error (which `swiftc
+    /// -parse` would wave through — the exact CalendarApp-audit failure) must
+    /// be caught by the whole-set typecheck, and the fixed version must pass.
+    /// Files under *Tests dirs are skipped (bare swiftc can't import XCTest).
+    #[test]
+    fn validate_change_typechecks_swift() {
+        let _g = serial();
+        if std::process::Command::new("swiftc")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("SKIP: swiftc not available");
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("chaty-agent-vcs-{}", std::process::id()));
+        std::fs::create_dir_all(tmp.join("AppTests")).unwrap();
+        set_ws(&tmp);
+        // Parses fine, fails typecheck — the class of error -parse can't see.
+        std::fs::write(tmp.join("main.swift"), "let x: Int = \"no\"\n").unwrap();
+        // Must be skipped: would fail with "no such module 'XCTest'".
+        std::fs::write(tmp.join("AppTests").join("t.swift"), "import XCTest\n").unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let out = rt
+            .block_on(agent_validate_change(Some(vec!["main.swift".into()])))
+            .expect("validate swift");
+        eprintln!("{out}");
+        assert!(out.contains("swiftc -typecheck"), "typecheck not run:\n{out}");
+        assert!(out.contains("✗ 失败"), "type error not reported:\n{out}");
+        assert!(out.contains("error:"), "compiler error line not surfaced:\n{out}");
+        assert!(!out.contains("XCTest"), "Tests dir must be skipped:\n{out}");
+
+        std::fs::write(tmp.join("main.swift"), "let x: Int = 1\nprint(x)\n").unwrap();
+        let out = rt
+            .block_on(agent_validate_change(Some(vec!["main.swift".into()])))
+            .expect("validate swift 2");
+        assert!(out.contains("✓ 通过"), "fixed code must pass:\n{out}");
+
+        // Macro-using code (SwiftData @Model) must not false-red: the
+        // compiler's plugin server self-sandboxes and dies inside the
+        // seatbelt unless -disable-sandbox is passed (round-12 phantom
+        // "external macro implementation could not be found"). Probe the
+        // toolchain outside the agent path first — old Xcodes without
+        // SwiftData skip the assertion instead of failing it.
+        let sd_src = "import SwiftData\n@Model final class Item { var n: Int = 0\n  init() {} }\n";
+        let probe_file = tmp.join("sd_probe_outside.swift");
+        std::fs::write(&probe_file, sd_src).unwrap();
+        let toolchain_ok = std::process::Command::new("swiftc")
+            .args(["-typecheck", probe_file.to_str().unwrap()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        std::fs::remove_file(&probe_file).ok();
+        if toolchain_ok {
+            std::fs::write(tmp.join("Store.swift"), sd_src).unwrap();
+            let out = rt
+                .block_on(agent_validate_change(Some(vec![
+                    "main.swift".into(),
+                    "Store.swift".into(),
+                ])))
+                .expect("validate swift macros");
+            assert!(
+                !out.contains("could not be found") && !out.contains("malformed response"),
+                "macro plugin false-red is back:\n{out}"
+            );
+            assert!(out.contains("✓ 通过"), "macro code must pass in-sandbox:\n{out}");
+            std::fs::remove_file(tmp.join("Store.swift")).ok();
+        } else {
+            eprintln!("SKIP: toolchain lacks SwiftData — macro assertion skipped");
+        }
+
+        // Package manifest must be excluded from the bare-swiftc set (it
+        // imports PackageDescription, a SwiftPM-only module), and an EMPTY
+        // journal must fall back to whole-workspace Swift validation instead
+        // of bouncing the model (CalendarApp repro round 2).
+        std::fs::write(tmp.join("Package.swift"), "import PackageDescription\n").unwrap();
+        cp_clear();
+        let out = rt.block_on(agent_validate_change(None)).expect("validate swift 3");
+        assert!(out.contains("全部 Swift 源"), "empty-journal fallback missing:\n{out}");
+        assert!(out.contains("✓ 通过"), "fallback must pass on clean sources:\n{out}");
+        assert!(
+            !out.contains("PackageDescription"),
+            "Package.swift must be excluded from bare typecheck:\n{out}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// validate_change on a TS project WITHOUT tests: `tsc --noEmit` is the
+    /// compile truth (vitest transpiles without typechecking). Uses the
+    /// repo's own node_modules for tsc via symlink — skipped when absent.
+    /// Unix-only: the symlink setup has no Windows equivalent worth the cfg
+    /// dance, and the branch under test is platform-independent.
+    #[cfg(unix)]
+    #[test]
+    fn validate_change_typechecks_ts() {
+        let _g = serial();
+        let repo_nm = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("node_modules");
+        if !repo_nm.join(".bin").join("tsc").exists() {
+            eprintln!("SKIP: repo node_modules/.bin/tsc not found");
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("chaty-agent-vct-{}", std::process::id()));
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::os::unix::fs::symlink(&repo_nm, tmp.join("node_modules")).unwrap();
+        set_ws(&tmp);
+        std::fs::write(
+            tmp.join("tsconfig.json"),
+            r#"{"compilerOptions":{"strict":true,"noEmit":true,"target":"ES2020","lib":["ES2020"],"types":[]},"include":["*.ts"]}"#,
+        )
+        .unwrap();
+        std::fs::write(tmp.join("app.ts"), "const n: number = \"not a number\";\n").unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let out = rt
+            .block_on(agent_validate_change(Some(vec!["app.ts".into()])))
+            .expect("validate ts");
+        eprintln!("{out}");
+        assert!(out.contains("tsc"), "tsc branch not taken:\n{out}");
+        assert!(out.contains("✗ 失败"), "type error not caught:\n{out}");
+
+        std::fs::write(tmp.join("app.ts"), "const n: number = 1;\nexport const m = n + 1;\n").unwrap();
+        let out = rt
+            .block_on(agent_validate_change(Some(vec!["app.ts".into()])))
+            .expect("validate ts 2");
+        assert!(out.contains("✓ 通过"), "fixed ts must pass:\n{out}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Raw `swift build` / `swiftc` in agent bash must get the nested-sandbox
+    /// defusal automatically — models don't know the flag, conclude "the
+    /// sandbox forbids Swift", and defect to another stack.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn swift_commands_get_sandbox_defusal() {
+        assert_eq!(
+            defuse_nested_sandbox("swift build -c release 2>&1 | tail -5"),
+            "swift build --disable-sandbox -c release 2>&1 | tail -5"
+        );
+        assert_eq!(
+            defuse_nested_sandbox("cd App && swift test && swift run"),
+            "cd App && swift test --disable-sandbox && swift run --disable-sandbox"
+        );
+        assert_eq!(
+            defuse_nested_sandbox("swiftc -typecheck a.swift b.swift"),
+            "swiftc -disable-sandbox -typecheck a.swift b.swift"
+        );
+        assert_eq!(
+            defuse_nested_sandbox("swift package init --type executable"),
+            "swift package --disable-sandbox init --type executable"
+        );
+        // Untouched: no swift, version probes, explicit flags.
+        assert_eq!(defuse_nested_sandbox("npm run build"), "npm run build");
+        assert_eq!(defuse_nested_sandbox("swift --version"), "swift --version");
+        let explicit = "swift build --disable-sandbox";
+        assert_eq!(defuse_nested_sandbox(explicit), explicit);
+        // xcodebuild gets both knobs — unless the command sets its own.
+        assert_eq!(
+            defuse_nested_sandbox("xcodebuild -project X.xcodeproj build"),
+            "xcodebuild ENABLE_USER_SCRIPT_SANDBOXING=NO OTHER_SWIFT_FLAGS=-disable-sandbox -project X.xcodeproj build"
+        );
+        let own = "xcodebuild build OTHER_SWIFT_FLAGS=-Dfoo";
+        assert_eq!(defuse_nested_sandbox(own), own);
+    }
+
+    /// The seatbelt must whitelist the whole dev-toolchain class — every
+    /// mainstream language keeps registries/caches under $HOME, and a denied
+    /// write there reads as "the sandbox forbids this language" to a model
+    /// (live probes: cargo new-crate fetch and `gem install --user-install`
+    /// both died before this).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_whitelists_toolchain_homes() {
+        let profile = seatbelt_profile(Path::new("/tmp/ws"));
+        for needle in [
+            "/.cargo\"", "/.rustup\"", "/go\"", "/.gradle\"", "/.m2\"",
+            "/.gem\"", "/.pub-cache\"", "/.cache\"",
+            "Library/Caches/go-build", "Library/Caches/pip",
+            "Library/Caches/ms-playwright", "Library/pnpm",
+        ] {
+            assert!(profile.contains(needle), "missing {needle} in profile:\n{profile}");
+        }
+        // The hard edge stays: no blanket HOME, no Documents, no ssh.
+        assert!(!profile.contains("/Documents"));
+        assert!(!profile.contains("/.ssh"));
+    }
+
+    /// Agent shells must point npm/electron caches at writable temp dirs —
+    /// the default locations are outside the seatbelt write allowlist, so
+    /// installs would EPERM (CalendarApp repro round 4).
+    #[test]
+    fn agent_shell_redirects_package_caches() {
+        let cmd = build_command(Path::new("/tmp"), "true", true);
+        let envs: Vec<(String, String)> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((k.to_string_lossy().into_owned(), v?.to_string_lossy().into_owned()))
+            })
+            .collect();
+        for var in ["npm_config_cache", "ELECTRON_CACHE"] {
+            assert!(
+                envs.iter().any(|(k, v)| k == var && v.contains("chaty-")),
+                "{var} not redirected: {envs:?}"
+            );
+        }
     }
 
     /// understand_repo must assemble README lede, manifest line, tree,

@@ -231,6 +231,20 @@ const AUTOSCROLL_JS: &str = r#"new Promise(function(done){
   },50);
 })"#;
 
+/// Freeze CSS motion at its END state before a full-page capture: reveal-on-
+/// scroll pages (IntersectionObserver + transition) raced the shot — the
+/// autoscroll passes a 6-screen page in ~0.4s, every staggered 0.5-0.8s
+/// transition is mid-flight or unstarted, and whole sections captured BLANK
+/// (owner walkthrough: the Hello-Kitty featured-products grid photographed
+/// empty; the model faithfully reported products that "weren't there").
+/// Zeroing durations makes any triggered reveal land instantly; idempotent.
+const FREEZE_ANIMATIONS_JS: &str = r#"(function(){
+  if(document.getElementById('__chaty_freeze'))return 'ok';
+  var s=document.createElement('style');s.id='__chaty_freeze';
+  s.textContent='*,*::before,*::after{animation-duration:0s!important;animation-delay:0s!important;transition-duration:0s!important;transition-delay:0s!important}';
+  (document.head||document.documentElement).appendChild(s);return 'ok';
+})()"#;
+
 /// Process-wide handle to the browser actor thread. Lazily started.
 static BROWSER: Mutex<Option<Sender<BrowserCmd>>> = Mutex::new(None);
 /// Persistent profile dir for the interactive browser (set once at startup, so
@@ -274,6 +288,59 @@ pub fn kill_now() {
             cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
             let _ = crate::agent::hide_console(&mut cmd).output();
         }
+    }
+}
+
+/// Profile dirs under `root` whose creator process is gone. The dir name is
+/// `chaty-cdp-<creator pid>-<nanos>` (tempdir::Guard), so liveness of that
+/// pid decides ownership — a concurrent Chaty/headless keeps its own.
+fn orphan_cdp_dirs(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(rd) = std::fs::read_dir(root) else { return Vec::new() };
+    rd.flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Some(rest) = name.strip_prefix("chaty-cdp-") else { return false };
+            // Unparsable pid = malformed debris → orphan.
+            rest.split('-').next().and_then(|s| s.parse::<u32>().ok()).is_none_or(|pid| !pid_alive(pid))
+        })
+        .map(|e| e.path())
+        .collect()
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    // Creators are always our own uid, so ESRCH is the only "gone" signal;
+    // EPERM would mean someone else's process — never ours — count it alive.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    let mut cmd = std::process::Command::new("tasklist");
+    cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
+    crate::agent::hide_console(&mut cmd)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!(",\"{pid}\"")))
+        .unwrap_or(true) // can't tell ⇒ assume alive, never kill blind
+}
+
+/// Startup sweep for browsers that outlived their Chaty. Every exit path
+/// that skips destructors — the `_exit()` in the app's exit handler, a
+/// SIGKILLed bench bridge, a crash — leaves the headless Chrome tree running
+/// and its profile dir behind (16 helpers + 14 dirs stood on the author's
+/// machine the day this was written). Kill by profile path, then remove.
+pub fn sweep_orphan_browsers() {
+    for dir in orphan_cdp_dirs(&std::env::temp_dir()) {
+        #[cfg(unix)]
+        {
+            let pat = dir.to_string_lossy().to_string();
+            let _ = std::process::Command::new("pkill").args(["-9", "-f", &pat]).status();
+        }
+        // Windows: no safe kill-by-cmdline; a live Chrome holds the profile
+        // lock so the remove fails and the dir simply waits for the next try.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -485,10 +552,22 @@ fn actor(rx: Receiver<BrowserCmd>, init: Sender<Result<(), String>>) {
                 let _ = reply.send(with_console_errors(&mut session, r));
             }
             BrowserCmd::Screenshot { reply } => {
-                let _ = reply.send(run(&mut session, headless, |s| s.screenshot()));
+                let r = run(&mut session, headless, |s| {
+                    if !page_loaded(&s.current_url) {
+                        return Err(no_page_error());
+                    }
+                    s.screenshot()
+                });
+                let _ = reply.send(r);
             }
             BrowserCmd::Snapshot { reply } => {
-                let _ = reply.send(run(&mut session, headless, |s| s.snapshot()));
+                let r = run(&mut session, headless, |s| {
+                    if !page_loaded(&s.current_url) {
+                        return Err(no_page_error());
+                    }
+                    s.snapshot()
+                });
+                let _ = reply.send(r);
             }
             BrowserCmd::Scroll { to, by, reply } => {
                 let r = run(&mut session, headless, |s| s.scroll(to.as_deref(), by));
@@ -554,9 +633,12 @@ impl BrowserSession {
     /// `track_pid`: register the child in CHROME_PID for exit-time cleanup (the
     /// shared interactive browser); one-shot headless captures pass false.
     fn launch(headless: bool, track_pid: bool) -> Result<Self, String> {
-        let exe = chrome_path().ok_or(
-            "未找到 Chrome/Chromium,请先安装 Chrome。(No Chrome/Chromium found — install Google Chrome.)",
-        )?;
+        let exe = chrome_path().ok_or_else(|| {
+            crate::agent::tr(
+                "未找到 Chrome/Chromium,请先安装 Chrome。",
+                "No Chrome/Chromium found — install Google Chrome.",
+            )
+        })?;
         // The interactive browser (track_pid) uses a PERSISTENT profile so the
         // user's logins survive across runs; one-shot captures use a throwaway.
         let persistent = if track_pid { PROFILE_DIR.lock().unwrap().clone() } else { None };
@@ -592,11 +674,19 @@ impl BrowserSession {
             .arg("--force-device-scale-factor=2")
             .arg("--window-size=1280,900")
             .arg("--disable-background-networking")
+            // New-headless Chrome (≥~150) parks frame production on static /
+            // occluded pages; a later Page.captureScreenshot then waits for a
+            // frame that never comes, times out, and the dead-session
+            // recovery relaunches into a blank tab. The standard automation
+            // trio (same defaults Puppeteer ships) keeps frames alive.
+            .arg("--disable-background-timer-throttling")
+            .arg("--disable-backgrounding-occluded-windows")
+            .arg("--disable-renderer-backgrounding")
             .arg("about:blank")
             .stderr(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .spawn()
-            .map_err(|e| format!("启动 Chrome 失败 (failed to launch Chrome): {e}"))?;
+            .map_err(|e| trf!("启动 Chrome 失败: {}", "failed to launch Chrome: {}", e))?;
         if track_pid {
             CHROME_PID.store(child.id(), std::sync::atomic::Ordering::SeqCst);
         }
@@ -607,7 +697,10 @@ impl BrowserSession {
         let (port, ws_path) = loop {
             if Instant::now() > deadline {
                 let _ = child.kill();
-                return Err("Chrome 未在预期时间内就绪 (Chrome did not become ready in time)".into());
+                return Err(crate::agent::tr(
+                    "Chrome 未在预期时间内就绪",
+                    "Chrome did not become ready in time",
+                ));
             }
             if let Ok(content) = std::fs::read_to_string(&port_file) {
                 let mut lines = content.lines();
@@ -623,7 +716,7 @@ impl BrowserSession {
         // Connect to the browser-level endpoint, open a page target, attach.
         let url = format!("ws://127.0.0.1:{port}{ws_path}");
         let (mut ws, _) = connect(&url)
-            .map_err(|e| format!("连接 CDP 失败 (failed to connect CDP): {e}"))?;
+            .map_err(|e| trf!("连接 CDP 失败: {}", "failed to connect CDP: {}", e))?;
         set_read_timeout(&ws, Duration::from_secs(30));
 
         let mut next_id = 1i64;
@@ -640,7 +733,10 @@ impl BrowserSession {
         let session_id = attached["sessionId"].as_str().unwrap_or_default().to_string();
         if session_id.is_empty() {
             let _ = child.kill();
-            return Err("CDP 会话附加失败 (failed to attach CDP session)".into());
+            return Err(crate::agent::tr(
+                "CDP 会话附加失败",
+                "failed to attach CDP session",
+            ));
         }
 
         let mut s = BrowserSession { child, ws, session_id, next_id, console: Vec::new(), surfaced: 0, current_url: String::new(), _profile: _guard };
@@ -649,6 +745,12 @@ impl BrowserSession {
         let sid = s.session_id.clone();
         let _ = s.call(Some(&sid), "Page.enable", json!({}));
         let _ = s.call(Some(&sid), "Runtime.enable", json!({}));
+        // New-headless parks rendering for unfocused pages — a later
+        // captureScreenshot then waits on a frame that never comes and hits
+        // the CDP read timeout (observed on Chrome 150 after a plain
+        // scroll). Emulating focus keeps the compositor producing frames;
+        // Puppeteer ships the same call for exactly this reason.
+        let _ = s.call(Some(&sid), "Emulation.setFocusEmulationEnabled", json!({"enabled": true}));
         let _ = s.call(Some(&sid), "Log.enable", json!({}));
         Ok(s)
     }
@@ -672,7 +774,7 @@ impl BrowserSession {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if Instant::now() > deadline {
-                return Err("CDP 响应超时 (CDP response timed out)".into());
+                return Err(crate::agent::tr("CDP 响应超时", "CDP response timed out"));
             }
             let frame = match self.ws.read() {
                 Ok(Message::Text(t)) => t.to_string(),
@@ -680,7 +782,7 @@ impl BrowserSession {
                 Ok(Message::Close(_)) => return Err(trf!("CDP 连接已关闭", "the CDP connection closed")),
                 Ok(Message::Frame(_)) => continue,
                 Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    return Err("CDP 读取超时 (CDP read timed out)".into());
+                    return Err(crate::agent::tr("CDP 读取超时", "CDP read timed out"));
                 }
                 Err(e) => return Err(format!("CDP read failed: {e}")),
             };
@@ -821,7 +923,7 @@ impl BrowserSession {
         // messages are included even without an intervening command.
         self.pump_pending();
         if self.console.is_empty() {
-            return "（控制台无输出 / console is empty）".into();
+            return crate::agent::tr("（控制台无输出）", "(console is empty)");
         }
         let out = self.console.join("\n");
         self.console.clear();
@@ -850,7 +952,7 @@ impl BrowserSession {
         let r = self.call(Some(&sid), "Page.navigate", json!({"url": url}))?;
         if let Some(err) = r.get("errorText").and_then(|e| e.as_str()) {
             if !err.is_empty() {
-                return Err(format!("导航失败 (navigation failed): {err}"));
+                return Err(trf!("导航失败: {}", "navigation failed: {}", err));
             }
         }
         let (final_url, title, rich) = self.settle_and_digest()?;
@@ -1018,8 +1120,13 @@ impl BrowserSession {
     /// lazy-loaded images/sections), then returns to the top and captures the
     /// whole document — so nothing below the fold is missed or blank.
     fn screenshot(&mut self) -> Result<Vec<u8>, String> {
+        // Order matters: freeze first, so reveals triggered by the scroll
+        // land at their end state instantly instead of racing the capture.
+        let _ = self.eval(FREEZE_ANIMATIONS_JS);
         let _ = self.eval(AUTOSCROLL_JS); // best-effort; ignore if it errors
-        std::thread::sleep(Duration::from_millis(300));
+        // Settle for timer-driven DOM work (typed-in content, staged inserts)
+        // — CSS is already frozen, this only covers JS setTimeout chains.
+        std::thread::sleep(Duration::from_millis(500));
         self.capture(true)
     }
 
@@ -1036,11 +1143,13 @@ impl BrowserSession {
             "Page.captureScreenshot",
             json!({"format": "png", "captureBeyondViewport": beyond_viewport}),
         )?;
-        let b64 = r["data"].as_str().ok_or("截图无数据 (no screenshot data)")?;
+        let b64 = r["data"].as_str().ok_or_else(|| {
+            crate::agent::tr("截图无数据", "no screenshot data")
+        })?;
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD
             .decode(b64)
-            .map_err(|e| format!("截图解码失败 (screenshot decode failed): {e}"))
+            .map_err(|e| trf!("截图解码失败: {}", "screenshot decode failed: {}", e))
     }
 
     /// Scroll the page: to "bottom"/"top", or by `by` pixels (default one
@@ -1089,7 +1198,7 @@ impl BrowserSession {
                 .as_str()
                 .or_else(|| exc["text"].as_str())
                 .unwrap_or("evaluation error");
-            return Err(format!("JS 报错 (JS error): {text}"));
+            return Err(trf!("JS 报错: {}", "JS error: {}", text));
         }
         Ok(remote_object_to_string(&r["result"]))
     }
@@ -1522,16 +1631,32 @@ where
     let tx = ensure()?;
     let (reply, rx) = std::sync::mpsc::channel();
     tx.send(build(reply)).map_err(|_| trf!("浏览器已关闭", "the browser is closed"))?;
-    rx.recv().map_err(|_| "浏览器无响应 (browser did not respond)".to_string())?
+    rx.recv().map_err(|_| crate::agent::tr("浏览器无响应", "browser did not respond"))?
 }
 
 pub fn navigate(url: &str) -> Result<String, String> {
-    let url = normalize_url(url);
+    let ws = crate::agent::agent_get_workspace().map(std::path::PathBuf::from);
+    let url = normalize_url(url, ws.as_deref())?;
     dispatch(|reply| BrowserCmd::Navigate { url, reply })
 }
 
 pub fn refresh() -> Result<String, String> {
     dispatch(|reply| BrowserCmd::Refresh { reply })
+}
+
+/// A capture only makes sense once a page is loaded. Models reach for
+/// browser_screenshot to "verify" NATIVE app windows (session audit: a
+/// calculator delivery tried it as a system-level screenshot) — the lazy
+/// blank session must teach, not hand back an empty white capture.
+pub(crate) fn page_loaded(url: &str) -> bool {
+    !(url.is_empty() || url == "about:blank")
+}
+
+fn no_page_error() -> String {
+    crate::agent::tr(
+        "浏览器还没有打开任何页面。浏览器截图/快照只能拍到内嵌浏览器里的网页,拍不到系统屏幕或原生应用窗口——原生 GUI 的验证用「启动 + 存活检查」(见 mac-app 技能);网页则先 browser_navigate 打开页面再截。",
+        "The browser has no page open. Browser screenshot/snapshot capture ONLY the embedded browser's web page — never the system screen or native app windows. Verify a native GUI with a launch + stay-alive check (see the mac-app skill); for web pages, browser_navigate first, then capture.",
+    )
 }
 
 pub fn screenshot() -> Result<Vec<u8>, String> {
@@ -1607,7 +1732,89 @@ pub fn capture_headless(url: &str) -> Result<(Vec<u8>, String), String> {
 }
 
 /// Accept bare hosts and local file paths; default to https for schemeless hosts.
-fn normalize_url(u: &str) -> String {
+/// Extensions that mark an input as a FILE reference, never a domain guess —
+/// `index.html` must not become `https://index.html` (a DNS error the model
+/// retries forever); `example.com` must keep becoming a website.
+const WEB_FILE_EXTS: &[&str] = &[
+    "html", "htm", "xhtml", "svg", "pdf", "png", "jpg", "jpeg", "gif", "webp", "css", "js", "mjs",
+    "json", "txt", "md", "csv", "mp4", "webm", "ico",
+];
+
+fn web_file_ext(u: &str) -> bool {
+    let seg = u.rsplit(['/', '\\']).next().unwrap_or(u);
+    match seg.rsplit_once('.') {
+        Some((_, ext)) => WEB_FILE_EXTS.contains(&ext.to_ascii_lowercase().as_str()),
+        None => false,
+    }
+}
+
+/// Scheme-less local dev hosts (`localhost:8000`, `127.0.0.1:3000/app`) speak
+/// plain http — an `https://` guess dies on TLS and loops the model.
+fn is_local_host(u: &str) -> bool {
+    let host_port = u.split('/').next().unwrap_or("");
+    let host = if host_port.starts_with('[') {
+        host_port.split(']').next().map(|h| format!("{h}]")).unwrap_or_default()
+    } else {
+        match host_port.rsplit_once(':') {
+            Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => h.to_string(),
+            _ => host_port.to_string(),
+        }
+    };
+    matches!(host.as_str(), "localhost" | "127.0.0.1" | "0.0.0.0" | "[::1]")
+        || host.ends_with(".localhost")
+}
+
+/// file:// URL with the handful of characters that break URL parsing escaped.
+fn file_url(p: &std::path::Path) -> String {
+    let s = p
+        .display()
+        .to_string()
+        .replace('%', "%25")
+        .replace(' ', "%20")
+        .replace('#', "%23")
+        .replace('?', "%3F");
+    format!("file://{s}")
+}
+
+/// Bounded workspace walk for a unique basename match: the model says
+/// `index.html`, the file lives at `dist/index.html` — one hit resolves it,
+/// several hits produce a disambiguation error instead of a wrong guess.
+fn find_by_name(ws: &std::path::Path, name: &str) -> Vec<std::path::PathBuf> {
+    const SKIP: &[&str] = &[".git", "node_modules", ".venv", "__pycache__", "target"];
+    let mut stack = vec![ws.to_path_buf()];
+    let mut hits = Vec::new();
+    let mut visited = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            visited += 1;
+            if visited > 20_000 || hits.len() >= 5 {
+                return hits;
+            }
+            let p = e.path();
+            let fname = e.file_name();
+            let fname = fname.to_string_lossy();
+            if p.is_dir() {
+                if !SKIP.contains(&fname.as_ref()) {
+                    stack.push(p);
+                }
+            } else if fname == name {
+                hits.push(p);
+            }
+        }
+    }
+    hits
+}
+
+/// Turn a model-supplied navigation target into a real URL. Resolution order
+/// (each step preserved from the previous behavior unless noted):
+/// scheme'd URLs pass through → bare localhost gets http:// → an existing
+/// path (absolute or CWD-relative, the old rule) → WORKSPACE-relative (new:
+/// the agent's cwd is the workspace, not the app process's) → a unique
+/// basename match inside the workspace (new) → a file-looking name that
+/// resolved nowhere is a plain-language error (new — it used to become
+/// `https://index.html` and loop the model on DNS) → https:// guess.
+fn normalize_url(u: &str, workspace: Option<&std::path::Path>) -> Result<String, String> {
     let u = u.trim();
     if u.starts_with("http://")
         || u.starts_with("https://")
@@ -1615,16 +1822,66 @@ fn normalize_url(u: &str) -> String {
         || u.starts_with("about:")
         || u.starts_with("data:")
     {
-        return u.to_string();
+        return Ok(u.to_string());
+    }
+    if is_local_host(u) {
+        return Ok(format!("http://{u}"));
     }
     // An existing local file → file:// URL.
     let p = std::path::Path::new(u);
     if p.exists() {
         if let Ok(abs) = p.canonicalize() {
-            return format!("file://{}", abs.display());
+            return Ok(file_url(&abs));
         }
     }
-    format!("https://{u}")
+    if let Some(ws) = workspace {
+        if !p.is_absolute() {
+            let joined = ws.join(u);
+            if joined.exists() {
+                if let Ok(abs) = joined.canonicalize() {
+                    // `../`-escapes stay jailed: resolve only inside the workspace.
+                    if abs.starts_with(ws) {
+                        return Ok(file_url(&abs));
+                    }
+                }
+            }
+            if !u.contains(['/', '\\']) && web_file_ext(u) {
+                let hits = find_by_name(ws, u);
+                match hits.len() {
+                    1 => {
+                        if let Ok(abs) = hits[0].canonicalize() {
+                            return Ok(file_url(&abs));
+                        }
+                    }
+                    n if n > 1 => {
+                        let shown = hits
+                            .iter()
+                            .filter_map(|h| h.strip_prefix(ws).ok())
+                            .map(|h| h.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(crate::agent::tr(
+                            &format!("工作区里有多个 {u}:{shown}。请用相对工作区的完整路径指明要打开哪一个。"),
+                            &format!("Multiple files named {u} in the workspace: {shown}. Pass the full workspace-relative path of the one to open."),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if web_file_ext(u) {
+        let ws_shown = workspace.map(|w| w.display().to_string()).unwrap_or_else(|| "-".into());
+        return Err(crate::agent::tr(
+            &format!(
+                "找不到文件 {u}(工作区:{ws_shown})。请传工作区相对路径(如 dist/index.html)或绝对路径;网页地址请带 http(s)://。"
+            ),
+            &format!(
+                "File not found: {u} (workspace: {ws_shown}). Pass a workspace-relative path (e.g. dist/index.html) or an absolute path; for websites include http(s)://."
+            ),
+        ));
+    }
+    Ok(format!("https://{u}"))
 }
 
 /// A self-cleaning temp directory (Chrome's throwaway profile).
@@ -1659,6 +1916,127 @@ mod tempdir {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The model-supplied navigation target resolver: relative file paths
+    /// resolve against the WORKSPACE (the agent's world), never the app
+    /// process's cwd — the old rule turned `index.html` into
+    /// `https://index.html` and looped the model on a DNS error.
+    #[test]
+    fn normalize_url_resolves_files_hosts_and_teaches() {
+        let ws = std::env::temp_dir().join(format!("chaty-navtest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join("dist")).unwrap();
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("index.html"), "<p>hi</p>").unwrap();
+        std::fs::write(ws.join("dist/app.html"), "<p>app</p>").unwrap();
+        std::fs::write(ws.join("dist/dup.html"), "x").unwrap();
+        std::fs::write(ws.join("src/dup.html"), "x").unwrap();
+        std::fs::write(ws.join("my page.html"), "x").unwrap();
+        let ws = ws.canonicalize().unwrap();
+        let w = Some(ws.as_path());
+
+        // Scheme'd URLs pass through untouched.
+        for u in ["https://example.com/a?b=1", "http://x.dev", "about:blank", "data:text/html,hi"] {
+            assert_eq!(normalize_url(u, w).unwrap(), u);
+        }
+        // Bare local dev hosts speak http, not an https guess that dies on TLS.
+        assert_eq!(normalize_url("localhost:8000", w).unwrap(), "http://localhost:8000");
+        assert_eq!(normalize_url("127.0.0.1:3000/app", w).unwrap(), "http://127.0.0.1:3000/app");
+        assert_eq!(normalize_url("app.localhost:5173", w).unwrap(), "http://app.localhost:5173");
+        // Websites keep working.
+        assert_eq!(normalize_url("example.com", w).unwrap(), "https://example.com");
+        // Workspace-relative resolution: bare name and subdir path.
+        assert_eq!(normalize_url("index.html", w).unwrap(), file_url(&ws.join("index.html")));
+        assert_eq!(normalize_url("dist/app.html", w).unwrap(), file_url(&ws.join("dist/app.html")));
+        // Unique basename rescue: `app.html` lives only in dist/.
+        assert_eq!(normalize_url("app.html", w).unwrap(), file_url(&ws.join("dist/app.html")));
+        // Ambiguous basename → a disambiguation error, not a wrong guess.
+        let e = normalize_url("dup.html", w).unwrap_err();
+        assert!(e.contains("dup.html"), "err should name the file: {e}");
+        // Missing file-looking target → plain-language error, not https://.
+        let e = normalize_url("nope.html", w).unwrap_err();
+        assert!(e.contains("nope.html") && e.contains(ws.display().to_string().as_str()), "{e}");
+        // `../` cannot escape the workspace jail (parent exists but is outside).
+        assert!(normalize_url("../outside-escape.html", w).is_err());
+        // Spaces in resolved paths are escaped for the URL.
+        let got = normalize_url("my page.html", w).unwrap();
+        assert!(got.contains("my%20page.html"), "{got}");
+        // No workspace: files-looking names still teach instead of guessing DNS.
+        assert!(normalize_url("index.html", None).is_err());
+        assert_eq!(normalize_url("example.com", None).unwrap(), "https://example.com");
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// The orphan sweep must claim dirs whose creator pid is gone (and
+    /// malformed debris), and must NEVER claim a live process's profile —
+    /// the first design pass nearly killed a concurrently-running bench's
+    /// browser.
+    #[test]
+    #[cfg(unix)]
+    fn orphan_sweep_respects_live_creators() {
+        let root = std::env::temp_dir().join(format!("chaty-sweeptest-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        // A dead creator: spawn+reap a child so the pid is real but gone.
+        let dead = std::process::Command::new("true").spawn().map(|mut c| {
+            let pid = c.id();
+            let _ = c.wait();
+            pid
+        });
+        let dead = dead.unwrap();
+        let mine = std::process::id();
+        std::fs::create_dir_all(root.join(format!("chaty-cdp-{dead}-111"))).unwrap();
+        std::fs::create_dir_all(root.join(format!("chaty-cdp-{mine}-222"))).unwrap();
+        std::fs::create_dir_all(root.join("chaty-cdp-garbage-333")).unwrap();
+        std::fs::create_dir_all(root.join("unrelated-dir")).unwrap();
+        let got: Vec<String> = orphan_cdp_dirs(&root)
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(got.contains(&format!("chaty-cdp-{dead}-111")), "dead creator must be swept: {got:?}");
+        assert!(got.contains(&"chaty-cdp-garbage-333".to_string()), "malformed debris must be swept");
+        assert!(!got.iter().any(|n| n.contains(&mine.to_string())), "live creator must be kept: {got:?}");
+        assert!(!got.contains(&"unrelated-dir".to_string()), "non-chaty dirs are untouchable");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Windows twin of the sweep test: pid_alive must see the current
+    /// process via tasklist, treat a spawned-and-reaped cmd as gone, and the
+    /// dir selection must obey it. Runs only on the Windows CI job — the dev
+    /// Mac can't execute this path at all.
+    #[test]
+    #[cfg(windows)]
+    fn orphan_sweep_respects_live_creators_windows() {
+        let root = std::env::temp_dir().join(format!("chaty-sweeptest-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let dead = {
+            let mut c = std::process::Command::new("cmd").args(["/C", "exit"]).spawn().unwrap();
+            let pid = c.id();
+            let _ = c.wait();
+            pid
+        };
+        let mine = std::process::id();
+        assert!(pid_alive(mine), "tasklist must see the current process");
+        std::fs::create_dir_all(root.join(format!("chaty-cdp-{dead}-111"))).unwrap();
+        std::fs::create_dir_all(root.join(format!("chaty-cdp-{mine}-222"))).unwrap();
+        let got: Vec<String> = orphan_cdp_dirs(&root)
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(got.contains(&format!("chaty-cdp-{dead}-111")), "dead creator must be swept: {got:?}");
+        assert!(!got.iter().any(|n| n.contains(&mine.to_string())), "live creator must be kept: {got:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Blank lazy sessions must not hand a "capture" of nothing back to a
+    /// model that thinks it is taking a system screenshot.
+    #[test]
+    fn capture_requires_a_loaded_page() {
+        assert!(!page_loaded(""));
+        assert!(!page_loaded("about:blank"));
+        assert!(page_loaded("http://localhost:5173/"));
+        assert!(page_loaded("https://example.com"));
+    }
 
     /// Discovery must agree with the file system: when any known browser is
     /// installed (incl. Windows per-user %LOCALAPPDATA% Chrome — the usual
@@ -1715,7 +2093,7 @@ mod tests {
         }
         for u in [
             "https://example.com/",
-            "https://github.com/Fangyuan025/Chaty",
+            "https://github.com/adamlwalker/DARIA",
             "http://192.168.1.20:8080/",
             "https://localhost.evil.com/phish",
             "https://mylocalhost.com/",
@@ -1877,8 +2255,8 @@ mod tests {
             eprintln!("SKIP: no Chrome found");
             return;
         }
-        let html = "<!doctype html><html><head><title>Chaty Test</title></head>\
-            <body style='background:#0a7'><h1 id='h'>Hello Chaty</h1>\
+        let html = "<!doctype html><html><head><title>DARIA Test</title></head>\
+            <body style='background:#0a7'><h1 id='h'>Hello DARIA</h1>\
             <button id='b' onclick=\"document.getElementById('h').textContent='Clicked'\">Go</button>\
             <button id='md'>Save</button><button id='md2'>Save All</button>\
             <script>console.error('boom-42');console.log('ok-hi');\
@@ -1890,10 +2268,10 @@ mod tests {
 
         let nav = navigate(&url).expect("navigate");
         eprintln!("nav: {nav}");
-        assert!(nav.contains("Chaty Test"), "title should appear: {nav}");
+        assert!(nav.contains("DARIA Test"), "title should appear: {nav}");
 
         let title = eval("document.title").expect("eval");
-        assert_eq!(title, "Chaty Test");
+        assert_eq!(title, "DARIA Test");
 
         let shot = screenshot().expect("screenshot");
         assert!(shot.len() > 1000 && &shot[1..4] == b"PNG", "expected a PNG, got {} bytes", shot.len());
@@ -1965,7 +2343,9 @@ mod tests {
         // <select> dropdown: browser_type selects the option by visible text.
         eval("document.body.innerHTML='<select id=sel><option value=\"\">--</option><option value=\"e\">Albert Einstein</option><option value=\"m\">Marilyn Monroe</option></select>';").expect("build select");
         let seld = type_text(Some("#sel".into()), None, "Marilyn Monroe".into()).expect("select by text");
-        assert!(seld.contains("typed"), "select result: {seld}");
+        // The result string is bilingual and language-state dependent —
+        // assert the act, not one language's phrasing.
+        assert!(seld.contains("typed") || seld.contains("已输入"), "select result: {seld}");
         assert_eq!(eval("document.getElementById('sel').value").unwrap().trim_matches('"'), "m", "select set to the matching option");
         // A non-existent option returns the option list, not a silent no-op.
         let miss = type_text(Some("#sel".into()), None, "Nobody".into());
@@ -1981,6 +2361,15 @@ mod tests {
         let _sc = scroll_page(Some("bottom".into()), None).expect("scroll");
         let marker = eval("document.getElementById('late').textContent").unwrap();
         assert!(marker.contains("LAZY-LOADED-CONTENT"), "scroll should trigger lazy content, got {marker:?}");
+        // KNOWN IN-TEST FLAKE (audited 2026-08-08): at THIS point in the
+        // accumulated session (≈15 DOM-heavy sections deep), Chrome 150's
+        // captureScreenshot can wedge past the CDP read timeout. The real
+        // product path is healthy — the identical nav→scroll→snapshot
+        // sequence (including an http→file cross-process hop) captures in
+        // <100ms through chaty-headless, verified twice during the audit.
+        // Anti-throttling launch flags + focus emulation were added as
+        // standard hardening; if this expect ever fires, suspect the test's
+        // own session accumulation before suspecting the capture path.
         let snap = snapshot().expect("snapshot");
         assert!(snap.len() > 1000 && &snap[1..4] == b"PNG");
         let _ = std::fs::remove_file(&lp);
@@ -2001,14 +2390,14 @@ mod tests {
         std::thread::sleep(Duration::from_millis(400));
         // the next command must relaunch a fresh browser and succeed.
         let recovered = navigate(&url).expect("should auto-recover after the browser is killed");
-        assert!(recovered.contains("Chaty Test"), "recovered nav should load: {recovered}");
+        assert!(recovered.contains("DARIA Test"), "recovered nav should load: {recovered}");
 
         // ---- browser_close, then reuse ----
         shutdown();
         std::thread::sleep(Duration::from_millis(300));
         // a call after close starts a fresh actor + browser.
         let reused = navigate(&url).expect("should start a fresh browser after close");
-        assert!(reused.contains("Chaty Test"));
+        assert!(reused.contains("DARIA Test"));
 
         shutdown();
         let _ = std::fs::remove_file(&path);

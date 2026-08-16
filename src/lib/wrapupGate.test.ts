@@ -233,3 +233,47 @@ describe("devServerUrlFrom", () => {
     expect(devServerUrlFrom("see https://example.com/docs")).toBeUndefined();
   });
 });
+
+describe("wrapupNudge · red build escalation", () => {
+  const edited = { files: ["a.swift", "b.swift"], lines: 200 };
+  it("an outstanding failed run replaces the note with the red-build demand", () => {
+    const n = wrapupNudge(
+      { ...base, codeEditsSinceExec: edited, lastFailedRun: "xcodebuild -project X build" },
+      "en",
+    );
+    expect(n).toContain("FAILED");
+    expect(n).toContain("xcodebuild -project X build");
+    expect(n).toContain("until it passes");
+    const zh = wrapupNudge(
+      { ...base, codeEditsSinceExec: edited, lastFailedRun: "xcodebuild -project X build" },
+      "zh",
+    );
+    expect(zh).toContain("失败");
+    expect(zh).toContain("不允许带着编译/构建错误交付");
+  });
+  it("no failed run → the standard run-check wording, not the red-build one", () => {
+    const n = wrapupNudge({ ...base, codeEditsSinceExec: edited }, "en");
+    expect(n).toContain("read-only commands don't count");
+    expect(n).not.toContain("FAILED");
+  });
+  it("failed run but empty ledger (green run followed) → silent", () => {
+    expect(
+      wrapupNudge({ ...base, lastFailedRun: "cargo build" }, "en"),
+    ).toBeNull();
+  });
+});
+
+describe("wrapupNudge · second-attempt sharpening", () => {
+  const edited = { files: ["a.py", "b.py"], lines: 100 };
+  it("attempt 2 with untouched ledger → the sharpened order, not the verbatim note", () => {
+    const n = wrapupNudge({ ...base, codeEditsSinceExec: edited, attempt: 2 }, "en");
+    expect(n).toContain("Second reminder");
+    expect(n).not.toContain("read-only commands don't count");
+    const zh = wrapupNudge({ ...base, codeEditsSinceExec: edited, attempt: 2 }, "zh");
+    expect(zh).toContain("第二次提醒");
+  });
+  it("attempt 1 keeps the standard wording", () => {
+    const n = wrapupNudge({ ...base, codeEditsSinceExec: edited, attempt: 1 }, "en");
+    expect(n).toContain("read-only commands don't count");
+  });
+});

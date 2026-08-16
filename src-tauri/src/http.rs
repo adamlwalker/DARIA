@@ -11,7 +11,7 @@
 //!   content for non-browser agents (search results, article extraction).
 //!   Sites serve a different document to `curl/1.0`; presenting a normal
 //!   browser is what makes the extractor work at all.
-//! * A branded UA (`"Chaty model downloader"`, `"Chaty-Updater"`, …) — for
+//! * A branded UA (`"DARIA model downloader"`, `"DARIA-Updater"`, …) — for
 //!   talking to APIs that WANT to know who is calling: Hugging Face, GitHub
 //!   releases, our own endpoints. Rate limits and abuse handling there are
 //!   per-client, so identifying honestly is the correct behavior.
@@ -37,4 +37,19 @@ pub fn client(ua: &str, timeout: Duration) -> Result<reqwest::Client, String> {
 /// Seconds-flavored shorthand for the common case.
 pub fn client_secs(ua: &str, secs: u64) -> Result<reqwest::Client, String> {
     client(ua, Duration::from_secs(secs))
+}
+
+/// Client for STREAMING downloads (model files, installers, embedders):
+/// bounded connect + a between-chunks read timeout, and deliberately NO
+/// whole-request timeout — a 20 GB model on a modest line is not an error,
+/// but a CDN that goes silent for a minute is. Before this factory the
+/// download clients had no timeout at all, and a stalled connection looked
+/// like "download stuck at 43%" forever with no way out but a restart.
+pub fn download_client(ua: &str) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent(ua)
+        .connect_timeout(Duration::from_secs(20))
+        .read_timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())
 }

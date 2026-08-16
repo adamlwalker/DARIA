@@ -1,5 +1,5 @@
-//! Read a user-attached file into plain text so it can be injected as context
-//! ("长文档秒问"). Text files auto-decode UTF-8 / GB18030; PDFs are extracted.
+//! Read a user-attached file into plain text so it can be injected as context.
+//! Text files auto-decode UTF-8 / GB18030; PDFs are extracted.
 
 use std::path::Path;
 
@@ -42,7 +42,7 @@ pub async fn read_attachment(app: tauri::AppHandle, path: String) -> Result<Atta
             let extracted = tokio::task::spawn_blocking(move || pdf_extract::extract_text(&path))
                 .await
                 .map_err(|e| e.to_string())?
-                .map_err(|e| format!("PDF 解析失败：{e}"))?;
+                .map_err(|e| trf!("PDF 解析失败：{}", "PDF extraction failed: {}", e))?;
             ("pdf".to_string(), extracted)
         }
         "docx" => ("docx".to_string(), crate::rag::extract_docx(&path)?),
@@ -56,7 +56,7 @@ pub async fn read_attachment(app: tauri::AppHandle, path: String) -> Result<Atta
                 .join("ocr-models");
             let text = crate::ocr::ocr_image(dir, path.clone())
                 .await
-                .map_err(|e| format!("OCR 失败：{e:#}"))?;
+                .map_err(|e| trf!("OCR 失败：{:#}", "OCR failed: {:#}", e))?;
             ("image".to_string(), text)
         }
         _ => ("text".to_string(), read_text_file(&path)?),
@@ -80,7 +80,10 @@ pub async fn read_attachment(app: tauri::AppHandle, path: String) -> Result<Atta
     }
     let text = text.trim().to_string();
     if text.is_empty() && images.is_empty() {
-        return Err("没有从文件中解析到文本内容".into());
+        return Err(crate::agent::tr(
+            "没有从文件中解析到文本内容",
+            "no text could be extracted from this file",
+        ));
     }
 
     Ok(Attachment {

@@ -100,13 +100,16 @@ mod imp {
         // App-level TCC consent first — this is the prompt the user can grant.
         if !crate::voice::request_mic_permission() {
             return Err(
-                "麦克风权限被拒绝，请在 系统设置 → 隐私与安全性 → 麦克风 中允许 Chaty。(Microphone access denied — allow Chaty in System Settings → Privacy & Security → Microphone.)".into(),
+                crate::agent::tr(
+                    "麦克风权限被拒绝，请在 系统设置 → 隐私与安全性 → 麦克风 中允许 DARIA。",
+                    "Microphone access denied — allow DARIA in System Settings → Privacy & Security → Microphone.",
+                ),
             );
         }
 
         let mut stop_slot = STOP.lock().unwrap();
         if stop_slot.is_some() {
-            return Err("已经在录音了 (already recording)".into());
+            return Err(crate::agent::localize_mixed("已经在录音了 (already recording)"));
         }
 
         let sh = shared().clone();
@@ -203,19 +206,19 @@ mod imp {
                         None,
                     ),
                     other => {
-                        let _ = init_tx.send(Err(format!("不支持的采样格式 (unsupported sample format): {other:?}")));
+                        let _ = init_tx.send(Err(crate::agent::localize_mixed(&format!("不支持的采样格式 (unsupported sample format): {other:?}"))));
                         return;
                     }
                 };
                 let stream = match stream {
                     Ok(s) => s,
                     Err(e) => {
-                        let _ = init_tx.send(Err(format!("无法打开麦克风输入流 (failed to open input stream): {e}")));
+                        let _ = init_tx.send(Err(crate::agent::localize_mixed(&format!("无法打开麦克风输入流 (failed to open input stream): {e}"))));
                         return;
                     }
                 };
                 if let Err(e) = stream.play() {
-                    let _ = init_tx.send(Err(format!("无法启动麦克风输入流 (failed to start input stream): {e}")));
+                    let _ = init_tx.send(Err(crate::agent::localize_mixed(&format!("无法启动麦克风输入流 (failed to start input stream): {e}"))));
                     return;
                 }
                 sh.sample_rate.store(sample_rate, Ordering::Relaxed);
@@ -232,7 +235,7 @@ mod imp {
                 Ok(rate)
             }
             Ok(Err(e)) => Err(e),
-            Err(_) => Err("录音线程启动失败 (capture thread failed to start)".into()),
+            Err(_) => Err(crate::agent::localize_mixed("录音线程启动失败 (capture thread failed to start)")),
         }
     }
 
@@ -291,10 +294,14 @@ mod imp {
                 }
             }
         }
-        Err(format!(
-            "没有可用的麦克风输入设备 (no usable microphone)。已尝试 (tried): {}",
+        Err(trf!(
+            "没有可用的麦克风输入设备。已尝试: {}",
+            "no usable microphone. tried: {}",
             if tried.is_empty() {
-                "系统未报告任何输入设备 (system reports no input devices)".to_string()
+                crate::agent::tr(
+                    "系统未报告任何输入设备",
+                    "system reports no input devices",
+                )
             } else {
                 tried.join("; ")
             }
@@ -307,7 +314,7 @@ mod imp {
                 let _ = tx.send(());
                 Ok(())
             }
-            None => Err("当前没有进行中的录音 (no recording in progress)".into()),
+            None => Err(crate::agent::localize_mixed("当前没有进行中的录音 (no recording in progress)")),
         }
     }
 }

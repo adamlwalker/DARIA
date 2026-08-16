@@ -1,12 +1,21 @@
 [package]
 name = "chaty"
-version = "2.0.2"
+version = "2.1.0"
 # Two binaries live here (the app + the bench/headless tool server) — `cargo
 # run`, which `tauri dev` invokes, needs to know the app is the default.
-default-run = "chaty"
-description = "A Tauri App"
-authors = ["you"]
+autobins = false
+default-run = "daria"
+description = "DARIA — Discrete AI for Reasoning, Interaction & Automation"
+authors = ["Adam Walker"]
 edition = "2021"
+
+[[bin]]
+name = "daria"
+path = "src/main.rs"
+
+[[bin]]
+name = "chaty-headless"
+path = "src/bin/chaty-headless.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -43,6 +52,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["time", "rt", "sync", "macros"] }
 async-trait = "0.1"
 anyhow = "1"
+chrono = "0.4"
 # Base llama.cpp binding (CPU). The GPU backend feature (vulkan/metal) is added
 # per-target by the `gpu-backend` shim when the `gpu` feature is on.
 llama-cpp-2 = { version = "0.1.150", features = ["sampler", "mtmd"] }
@@ -66,6 +76,7 @@ libc = "0.2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # Embedded-image extraction from PDFs (same lopdf pdf-extract uses).
 lopdf = "0.34"
+flate2 = "1" # inflate PDF image streams ourselves — lopdf's own decompress rejects Chrome-print PDFs
 # .xlsx spreadsheet reading (handles shared strings, numbers, dates).
 calamine = "0.26"
 # Agentic coding tools: file glob + content grep over the workspace.
@@ -75,7 +86,9 @@ walkdir = "2"
 htmd = "0.5.4"
 dom_smoothie = "0.18.0"
 url = "2.5.8"
-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake", "native-tls"] }
+sha2 = "0.10"
+minimp3 = "0.5"
 hf-hub = "1.0.0"
 toml = "0.8"
 

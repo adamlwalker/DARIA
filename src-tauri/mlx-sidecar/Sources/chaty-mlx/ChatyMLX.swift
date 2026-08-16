@@ -52,6 +52,9 @@ struct WireParams: Decodable {
     /// Reasoning control: `false` forces no-think (template arg when the chat
     /// template supports `enable_thinking`, else an empty-<think> prefill).
     var think: Bool?
+    /// Native reasoning-effort rung for templates taking a `reasoning_effort`
+    /// kwarg (Qwen3.8: low | medium | xhigh). Passed straight through.
+    var effort: String?
 }
 
 struct WireCmd: Decodable {
@@ -127,6 +130,9 @@ struct ModelMeta {
     var hasChatTemplate = false
     /// Chat template honours an `enable_thinking` kwarg (Qwen3 family).
     var thinkArg = false
+    /// Native reasoning-effort ladder the template accepts, weakest first
+    /// (Qwen3.8: low/medium/xhigh). Empty ⇒ no effort control.
+    var effortLevels: [String] = []
     /// Best effort: the model emits <think> reasoning.
     var supportsThinking = false
     /// Best effort: the chat template supports tool / function calling.
@@ -154,9 +160,9 @@ struct ModelMeta {
 /// configuration (neither preprocessor_config.json nor processor_config.json)
 /// — the vision tower is right there in the weights, but the VLM factory
 /// throws a configurationFileError and the whole model refuses to load. For
-/// the Qwen3-VL processor family the preprocessing values are architecture
-/// constants (mean/std 0.5) plus fields mirrored in config.json's
-/// vision_config, so the folder can be healed by writing a minimal
+/// families whose preprocessing values are architecture constants (mirrored
+/// in config.json's vision_config, or baked into the library's decoder
+/// defaults) the folder can be healed by writing a minimal
 /// preprocessor_config.json. Never overwrites an existing file.
 func healProcessorConfig(dir: URL) {
     let pre = dir.appendingPathComponent("preprocessor_config.json")
@@ -164,23 +170,45 @@ func healProcessorConfig(dir: URL) {
     let fm = FileManager.default
     guard !fm.fileExists(atPath: pre.path), !fm.fileExists(atPath: proc.path),
         let cfg = readJSON(dir.appendingPathComponent("config.json")),
-        let arch = cfg["model_type"] as? String,
-        ["qwen3_5", "qwen3_5_moe", "qwen3_vl", "qwen3_vl_moe"].contains(arch),
-        let vision = cfg["vision_config"] as? [String: Any]
+        let arch = cfg["model_type"] as? String
     else { return }
-    let synthesized: [String: Any] = [
-        "processor_class": "Qwen3VLProcessor",
-        "image_processor_type": "Qwen2VLImageProcessorFast",
-        "image_mean": [0.5, 0.5, 0.5],
-        "image_std": [0.5, 0.5, 0.5],
-        "patch_size": vision["patch_size"] as? Int ?? 16,
-        "merge_size": vision["spatial_merge_size"] as? Int ?? 2,
-        "temporal_patch_size": vision["temporal_patch_size"] as? Int ?? 2,
-        // Smart-resize band (total pixels), mirroring the official configs.
-        // Without it the processor never resizes and an oversized image
-        // blows past Metal's limits inside mlx_eval, killing the process.
-        "size": ["longest_edge": 16_777_216, "shortest_edge": 65_536],
-    ]
+    var synthesized: [String: Any]
+    switch arch {
+    case "qwen3_5", "qwen3_5_moe", "qwen3_vl", "qwen3_vl_moe":
+        // Qwen3-VL processor family: mean/std are the 0.5 constants, the
+        // geometry fields are mirrored in config.json's vision_config.
+        guard let vision = cfg["vision_config"] as? [String: Any] else { return }
+        synthesized = [
+            "processor_class": "Qwen3VLProcessor",
+            "image_processor_type": "Qwen2VLImageProcessorFast",
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+            "patch_size": vision["patch_size"] as? Int ?? 16,
+            "merge_size": vision["spatial_merge_size"] as? Int ?? 2,
+            "temporal_patch_size": vision["temporal_patch_size"] as? Int ?? 2,
+            // Smart-resize band (total pixels), mirroring the official configs.
+            // Without it the processor never resizes and an oversized image
+            // blows past Metal's limits inside mlx_eval, killing the process.
+            "size": ["longest_edge": 16_777_216, "shortest_edge": 65_536],
+        ]
+    case "gemma4", "gemma4_unified":
+        // Gemma4: every pixel constant has an architecture default baked
+        // into the library's config decoder, so an almost-empty file
+        // suffices — but the processor class must be spelled out (absent,
+        // the decoder falls back to the Unified variant, wrong for plain
+        // gemma4). Special-token ids are mirrored from config.json where
+        // present so quants with re-numbered specials still line up.
+        synthesized = [
+            "processor_class": arch == "gemma4" ? "Gemma4Processor" : "Gemma4UnifiedProcessor"
+        ]
+        for key in [
+            "image_token_id", "boi_token_id", "eoi_token_id", "audio_token_id", "video_token_id",
+        ] {
+            if let v = cfg[key] as? Int { synthesized[key] = v }
+        }
+    default:
+        return
+    }
     guard
         let data = try? JSONSerialization.data(
             withJSONObject: synthesized, options: [.prettyPrinted, .sortedKeys])
@@ -245,6 +273,11 @@ func inspectModelDir(_ dir: URL) -> ModelMeta {
     }
     meta.hasChatTemplate = !template.isEmpty
     meta.thinkArg = template.contains("enable_thinking")
+    if template.contains("reasoning_effort") {
+        meta.effortLevels = ["low", "medium", "xhigh"].filter {
+            template.contains("'\($0)'") || template.contains("\"\($0)\"")
+        }
+    }
     let archLower = (meta.arch ?? "").lowercased()
     meta.supportsThinking =
         template.contains("<think>") || meta.thinkArg || archLower.contains("qwen3")
@@ -293,24 +326,50 @@ final class Engine: @unchecked Sendable {
 
     func load(path: String, nCtx: Int?) async {
         let dir = URL(fileURLWithPath: path)
-        let meta = inspectModelDir(dir)
+        var meta = inspectModelDir(dir)
+        var loadWarning: String?
+        if meta.multimodal {
+            healProcessorConfig(dir: dir)
+            let hasProcessorConfig = ["preprocessor_config.json", "processor_config.json"]
+                .contains { fname in
+                    FileManager.default.fileExists(
+                        atPath: dir.appendingPathComponent(fname).path)
+                }
+            // A multimodal config with no processor configuration at all —
+            // and no healing recipe for its family — can't drive its vision
+            // tower, but the language model underneath is fully loadable:
+            // the text factory registers these architectures too and its
+            // sanitize drops the vision_tower / multi_modal_projector
+            // weights. Degrade to text-only instead of refusing to load.
+            if !hasProcessorConfig {
+                log(
+                    "no processor config for \(meta.arch ?? "?") and no healing recipe; "
+                        + "degrading to text-only load")
+                meta.multimodal = false
+                loadWarning = "vision-config-missing"
+            }
+        }
         self.meta = meta
         self.modelDir = dir
+        let useVLM = meta.multimodal
         do {
             // Local-directory load: no downloader involved; the tokenizer
             // comes from swift-transformers via the MLXHuggingFace macro.
             // Natively-multimodal architectures (config carries a
-            // vision_config, e.g. the whole Qwen3.5+ family) are registered
-            // only in the VLM factory — load them there; chat stays
-            // text-only until Chaty grows MLX vision.
-            let container: ModelContainer
-            if meta.multimodal {
-                healProcessorConfig(dir: dir)
-                container = try await VLMModelFactory.shared.loadContainer(
-                    from: dir, using: #huggingFaceTokenizerLoader())
-            } else {
-                container = try await LLMModelFactory.shared.loadContainer(
-                    from: dir, using: #huggingFaceTokenizerLoader())
+            // vision_config, e.g. the whole Qwen3.5+ family) load through
+            // the VLM factory; text-only models — and vision models
+            // degraded above — through the LLM factory.
+            // withError: C-level MLX failures during weight load (Metal OOM
+            // on a too-big model) must surface as a load error, not kill the
+            // sidecar — same boxing as the generate path.
+            let container: ModelContainer = try await withError {
+                if useVLM {
+                    return try await VLMModelFactory.shared.loadContainer(
+                        from: dir, using: #huggingFaceTokenizerLoader())
+                } else {
+                    return try await LLMModelFactory.shared.loadContainer(
+                        from: dir, using: #huggingFaceTokenizerLoader())
+                }
             }
             self.container = container
             let trained = meta.nCtxTrain ?? 4096
@@ -324,6 +383,7 @@ final class Engine: @unchecked Sendable {
                 "supportsThinking": meta.supportsThinking,
                 "thinkArg": meta.thinkArg,
                 "supportsTools": meta.supportsTools,
+                "effortLevels": meta.effortLevels,
                 // VLM-factory models have their vision tower loaded and
                 // ready — no separate encoder file like GGUF's mmproj.
                 "multimodal": meta.multimodal,
@@ -332,31 +392,44 @@ final class Engine: @unchecked Sendable {
             if let v = meta.nLayer { info["nLayer"] = v }
             if let v = meta.nEmbd { info["nEmbd"] = v }
             if let v = meta.nCtxTrain { info["nCtxTrain"] = v }
+            if let v = loadWarning { info["warning"] = v }
             out.emit(["event": "loaded", "info": info])
         } catch {
-            out.error("模型加载失败 (failed to load MLX model): \(error)")
+            out.error("failed to load MLX model: \(error)")
         }
     }
 
     func generate(messages: [WireMessage], params: WireParams) async {
         guard let container else {
-            out.error("尚未加载模型 (no model loaded)")
+            out.error("no model loaded")
             return
         }
         cancelFlag.reset()
         do {
-            try await container.perform { context in
-                try await self.run(context: context, messages: messages, params: params)
+            // withError: box MLX's C-level runtime errors (Metal allocation
+            // failures, shape errors) into thrown Swift errors. Without it the
+            // GLOBAL handler fires — and its default is assertionFailure,
+            // which killed the whole sidecar mid-task ("MLX 引擎意外退出",
+            // owner crash report 2026-08-01: _mlx_error during eval on the
+            // vision round after a screenshot). A generation must be able to
+            // fail without taking the engine down with it.
+            try await withError {
+                try await container.perform { context in
+                    try await self.run(context: context, messages: messages, params: params)
+                }
             }
         } catch {
             // A failure can leave half-evaluated KV behind — drop the cache
-            // so the next turn starts from a clean slate.
+            // so the next turn starts from a clean slate. After a Metal-level
+            // error, also return scratch buffers to the OS so a post-OOM
+            // retry starts with headroom.
             kvCache = nil
             kvTokens = []
             kvImageKeys = []
             kvState = nil
             kvEvaluated = 0
-            out.error("生成失败 (generation failed): \(error)")
+            Memory.clearCache()
+            out.error("generation failed: \(error)")
         }
     }
 
@@ -376,11 +449,16 @@ final class Engine: @unchecked Sendable {
             }
         }
         let hasImages = messages.contains { !($0.images ?? []).isEmpty }
-        var extra: [String: any Sendable]? = nil
+        var extra: [String: any Sendable] = [:]
         if let think = p.think, meta.thinkArg {
-            extra = ["enable_thinking": think]
+            extra["enable_thinking"] = think
         }
-        let userInput = UserInput(chat: chat, additionalContext: extra)
+        // Native effort rung — only when the template declares the ladder and
+        // thinking isn't off (the template rejects unknown values outright).
+        if let effort = p.effort, meta.effortLevels.contains(effort), p.think != false {
+            extra["reasoning_effort"] = effort
+        }
+        let userInput = UserInput(chat: chat, additionalContext: extra.isEmpty ? nil : extra)
         let lmInput = try await context.processor.prepare(input: userInput)
         var tokens = lmInput.text.tokens.asArray(Int32.self).map(Int.init)
 
@@ -769,19 +847,19 @@ struct ChatyMLX {
                 do {
                     cmd = try JSONDecoder().decode(WireCmd.self, from: data)
                 } catch {
-                    out.error("无法解析命令 (bad command): \(error)")
+                    out.error("bad command: \(error)")
                     continue
                 }
                 switch cmd.cmd {
                 case "load":
                     guard let path = cmd.path else {
-                        out.error("load 缺少 path (load requires path)")
+                        out.error("load requires path")
                         continue
                     }
                     await engine.load(path: path, nCtx: cmd.nCtx)
                 case "generate":
                     guard let messages = cmd.messages else {
-                        out.error("generate 缺少 messages (generate requires messages)")
+                        out.error("generate requires messages")
                         continue
                     }
                     let params = cmd.params ?? WireParams()
@@ -800,7 +878,7 @@ struct ChatyMLX {
                     // the OS reclaims everything anyway.
                     _exit(0)
                 default:
-                    out.error("未知命令 (unknown command): \(cmd.cmd)")
+                    out.error("unknown command: \(cmd.cmd)")
                 }
             }
         } catch {

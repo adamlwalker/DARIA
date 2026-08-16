@@ -21,6 +21,7 @@ import {
   type Recorder,
 } from "./lib/audio";
 import { SettingsPanel, type GenSettings, defaultSettings, parseStops } from "./components/SettingsPanel";
+import { speakWithSettings } from "./lib/tts";
 import { SetupModal } from "./components/SetupModal";
 import { KnowledgePanel } from "./components/KnowledgePanel";
 import { CommandPalette, type Command } from "./components/CommandPalette";
@@ -36,8 +37,11 @@ import { CodeMode } from "./components/CodeMode";
 import { answerOnly, cleanTitle, cutSentences, forSpeech, stripThink } from "./lib/voiceText";
 import { copyToClipboard } from "./lib/clipboard";
 import {
+  agentSetLang,
+  logAppError,
+  canvasSessionSave,
+  canvasSessionLoad,
   cancelGeneration,
-  checkUpdate,
   deleteConversation,
   fetchUrl,
   generate,
@@ -66,7 +70,6 @@ import {
   renameConversation,
   setConversationPinned,
   replaceMessages,
-  runUpdate,
   searchConversations,
   exportTextFile,
   exportHtmlFile,
@@ -74,7 +77,6 @@ import {
   saveConversation,
   saveMessage,
   setTrayLanguage,
-  synthesize,
   transcribe,
   webResearch,
   type Attachment,
@@ -87,7 +89,6 @@ import {
   type Role,
   type SearchResult,
   type StreamEvent,
-  type UpdateInfo,
 } from "./lib/ipc";
 import "./App.css";
 import { fmtGbFromMb } from "./lib/fmt";
@@ -99,6 +100,20 @@ interface UiMessage extends ChatMessage {
 
 /** Module-level thumbnail cache: path → data URL (survives re-renders). */
 const thumbCache = new Map<string, string>();
+
+/** When the UI is English, prefer the English half of a leftover bilingual
+ *  backend message (`中文 (english)`). Never invents a translation. */
+function preferEnglishBackendMsg(msg: string, lang: Lang): string {
+  if (lang === "zh" || !/[\u4e00-\u9fff]/.test(msg)) return msg;
+  const parens = [...msg.matchAll(/\(([^)]*[A-Za-z][^)]*)\)/g)];
+  const last = parens.length ? parens[parens.length - 1]?.[1]?.trim() : undefined;
+  if (last && !/[\u4e00-\u9fff]/.test(last)) return last;
+  const slash = msg.split(" / ");
+  if (slash.length === 2 && /[\u4e00-\u9fff]/.test(slash[0]) && !/[\u4e00-\u9fff]/.test(slash[1])) {
+    return slash[1].trim();
+  }
+  return msg;
+}
 
 /** Self-loading thumbnail for a local image path; hides itself if unreadable. */
 /** User-message text with a clamp for pasted walls of text: over ~15 lines or
@@ -191,7 +206,7 @@ let bootLoadStarted = false;
 const SIDEBAR_DEFAULT = 248;
 const SIDEBAR_MIN = 200;
 const SIDEBAR_MAX = 440;
-const convTitle = (t: string) => t.replace(/\s+/g, " ").trim().slice(0, 40) || "新对话";
+const convTitle = (s: string, fallback = "New chat") => s.replace(/\s+/g, " ").trim().slice(0, 40) || fallback;
 
 /** Parse `chaty://open_from_hf?model=<repo>&file=<file>` from a deep link. */
 function parseHfDeepLink(raw: string): { repo: string; file?: string } | null {
@@ -219,18 +234,7 @@ function cleanQuery(raw: string): string {
 
 const URL_RE = /https?:\/\/[^\s)）】"'<>，。、]+/g;
 
-const SUGGESTIONS_ZH = [
-  "用简单的话解释什么是量子纠缠",
-  "帮我写一封礼貌专业的请假邮件",
-  "用 Python 实现快速排序并讲解思路",
-  "给我三个适合周末的短途旅行点子",
-];
-const SUGGESTIONS_EN = [
-  "Explain quantum entanglement in simple terms",
-  "Write a polite, professional time-off request email",
-  "Implement quicksort in Python and explain the idea",
-  "Give me three ideas for a weekend getaway",
-];
+const SUGGEST_KEYS = ["suggest1", "suggest2", "suggest3", "suggest4"] as const;
 
 /** System prompt for `/webdesign` mode — pushes the model to produce a single,
  *  polished, self-contained HTML UI (pairs with the in-app HTML preview). */
@@ -322,6 +326,21 @@ export default function App() {
     });
   }, []);
   const [settings, setSettings] = useState<GenSettings>(loadSettings);
+
+  // Uncaught front-end errors land in the user-attachable error log
+  // (Settings → Open error log) so issue reports can carry real evidence.
+  useEffect(() => {
+    const onErr = (e: ErrorEvent) =>
+      void logAppError("uncaught", `${e.message}\n${e.filename}:${e.lineno}:${e.colno}\n${(e.error as Error)?.stack ?? ""}`).catch(() => {});
+    const onRej = (e: PromiseRejectionEvent) =>
+      void logAppError("unhandledrejection", String((e.reason as Error)?.stack ?? e.reason)).catch(() => {});
+    window.addEventListener("error", onErr);
+    window.addEventListener("unhandledrejection", onRej);
+    return () => {
+      window.removeEventListener("error", onErr);
+      window.removeEventListener("unhandledrejection", onRej);
+    };
+  }, []);
   const [showSettings, setShowSettings] = useState(false);
   const [showCmdk, setShowCmdk] = useState(false);
   const [canvasOpen, setCanvasOpen] = useState(false);
@@ -336,6 +355,18 @@ export default function App() {
   // Set by the canvas Stop button; the generation flow then discards the
   // partial output instead of reporting a "no HTML" error.
   const canvasCancelRef = useRef(false);
+  // Chat history writes fail SILENTLY otherwise — the message sits in the UI,
+  // the user closes the app, the transcript is gone. Log to the error log,
+  // and tell the user once per conversation.
+  const chatSaveFailWarnedRef = useRef(new Set<string>());
+  const reportChatSaveFailure = (convId: string, e: unknown) => {
+    console.error("chat save FAILED", convId, e);
+    void logAppError("chat-save-failed", `conversation ${convId}\n${String((e as Error)?.stack ?? e)}`).catch(() => {});
+    if (!chatSaveFailWarnedRef.current.has(convId)) {
+      chatSaveFailWarnedRef.current.add(convId);
+      alert(t("chatSaveFailed"));
+    }
+  };
   const [canvasStream, setCanvasStream] = useState<string | null>(null);
   const canvasStreamRef = useRef<{ acc: string; timer: number | null }>({ acc: "", timer: null });
   const [showHardware, setShowHardware] = useState(false);
@@ -362,8 +393,6 @@ export default function App() {
   const [showSetup, setShowSetup] = useState(false);
   const [notice, setNotice] = useState<{ kind: "warn" | "error"; text: string } | null>(null);
   const noticeTimer = useRef<number | null>(null);
-  const [update, setUpdate] = useState<UpdateInfo | null>(null);
-  const [updating, setUpdating] = useState(false);
   const [webEnabled, setWebEnabled] = useState(false);
   const [ragEnabled, setRagEnabled] = useState(false);
   const [showKb, setShowKb] = useState(false);
@@ -371,6 +400,16 @@ export default function App() {
   const [showDeepResearch, setShowDeepResearch] = useState(false);
   const [showKbReport, setShowKbReport] = useState(false);
   const [appMode, setAppMode] = useState<"chat" | "code">("chat");
+  /** Native reasoning-effort rung for models with a ladder (Qwen3.8). Kept
+   *  even while thinking is off, so toggling back restores the choice; models
+   *  without a ladder never send it. */
+  const [effort, setEffort] = useState(() => {
+    try {
+      return localStorage.getItem("chaty.effort") || "xhigh";
+    } catch {
+      return "xhigh";
+    }
+  });
   const [thinkEnabled, setThinkEnabled] = useState(() => {
     try {
       return localStorage.getItem("chaty.think") !== "0";
@@ -514,22 +553,11 @@ export default function App() {
     refreshConversations();
   }, []);
 
-  // Keep the tray menu labels in sync with the UI language.
+  // Keep the tray menu labels and backend error language in sync with the UI.
   useEffect(() => {
     setTrayLanguage(lang).catch(() => {});
+    agentSetLang(lang).catch(() => {});
   }, [lang]);
-
-  // Check GitHub for a newer release shortly after launch.
-  useEffect(() => {
-    const id = window.setTimeout(() => {
-      checkUpdate()
-        .then((u) => {
-          if (u.available) setUpdate(u);
-        })
-        .catch(() => {});
-    }, 3000);
-    return () => window.clearTimeout(id);
-  }, []);
 
   // Global ⌘K / Ctrl+K toggles the command palette. (DOM KeyboardEvent — the
   // bare name is React's here, imported above for composer key handling.)
@@ -625,14 +653,14 @@ export default function App() {
     try {
       if (fresh) {
         setConversationId(convId);
-        await saveConversation(convId, convTitle(userText), model?.path ?? null);
+        await saveConversation(convId, convTitle(userText, t("newChat")), model?.path ?? null);
       }
       await saveMessage(uMsg.id, convId, "user", userText);
       await saveMessage(aMsg.id, convId, "assistant", assistantText);
       await refreshConversations();
       if (fresh) void makeTitle(convId, userText);
     } catch (e) {
-      console.error(e);
+      reportChatSaveFailure(convId, e);
     }
   }
 
@@ -708,10 +736,16 @@ export default function App() {
     el.dataset.light = settings.lightScheme;
   }, [settings.theme, settings.darkScheme, settings.lightScheme]);
 
-  // Keep each reply's canvas session current (cheap: refs into state).
+  // Keep each reply's canvas session current (cheap: refs into state), and
+  // mirror it to disk — the in-memory map alone lost every iteration on app
+  // restart (the chat message only carries v1). Fire-and-forget: persistence
+  // failing must never break the canvas itself.
   useEffect(() => {
     if (canvasKey && canvasVersions.length) {
       canvasSessions.current.set(canvasKey, { versions: canvasVersions, index: canvasIndex });
+      void canvasKeyHash(canvasKey).then((h) =>
+        canvasSessionSave(h, JSON.stringify({ versions: canvasVersions, index: canvasIndex })),
+      ).catch(() => {});
     }
   }, [canvasKey, canvasVersions, canvasIndex]);
 
@@ -780,6 +814,14 @@ export default function App() {
       /* ignore */
     }
   }, [thinkEnabled]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("chaty.effort", effort);
+    } catch {
+      /* ignore */
+    }
+  }, [effort]);
 
   useEffect(() => {
     try {
@@ -908,9 +950,30 @@ export default function App() {
     } else {
       setCanvasVersions([{ html, note: t("canvasInitial") }]);
       setCanvasIndex(0);
+      // Memory miss ⇒ maybe a restart wiped the map: hydrate from disk. Only
+      // apply if the user hasn't already iterated past the fresh v1 (their
+      // new work wins over history).
+      void canvasKeyHash(html)
+        .then((h) => canvasSessionLoad(h))
+        .then((s) => {
+          if (!s) return;
+          const saved = JSON.parse(s) as { versions: CanvasVersion[]; index: number };
+          if (!saved.versions?.length || saved.versions.length < 2) return;
+          canvasSessions.current.set(html, saved);
+          setCanvasVersions((cur) => (cur.length <= 1 ? saved.versions : cur));
+          setCanvasIndex((cur) => (cur === 0 ? Math.min(saved.index, saved.versions.length - 1) : cur));
+        })
+        .catch(() => {});
     }
     setCanvasKey(html);
     setCanvasOpen(true);
+  }
+
+  /** Stable disk key for a canvas session: SHA-256 of the ORIGINAL html the
+   *  canvas was opened with (same key the in-memory map uses). */
+  async function canvasKeyHash(html: string): Promise<string> {
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(html));
+    return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
   }
   // DEV hook: drive the full canvas stack from the console/harness without a
   // model round-trip (the console-pipeline hunt needed exactly this).
@@ -1162,6 +1225,12 @@ export default function App() {
       showNotice("warn", t("mmprojFailed"));
     } else if (info.warning === "ctx-clamped" && info.nCtx) {
       showNotice("warn", t("ctxClamped", { n: info.nCtx }));
+    } else if (info.warning === "gpu-crash-cpu") {
+      showNotice("warn", t("gpuCrashCpu"));
+    } else if (info.warning === "conversion-suspect") {
+      showNotice("warn", t("conversionSuspect"));
+    } else if (info.warning === "vision-config-missing") {
+      showNotice("warn", t("visionConfigMissing"));
     }
   }
 
@@ -1171,18 +1240,7 @@ export default function App() {
     if (/out of memory|内存不足|allocate|insufficient memory/i.test(msg)) {
       showNotice("error", t("oomFail"));
     } else {
-      showNotice("error", msg.slice(0, 220));
-    }
-  }
-
-  async function applyUpdate() {
-    if (!update?.url || updating) return;
-    setUpdating(true);
-    try {
-      await runUpdate(update.url); // downloads + launches installer, then app exits
-    } catch (e) {
-      setUpdating(false);
-      showLoadError(e);
+      showNotice("error", preferEnglishBackendMsg(msg, lang).slice(0, 220));
     }
   }
 
@@ -1460,7 +1518,7 @@ export default function App() {
     const newId = uid();
     const parent = conversations.find((c) => c.id === conversationId);
     const firstUser = slice.find((m) => m.role === "user");
-    const title = parent?.title ?? convTitle(firstUser?.content ?? "新对话");
+    const title = parent?.title ?? convTitle(firstUser?.content ?? t("newChat"), t("newChat"));
     try {
       await saveConversation(newId, title, model?.path ?? null);
       const copied: UiMessage[] = [];
@@ -1692,6 +1750,11 @@ export default function App() {
     // For switch-less reasoning models, drive thinking through the backend flag.
     const thinkParam =
       model?.supportsThinking && !model.thinkSwitch ? !wantNoThink : undefined;
+    // Native effort rung: only for models whose template declares the ladder,
+    // and only when they are actually reasoning.
+    const levels = model?.effortLevels ?? [];
+    const effortParam =
+      levels.length > 0 && !wantNoThink && levels.includes(effort) ? effort : undefined;
 
     // Only tell the model today's date when the question is actually time-related,
     // otherwise short prompts can trigger the model to recite the date.
@@ -1702,24 +1765,22 @@ export default function App() {
       );
 
     const sys = settings.systemPrompt.trim();
-    const sent: ChatMessage[] = [
-      ...(needsDate
-        ? [{ role: "system" as const, content: t("todayNote", { date: formatDate(lang) }) }]
-        : []),
-      ...(webDesign ? [{ role: "system" as const, content: WEBDESIGN_PROMPT }] : []),
-      ...(sys ? [{ role: "system" as const, content: sys }] : []),
+    // ONE system message, always. Qwen3.5/3.6 chat templates assert the
+    // system turn is single and first — stacking fragments as separate
+    // system messages threw TemplateException("System message must be at
+    // the beginning.") the moment two were active at once.
+    const sysParts = [
+      ...(needsDate ? [t("todayNote", { date: formatDate(lang) })] : []),
+      ...(webDesign ? [WEBDESIGN_PROMPT] : []),
+      ...(sys ? [sys] : []),
       ...(attachment && attachment.kind !== "vision"
-        ? [
-            {
-              role: "system" as const,
-              content:
-                t("attachInstruction", { name: attachment.name }) +
-                attachment.text.slice(0, 9000),
-            },
-          ]
+        ? [t("attachInstruction", { name: attachment.name }) + attachment.text.slice(0, 9000)]
         : []),
-      ...(webContext ? [{ role: "system" as const, content: webContext }] : []),
-      ...(summaryNote ? [{ role: "system" as const, content: summaryNote }] : []),
+      ...(webContext ? [webContext] : []),
+      ...(summaryNote ? [summaryNote] : []),
+    ];
+    const sent: ChatMessage[] = [
+      ...(sysParts.length ? [{ role: "system" as const, content: sysParts.join("\n\n") }] : []),
       ...modelHistory,
     ];
 
@@ -1742,7 +1803,7 @@ export default function App() {
       synthChain = synthChain.then(async () => {
         if (q.isStopped) return;
         try {
-          const { audio, sampleRate } = await synthesize(clean, settings.voiceSpeed, settings.voiceSid);
+          const { audio, sampleRate } = await speakWithSettings(settings, clean);
           if (!q.isStopped) q.enqueue(decodeAudio(audio), sampleRate);
         } catch (e) {
           console.error(e);
@@ -1791,6 +1852,7 @@ export default function App() {
             repeatPenalty: settings.repeatPenalty,
             stop: parseStops(settings.stop),
             think: thinkParam,
+            effort: effortParam,
           },
         },
         (ev: StreamEvent) => {
@@ -1806,7 +1868,7 @@ export default function App() {
             renderMsg();
             setStats(ev.stats);
           } else if (ev.type === "error") {
-            acc.text += `\n\n**${ev.message}**`;
+            acc.text += `\n\n**${preferEnglishBackendMsg(ev.message, lang)}**`;
             if (rafId != null) {
               cancelAnimationFrame(rafId);
               rafId = null;
@@ -1831,7 +1893,7 @@ export default function App() {
         if (acc.text.trim()) await saveMessage(asstId, convId, "assistant", acc.text);
         await refreshConversations();
       } catch (e) {
-        console.error(e);
+        reportChatSaveFailure(convId, e);
       }
       // Let the model name a fresh conversation from its first question.
       if (opts.freshConv && acc.text.trim()) void makeTitle(convId, text);
@@ -1885,12 +1947,12 @@ export default function App() {
     try {
       if (freshConv) {
         setConversationId(convId);
-        await saveConversation(convId, convTitle(text), model.path);
+        await saveConversation(convId, convTitle(text, t("newChat")), model.path);
       }
       await saveMessage(userMsg.id, convId, "user", text, visionImgs);
       await refreshConversations();
     } catch (e) {
-      console.error(e);
+      reportChatSaveFailure(convId, e);
     }
 
     await streamAssistant(history, asstMsg.id, convId, { freshConv });
@@ -1990,7 +2052,7 @@ export default function App() {
       setRecorder(rec);
     } catch (e) {
       console.error(e);
-      setAttachError("无法访问麦克风 / Microphone unavailable");
+      setAttachError(t("micUnavailable"));
     }
   }
 
@@ -2001,7 +2063,7 @@ export default function App() {
     stopSpeaking();
     try {
       setSpeaking(true);
-      const { audio, sampleRate } = await synthesize(clean, settings.voiceSpeed, settings.voiceSid);
+      const { audio, sampleRate } = await speakWithSettings(settings, clean);
       const pb = playAudio(decodeAudio(audio), sampleRate);
       playbackRef.current = pb;
       await pb.done;
@@ -2162,7 +2224,7 @@ export default function App() {
       <header className="titlebar" data-tauri-drag-region>
         <div className="brand">
           <span className="brand-dot" />
-          Chaty
+          DARIA
         </div>
 
         <div className="mode-switch" role="tablist" aria-label="Mode">
@@ -2612,7 +2674,7 @@ export default function App() {
                 )}
                 {model && (
                   <div className="suggestions">
-                    {(lang === "zh" ? SUGGESTIONS_ZH : SUGGESTIONS_EN).map((s) => (
+                    {SUGGEST_KEYS.map((k) => t(k)).map((s) => (
                       <button key={s} className="suggestion" onClick={() => setInput(s)}>
                         {s}
                       </button>
@@ -3018,6 +3080,52 @@ export default function App() {
                         </button>
                       </div>
                     </div>
+                    {/* Thinking. Models with a native effort ladder (Qwen3.8)
+                        get a submenu of their own rungs; every other model
+                        keeps the plain on/off item, byte-for-byte as before. */}
+                    {(model?.effortLevels?.length ?? 0) > 0 ? (
+                      <div className="tool-group">
+                        <button
+                          className={`tool-item tool-parent ${thinkEnabled ? "on" : ""}`}
+                          onClick={() => {
+                            const next = !thinkEnabled;
+                            setThinkEnabled(next);
+                            if (next) setWebEnabled(false);
+                          }}
+                          title={t("effortHint")}
+                        >
+                          <svg className="ti-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
+                            <path d="M9.5 18h5M10.5 21h3" strokeLinecap="round" />
+                            <path d="M12 3a6 6 0 0 0-3.5 10.9c.6.4 1 1.1 1 1.8v.3h5v-.3c0-.7.4-1.4 1-1.8A6 6 0 0 0 12 3z" strokeLinejoin="round" />
+                          </svg>
+                          <span className="ti-label">{t("toolThink")}</span>
+                          <span className="ti-check">
+                            {thinkEnabled ? <Icon name="check" size={12} strokeWidth={2.4} /> : ""}
+                          </span>
+                          <span className="ti-caret">›</span>
+                        </button>
+                        <div className="tool-submenu">
+                          {(model?.effortLevels ?? []).map((lvl) => (
+                            <button
+                              key={lvl}
+                              className={`tool-item ${thinkEnabled && effort === lvl ? "on" : ""}`}
+                              onClick={() => {
+                                setEffort(lvl);
+                                setThinkEnabled(true);
+                                setWebEnabled(false);
+                              }}
+                            >
+                              <span className="ti-label">
+                                {t(lvl === "low" ? "effortLow" : lvl === "medium" ? "effortMedium" : "effortXhigh")}
+                              </span>
+                              <span className="ti-check">
+                                {thinkEnabled && effort === lvl ? <Icon name="check" size={12} strokeWidth={2.4} /> : ""}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    ) : (
                     <button
                       className={`tool-item ${thinkEnabled && model?.supportsThinking ? "on" : ""}`}
                       onClick={() => {
@@ -3037,6 +3145,7 @@ export default function App() {
                         {thinkEnabled && model?.supportsThinking ? <Icon name="check" size={12} strokeWidth={2.4} /> : ""}
                       </span>
                     </button>
+                    )}
                     <button
                       className={`tool-item ${webDesign ? "on" : ""}`}
                       onClick={() => setWebDesign((v) => !v)}
@@ -3155,21 +3264,6 @@ export default function App() {
         </div>
       </div>
       <ContextMenu />
-      {update?.available && (
-        <div className="update-banner">
-          <span className="update-text">{t("updateAvailable", { v: update.latest })}</span>
-          <button className="update-btn primary" onClick={applyUpdate} disabled={updating}>
-            {updating ? t("updateDownloading") : t("updateNow")}
-          </button>
-          <button
-            className="update-btn"
-            onClick={() => setUpdate(null)}
-            disabled={updating}
-          >
-            {t("updateLater")}
-          </button>
-        </div>
-      )}
       {notice && (
         <div
           className={`toast toast-${notice.kind}`}

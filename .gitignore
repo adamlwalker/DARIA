@@ -32,3 +32,6 @@ src-tauri/mlx-sidecar/.build/
 *.sln
 *.sw?
 .preview-dist/
+
+# Local rebrand / update notes (not part of the project)
+update.md

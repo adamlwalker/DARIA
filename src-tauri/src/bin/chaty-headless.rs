@@ -115,6 +115,7 @@ fn load_engine(path: &str, n_ctx: Option<u32>) -> Result<ModelInfo, String> {
             has_chat_template: true,
             supports_thinking: false,
             think_switch: false,
+            effort_levels: Vec::new(),
             supports_tools: true,
             multimodal: false,
             vision_ready: false,
@@ -362,12 +363,19 @@ async fn dispatch(cmd: &str, args: Value, id: u64) {
             let tool = match req_s(&args, "tool") { Ok(x) => x, Err(e) => return reply(id, Err(e)) };
             res(chaty_lib::mcp::mcp_call(server, tool, args.get("args").cloned().unwrap_or_default()).await)
         }
+        "agent_resolve_image" => match req_s(&args, "path") {
+            Ok(p) => res(ag::agent_resolve_image(p)),
+            Err(e) => Err(e),
+        },
         _ => Err(format!("unsupported in headless bench: {cmd}")),
     };
     reply(id, r);
 }
 
 fn main() {
+    // Reap headless Chromes left by SIGKILLed bench runs before this one
+    // launches its own (a live sibling's browser is skipped by pid check).
+    chaty_lib::browser::sweep_orphan_browsers();
     // Bench A/B hook: flip hashline anchors on from the environment so the
     // whole session (read_file prefixes + edit_lines) runs in anchor mode.
     if std::env::var("CHATY_EDIT_ANCHORS").map(|v| v == "1").unwrap_or(false) {

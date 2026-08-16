@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { open } from "@tauri-apps/plugin-dialog";
-import { useI18n } from "../lib/i18n";
+import { agentLang, useI18n } from "../lib/i18n";
 import { diffLines } from "../lib/diff";
 import { useConfirm } from "./ConfirmModal";
 import { BUILTIN_SKILLS } from "../lib/skills";
@@ -87,6 +87,16 @@ interface CodeMsg {
 }
 
 const THINK_MODES: ThinkMode[] = ["off", "normal", "deep"];
+/** Models with a native effort ladder (Qwen3.8) show the model's own rungs
+ *  instead of Chaty's generic intensities — off still means enable_thinking
+ *  false, which the ladder itself has no rung for. */
+const NATIVE_THINK_MODES: ThinkMode[] = ["off", "low", "normal", "deep"];
+/** thinkMode → the native rung it requests. */
+const EFFORT_OF: Partial<Record<ThinkMode, string>> = {
+  low: "low",
+  normal: "medium",
+  deep: "xhigh",
+};
 
 const RAIL_DEFAULT = 240;
 const RAIL_MIN = 180;
@@ -538,9 +548,12 @@ export function CodeMode({
   const [previewImg, setPreviewImg] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [bypass, setBypass] = useState(false);
+  /** The model exposes a native reasoning-effort ladder (Qwen3.8) — the think
+   *  switch then shows the model's own rungs instead of Chaty's intensities. */
+  const nativeEffort = (model?.effortLevels?.length ?? 0) > 0;
   const [thinkMode, setThinkMode] = useState<ThinkMode>(() => {
     const v = localStorage.getItem("chaty.code.think");
-    return v === "off" || v === "normal" || v === "deep" ? v : "normal";
+    return v === "off" || v === "low" || v === "normal" || v === "deep" ? v : "normal";
   });
   const [approval, setApproval] = useState<{ call: ToolCall; resolve: (ok: boolean) => void } | null>(null);
   /** Out-of-workspace access request from the agent (grant persists this session). */
@@ -710,13 +723,49 @@ export function CodeMode({
    *  over the first-message fallback on every later persist. */
   const titlesRef = useRef(new Map<string, string>());
 
+  /** Sessions already warned about a failing save — one alert, not a storm. */
+  const saveFailWarnedRef = useRef(new Set<string>());
+
   const persist = useCallback((next: CodeMsg[], ws: string | null, id: string) => {
     const firstUser = next.find((m) => m.role === "user");
     const fallback =
       (firstUser?.text ?? "New session").replace(/\s+/g, " ").trim().slice(0, 48) || "New session";
     const title = titlesRef.current.get(id) ?? fallback;
-    codeSessionSave(id, title, ws, JSON.stringify(next)).then(refreshSessions).catch(() => {});
+    codeSessionSave(id, title, ws, JSON.stringify(next))
+      .then(refreshSessions)
+      .catch((e) => {
+        // A silently-swallowed save failure is invisible data loss — the
+        // calculator-session audit ended with a transcript the owner thought
+        // was kept and no row in the database. Log loudly; once per session,
+        // tell the user their transcript is not persisting.
+        console.error("code session save FAILED", id, e);
+        if (!saveFailWarnedRef.current.has(id)) {
+          saveFailWarnedRef.current.add(id);
+          alert(
+            "会话保存失败——当前对话记录没有写入磁盘,重启后会丢失。请检查磁盘空间/权限。\n(Session save failed — this transcript is NOT persisting to disk.)",
+          );
+        }
+      });
   }, [refreshSessions]);
+
+  /** Debounced mid-run persist: trailing 2s, drops when the session moved. */
+  const persistTimerRef = useRef<number | null>(null);
+  const persistSoon = useCallback(
+    (id: string) => {
+      if (persistTimerRef.current !== null) return;
+      persistTimerRef.current = window.setTimeout(() => {
+        persistTimerRef.current = null;
+        if (bodyRef.current.sid !== id) return;
+        setMsgs((cur) => {
+          persist(cur, bodyRef.current.workspace, id);
+          return cur;
+        });
+      }, 2000);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
 
   /** Ask the model for a concise session title after the first turn —
    *  mirrors the chat side's makeTitle (no-think, low temperature). */
@@ -1023,7 +1072,7 @@ export function CodeMode({
       newSession();
     } else if (cmd.startsWith("/think ")) {
       const arg = cmd.slice(7).trim();
-      if (arg === "off" || arg === "normal" || arg === "deep") {
+      if (arg === "off" || arg === "low" || arg === "normal" || arg === "deep") {
         setThinkMode(arg);
         localStorage.setItem("chaty.code.think", arg);
       }
@@ -1181,6 +1230,12 @@ export function CodeMode({
     // The session this turn belongs to — if the user deletes it mid-run the
     // live sid moves on, and the turn's results must not be written anywhere.
     const turnSid = bodyRef.current.sid;
+    // First message = the session EXISTS: on disk, in the sidebar, named
+    // (fallback title from the message text; the model-polished title still
+    // lands after the turn). Persisting only at turn end meant a paused or
+    // crashed first turn left ZERO rows — the calculator and minesweeper
+    // audits both lost their transcripts to exactly that.
+    persist(base, bodyRef.current.workspace, turnSid);
 
     const signal = new AgentSignal();
     signalRef.current = signal;
@@ -1190,10 +1245,11 @@ export function CodeMode({
     const turnImages = visionImgs;
     setCodeAttachments([]);
     const modelInput = attachCtx ? `${attachCtx}\n\n${text}` : text;
-    await runAgentTurn(modelInput, history, workspace, lang, {
+    await runAgentTurn(modelInput, history, workspace, agentLang(lang), {
       thinkMode,
       supportsThinking: model.supportsThinking,
       thinkSwitch: model.thinkSwitch,
+      effort: nativeEffort ? EFFORT_OF[thinkMode] : undefined,
       nCtx: model.nCtx ?? undefined,
       maxSteps,
       temperature,
@@ -1267,7 +1323,7 @@ export function CodeMode({
           setAsk({ question, options, resolve });
         }),
       onAssistantText: (full) => update((m) => ({ ...m, text: full })),
-      onStep: (step) =>
+      onStep: (step) => {
         update((m) => {
           const steps = [...m.steps];
           const i = steps.findIndex((s) => s.id === step.id);
@@ -1275,7 +1331,12 @@ export function CodeMode({
           else steps.push(step);
           // the reasoning is now captured on the step → clear the live buffer
           return { ...m, steps, liveThinking: "" };
-        }),
+        });
+        // Mid-run durability: every step lands on disk (debounced), so a
+        // pause + quit — or a crash — loses at most the last two seconds,
+        // not the whole transcript.
+        persistSoon(turnSid);
+      },
       onFinal: (final, thinking, reason) =>
         update((m) => ({
           ...m,
@@ -1431,8 +1492,8 @@ export function CodeMode({
               </div>
             );
           })()}
-          <div className="cm-think-switch" title={t("cmThinkHint")}>
-            {THINK_MODES.map((mode) => (
+          <div className="cm-think-switch" title={t(nativeEffort ? "effortHint" : "cmThinkHint")}>
+            {(nativeEffort ? NATIVE_THINK_MODES : THINK_MODES).map((mode) => (
               <button
                 key={mode}
                 className={`cm-think-tab ${thinkMode === mode ? "active" : ""}`}
@@ -1442,7 +1503,19 @@ export function CodeMode({
                 }}
                 disabled={running}
               >
-                {t(mode === "off" ? "cmThinkOff" : mode === "normal" ? "cmThinkNormal" : "cmThinkDeep")}
+                {t(
+                  mode === "off"
+                    ? "cmThinkOff"
+                    : nativeEffort
+                      ? mode === "low"
+                        ? "effortLow"
+                        : mode === "normal"
+                          ? "effortMedium"
+                          : "effortXhigh"
+                      : mode === "normal"
+                        ? "cmThinkNormal"
+                        : "cmThinkDeep",
+                )}
               </button>
             ))}
           </div>

@@ -1,23 +1,24 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
-import { useI18n } from "../lib/i18n";
+import { useI18n, type TKey } from "../lib/i18n";
 import { useExitTransition } from "../lib/useExit";
 import { Icon } from "./Icon";
 import {
   openDataDir,
   clearAllConversations,
-  checkUpdate,
-  runUpdate,
   dataStats,
   listModels,
   ragStatus,
   ragClearAll,
   openModelsDir,
   openExternal,
-  synthesize,
-  type UpdateInfo,
+  listEdgeVoices,
+  openErrorLog,
+  type EdgeVoice,
 } from "../lib/ipc";
 import { decodeAudio, playAudio } from "../lib/audio";
+import { SAMPLING_PRESETS, matchingSamplingPreset, applySamplingPresetValues } from "../lib/samplingPresets";
+import { speakWithSettings, DEFAULT_EDGE_VOICE, type TtsEngine } from "../lib/tts";
 import { CODE_THEMES, type CodeTheme } from "../lib/codeTheme";
 import { useConfirm } from "./ConfirmModal";
 import { Select } from "./Select";
@@ -52,8 +53,16 @@ export interface GenSettings {
   presets: PromptPreset[];
   /** Kokoro voice id (0–10). */
   voiceSid: number;
-  /** Speech rate multiplier (0.5–2.0). */
+  /** Speech rate multiplier (0.5–2.0). Shared by Kokoro and Edge TTS. */
   voiceSpeed: number;
+  /** Read-aloud engine. Live voice chat always stays on Kokoro. */
+  ttsEngine: TtsEngine;
+  /** Microsoft Edge TTS short name (e.g. en-US-JennyNeural). */
+  edgeVoice: string;
+  /** Edge TTS pitch offset in Hz (−50…+50). Ignored by Kokoro. */
+  voicePitch: number;
+  /** Edge TTS volume offset in percent (−50…+50). Ignored by Kokoro. */
+  voiceVolume: number;
   /** GPU offload: -1 = auto‑tune by VRAM, 0 = CPU only, >0 = that many layers. */
   gpuLayers: number;
   /** Context window to load the model with: 0 = memory-friendly default (≤8192),
@@ -128,9 +137,13 @@ export const defaultSettings: GenSettings = {
   presets: [],
   voiceSid: 0,
   voiceSpeed: 1.0,
+  ttsEngine: "kokoro",
+  edgeVoice: DEFAULT_EDGE_VOICE,
+  voicePitch: 0,
+  voiceVolume: 0,
   gpuLayers: -1,
   contextLength: 0,
-  codeMaxSteps: 32,
+  codeMaxSteps: 64,
   codeBashTimeout: 60,
   codeTemperature: 0.3,
   codeThinkBudget: 0,
@@ -267,8 +280,6 @@ export function SettingsPanel({
   const confirm = useConfirm();
   const [cat, setCat] = useState<CatId>("general");
   const [presetName, setPresetName] = useState("");
-  const [upd, setUpd] = useState<UpdateInfo | null>(null);
-  const [checking, setChecking] = useState(false);
   const set = <K extends keyof GenSettings>(key: K, v: GenSettings[K]) =>
     onChange({ ...value, [key]: v });
 
@@ -313,13 +324,49 @@ export function SettingsPanel({
 
   // ---- Voice preview ----
   const [voiceTesting, setVoiceTesting] = useState(false);
+  const [edgeVoices, setEdgeVoices] = useState<EdgeVoice[]>([]);
+  const [edgeVoicesErr, setEdgeVoicesErr] = useState("");
+  const [edgeVoicesLoading, setEdgeVoicesLoading] = useState(false);
   const testVoice = () => {
     if (voiceTesting) return;
     setVoiceTesting(true);
-    synthesize("Hi! This is how I sound. Nice to meet you.", value.voiceSpeed, value.voiceSid)
+    speakWithSettings(value, "Hi! This is how I sound. Nice to meet you.")
       .then((a) => playAudio(decodeAudio(a.audio), a.sampleRate).done)
-      .catch(console.error)
+      .catch((e) => {
+        console.error(e);
+        setEdgeVoicesErr(e instanceof Error ? e.message : String(e));
+      })
       .finally(() => setVoiceTesting(false));
+  };
+  useEffect(() => {
+    if (!open || cat !== "voice" || value.ttsEngine !== "edge") return;
+    let cancelled = false;
+    setEdgeVoicesLoading(true);
+    listEdgeVoices()
+      .then((vs) => {
+        if (cancelled) return;
+        setEdgeVoices(vs);
+        setEdgeVoicesErr("");
+        if (vs.length && !vs.some((v) => v.shortName === value.edgeVoice)) {
+          set("edgeVoice", vs[0].shortName);
+        }
+      })
+      .catch((e) => {
+        if (!cancelled) setEdgeVoicesErr(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => {
+        if (!cancelled) setEdgeVoicesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, cat, value.ttsEngine]);
+
+  const applySamplingPreset = (id: string) => {
+    const p = SAMPLING_PRESETS.find((x) => x.id === id);
+    if (!p) return;
+    onChange(applySamplingPresetValues(value, p));
   };
 
   const savePreset = () => {
@@ -433,7 +480,7 @@ export function SettingsPanel({
     { id: "chat", label: t("setCatChat") },
     { id: "sampling", label: t("setCatSampling") },
     { id: "model", label: t("setCatModel") },
-    { id: "code", label: "Code" },
+    { id: "code", label: t("setCatCode") },
     // TTS is English-only, so the voice section only exists in English UI.
     ...(lang === "en" ? [{ id: "voice" as CatId, label: t("setCatVoice") }] : []),
     { id: "data", label: t("setCatData") },
@@ -528,6 +575,13 @@ export function SettingsPanel({
               <SetRow label={t("setReduceMotion")} hint={t("setReduceMotionHint")}>
                 <Switch on={value.reduceMotion} onToggle={() => set("reduceMotion", !value.reduceMotion)} />
               </SetRow>
+              <SetRow label={t("errorLog")} hint={t("errorLogHint")}>
+                <div className="lang-switch">
+                  <button type="button" onClick={() => { void openErrorLog().catch(() => {}); }}>
+                    {t("errorLogOpen")}
+                  </button>
+                </div>
+              </SetRow>
             </>
           )}
 
@@ -611,6 +665,22 @@ export function SettingsPanel({
           {cat === "sampling" && (
             <>
               <label className="field">
+                <span>{t("samplingPreset")}</span>
+                <Select
+                  className="field-select"
+                  value={matchingSamplingPreset(value)}
+                  ariaLabel={t("samplingPreset")}
+                  onChange={(id) => {
+                    if (id) applySamplingPreset(id);
+                  }}
+                  options={[
+                    { value: "", label: t("samplingPresetCustom") },
+                    ...SAMPLING_PRESETS.map((p) => ({ value: p.id, label: t(p.labelKey as TKey), group: p.family })),
+                  ]}
+                />
+              </label>
+              <div className="settings-hint">{t("samplingPresetHint")}</div>
+              <label className="field">
                 <span>
                   <em className="has-tip" data-tip={t("tipTemperature")}>{t("temperature")}</em> <b>{value.temperature.toFixed(2)}</b>
                 </span>
@@ -684,6 +754,11 @@ export function SettingsPanel({
               >
                 {t("resetDefaults")}
               </button>
+              {onReloadModel && (
+                <button className="settings-reload" onClick={onReloadModel} disabled={reloading}>
+                  {reloading ? "…" : t("reloadApply")}
+                </button>
+              )}
             </>
           )}
 
@@ -1169,27 +1244,108 @@ export function SettingsPanel({
           {cat === "voice" && lang === "en" && (
             <>
               <label className="field">
-                <span>{t("voice")}</span>
-                <Select
-                  className="field-select"
-                  value={value.voiceSid}
-                  ariaLabel={t("voice")}
-                  onChange={(v) => set("voiceSid", v)}
-                  options={VOICES.map((name, i) => ({ value: i, label: name }))}
-                />
+                <span>{t("ttsEngine")}</span>
+                <div className="lang-switch">
+                  <button
+                    type="button"
+                    className={value.ttsEngine === "kokoro" ? "active" : ""}
+                    onClick={() => set("ttsEngine", "kokoro")}
+                  >
+                    {t("ttsEngineKokoro")}
+                  </button>
+                  <button
+                    type="button"
+                    className={value.ttsEngine === "edge" ? "active" : ""}
+                    onClick={() => set("ttsEngine", "edge")}
+                  >
+                    {t("ttsEngineEdge")}
+                  </button>
+                </div>
               </label>
+              {value.ttsEngine === "edge" && (
+                <div className="settings-warn" role="alert">
+                  {t("ttsEdgePrivacyWarn")}
+                </div>
+              )}
+              {value.ttsEngine === "kokoro" ? (
+                <label className="field">
+                  <span>{t("voice")}</span>
+                  <Select
+                    className="field-select"
+                    value={value.voiceSid}
+                    ariaLabel={t("voice")}
+                    onChange={(v) => set("voiceSid", v)}
+                    options={VOICES.map((name, i) => ({ value: i, label: name }))}
+                  />
+                </label>
+              ) : (
+                <label className="field">
+                  <span>{t("edgeVoices")}</span>
+                  {edgeVoicesLoading && !edgeVoices.length ? (
+                    <div className="settings-hint">{t("edgeVoiceLoading")}</div>
+                  ) : (
+                    <Select
+                      className="field-select"
+                      value={value.edgeVoice}
+                      ariaLabel={t("edgeVoices")}
+                      onChange={(v) => set("edgeVoice", v)}
+                      options={(edgeVoices.length
+                        ? edgeVoices
+                        : [{ shortName: value.edgeVoice || DEFAULT_EDGE_VOICE, friendlyName: value.edgeVoice || DEFAULT_EDGE_VOICE, locale: "", gender: "" }]
+                      ).map((v) => ({
+                        value: v.shortName,
+                        label: v.gender ? `${v.friendlyName} · ${v.gender}` : v.friendlyName,
+                        group: v.locale || undefined,
+                      }))}
+                    />
+                  )}
+                  {edgeVoicesErr && <div className="settings-hint">{t("edgeVoiceFailed")}</div>}
+                </label>
+              )}
               <label className="field">
                 <span>
                   {t("voiceSpeed")} <b>{value.voiceSpeed.toFixed(2)}×</b>
                 </span>
                 <input type="range" min={0.5} max={2} step={0.05} value={value.voiceSpeed} onChange={(e) => set("voiceSpeed", Number(e.target.value))} />
               </label>
+              {value.ttsEngine === "edge" && (
+                <>
+                  <label className="field">
+                    <span>
+                      <em className="has-tip" data-tip={t("tipPitch")}>{t("voicePitch")}</em>{" "}
+                      <b>{value.voicePitch >= 0 ? "+" : ""}{value.voicePitch.toFixed(0)} Hz</b>
+                    </span>
+                    <input
+                      type="range"
+                      min={-50}
+                      max={50}
+                      step={1}
+                      value={value.voicePitch}
+                      onChange={(e) => set("voicePitch", Number(e.target.value))}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>
+                      <em className="has-tip" data-tip={t("tipVolume")}>{t("voiceVolume")}</em>{" "}
+                      <b>{value.voiceVolume >= 0 ? "+" : ""}{value.voiceVolume.toFixed(0)}%</b>
+                    </span>
+                    <input
+                      type="range"
+                      min={-50}
+                      max={50}
+                      step={1}
+                      value={value.voiceVolume}
+                      onChange={(e) => set("voiceVolume", Number(e.target.value))}
+                    />
+                  </label>
+                </>
+              )}
               <SetRow label={t("voicePreview")} hint={t("voicePreviewHint")}>
                 <button type="button" className="data-btn" disabled={voiceTesting} onClick={testVoice}>
                   {voiceTesting ? "…" : t("voicePreviewBtn")}
                 </button>
               </SetRow>
-              <div className="settings-hint">{t("voiceEngineHint")}</div>
+              <div className="settings-hint">{value.ttsEngine === "edge" ? t("ttsEngineHint") : t("voiceEngineHint")}</div>
             </>
           )}
 
@@ -1284,49 +1440,12 @@ export function SettingsPanel({
 
           {cat === "about" && (
             <div className="about-card">
-              <img className="about-logo" src={logoUrl} alt="Chaty" draggable={false} />
-              <div className="about-name">Chaty</div>
+              <img className="about-logo" src={logoUrl} alt="DARIA" draggable={false} />
+              <div className="about-name">DARIA</div>
               <div className="about-version">v{__APP_VERSION__}</div>
               <div className="about-tagline">{t("aboutTagline")}</div>
-              <div className="about-actions">
-                <button
-                  type="button"
-                  className="data-btn"
-                  disabled={checking}
-                  onClick={() => {
-                    setChecking(true);
-                    setUpd(null);
-                    checkUpdate()
-                      .then(setUpd)
-                      .catch(() => setUpd({ available: false, current: __APP_VERSION__, latest: __APP_VERSION__ }))
-                      .finally(() => setChecking(false));
-                  }}
-                >
-                  {checking ? "…" : t("aboutCheckUpdate")}
-                </button>
-                {upd?.available && upd.url && (
-                  <button
-                    type="button"
-                    className="data-btn accent"
-                    onClick={() => void runUpdate(upd.url!).catch(console.error)}
-                  >
-                    {t("aboutUpdateNow")}
-                  </button>
-                )}
-              </div>
-              {upd && (
-                <div className="about-status">
-                  {upd.available
-                    ? `${t("aboutNewVersion")}: v${upd.latest}`
-                    : t("aboutUpToDate")}
-                </div>
-              )}
               <div className="about-links">
-                <button type="button" onClick={() => void openExternal("https://chaty.ca").catch(console.error)}>
-                  chaty.ca
-                </button>
-                <span aria-hidden="true">·</span>
-                <button type="button" onClick={() => void openExternal("https://github.com/Fangyuan025/Chaty").catch(console.error)}>
+                <button type="button" onClick={() => void openExternal("https://github.com/adamlwalker/DARIA").catch(console.error)}>
                   GitHub
                 </button>
               </div>

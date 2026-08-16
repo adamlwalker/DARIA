@@ -1,4 +1,4 @@
-; Inno Setup script for Chaty — a modern, per-user installer.
+; Inno Setup script for DARIA — a modern, per-user installer.
 ; Build:  ISCC /DAppVersion=x.y.z /DSrcDir=C:\path\to\release Chaty.iss
 ; (AppVersion + SrcDir can also be left to the defaults below.)
 
@@ -9,13 +9,13 @@
   #define SrcDir "..\..\..\..\ct\release"
 #endif
 
-#define AppName "Chaty"
-#define AppPublisher "Fangyuan Lin"
-#define AppURL "https://github.com/Fangyuan025/Chaty"
-#define AppExe "chaty.exe"
+#define AppName "DARIA"
+#define AppPublisher "Adam Walker"
+#define AppURL "https://github.com/adamlwalker/DARIA"
+#define AppExe "daria.exe"
 
 [Setup]
-AppId={{8F4C9E2A-3B7D-4E1C-9A6F-CHATY0DESKTOP}
+AppId={{8F4C9E2A-3B7D-4E1C-9A6F-DARIA0DESKTOP}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
@@ -30,7 +30,7 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir={#SrcDir}\bundle\inno
-OutputBaseFilename=Chaty_{#AppVersion}_x64-setup
+OutputBaseFilename=DARIA_{#AppVersion}_x64-setup
 SetupIconFile=..\icons\icon.ico
 UninstallDisplayIcon={app}\{#AppExe}
 UninstallDisplayName={#AppName}

@@ -40,6 +40,128 @@ pub fn is_mlx_dir(path: &Path) -> bool {
     })
 }
 
+const WRAP_PREFIX: &str = "language_model.";
+
+/// Strip a uniform VLM-style `language_model.` wrapper off every weight key
+/// of a TEXT-ONLY checkpoint (converter artifact; the LFM2.5 quants shipped
+/// this way and the text factory dies with keyNotFound on the first key).
+///
+/// Safetensors layout is `u64 header-len | header JSON | data`; renames only
+/// SHRINK the JSON, so the rewritten header is padded with trailing spaces
+/// back to its exact original length and written in place — the data section
+/// never moves, so a multi-gigabyte model costs a kilobyte-sized write.
+/// Applies ONLY when EVERY tensor key wears the prefix — a real VLM always
+/// carries vision_tower / multi_modal_projector siblings, so the uniform
+/// condition fails naturally and its wrapper stays. (The config's own
+/// vision_config is NOT consulted: the LFM2.5 quants keep a VL config shell
+/// on a text-only weight tree, which is exactly the case to heal.)
+pub(crate) fn heal_wrapped_weight_prefix(dir: &Path) -> Result<()> {
+    let shards: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |x| x.eq_ignore_ascii_case("safetensors")))
+        .collect();
+    if shards.is_empty() {
+        return Ok(());
+    }
+    // Pass 1: every tensor key in every shard must wear the wrapper.
+    let mut headers = Vec::new();
+    for shard in &shards {
+        let (len, json) = read_st_header(shard)?;
+        let obj = json.as_object().context("safetensors header is not an object")?;
+        for k in obj.keys() {
+            if k != "__metadata__" && !k.starts_with(WRAP_PREFIX) {
+                return Ok(()); // mixed or already-clean tree — not ours to touch
+            }
+        }
+        if !obj.keys().any(|k| k != "__metadata__") {
+            return Ok(());
+        }
+        headers.push((shard.clone(), len, json));
+    }
+    // Pass 2: rewrite headers in place, padded to the original length.
+    for (shard, orig_len, json) in headers {
+        let mut renamed = serde_json::Map::new();
+        for (k, v) in json.as_object().unwrap() {
+            let nk = if k == "__metadata__" {
+                k.clone()
+            } else {
+                k.strip_prefix(WRAP_PREFIX).unwrap_or(k).to_string()
+            };
+            renamed.insert(nk, v.clone());
+        }
+        let mut out = serde_json::to_string(&Value::Object(renamed))?;
+        if out.len() > orig_len {
+            bail!("renamed header grew — refusing to shift tensor data");
+        }
+        out.push_str(&" ".repeat(orig_len - out.len()));
+        use std::io::{Seek, SeekFrom, Write as _};
+        let mut f = std::fs::OpenOptions::new().write(true).open(&shard)?;
+        f.seek(SeekFrom::Start(8))?;
+        f.write_all(out.as_bytes())?;
+        f.sync_all()?;
+    }
+    // The index (when present) maps the same key names.
+    let index = dir.join("model.safetensors.index.json");
+    if index.is_file() {
+        let mut idx: Value = serde_json::from_str(&std::fs::read_to_string(&index)?)?;
+        if let Some(map) = idx.get_mut("weight_map").and_then(|m| m.as_object_mut()) {
+            let renamed: serde_json::Map<String, Value> = map
+                .iter()
+                .map(|(k, v)| {
+                    (k.strip_prefix(WRAP_PREFIX).unwrap_or(k).to_string(), v.clone())
+                })
+                .collect();
+            *map = renamed;
+        }
+        std::fs::write(&index, serde_json::to_string(&idx)?)?;
+    }
+    eprintln!("[mlx] healed weight keys: stripped `{WRAP_PREFIX}` wrapper in {dir:?}");
+    Ok(())
+}
+
+/// LFM2.5 configs express the FFN width as standard `intermediate_size`,
+/// but the engine's LFM2 reader only understands `block_ff_dim` and falls
+/// back to a wrong default without it — weights then fail shape validation
+/// (w2.scales expected [2048,32], actual [2048,168]). Mirror the value in.
+pub(crate) fn heal_lfm2_ff_dim(dir: &Path) -> Result<()> {
+    let cfg_path = dir.join("config.json");
+    let mut cfg: Value = serde_json::from_str(&std::fs::read_to_string(&cfg_path)?)?;
+    let obj = match cfg.as_object_mut() {
+        Some(o) => o,
+        None => return Ok(()),
+    };
+    if obj.get("model_type").and_then(|v| v.as_str()) != Some("lfm2") {
+        return Ok(());
+    }
+    if obj.contains_key("block_ff_dim") {
+        return Ok(());
+    }
+    let Some(inter) = obj.get("intermediate_size").and_then(|v| v.as_u64()) else {
+        return Ok(());
+    };
+    obj.insert("block_ff_dim".into(), json!(inter));
+    std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg)?)?;
+    eprintln!("[mlx] healed lfm2 config: block_ff_dim = {inter} (from intermediate_size)");
+    Ok(())
+}
+
+/// Read a safetensors header: (header byte length, parsed JSON).
+fn read_st_header(path: &Path) -> Result<(usize, Value)> {
+    use std::io::Read as _;
+    let mut f = std::fs::File::open(path)?;
+    let mut lenb = [0u8; 8];
+    f.read_exact(&mut lenb)?;
+    let len = u64::from_le_bytes(lenb) as usize;
+    if len == 0 || len > 256 * 1024 * 1024 {
+        bail!("implausible safetensors header length {len}");
+    }
+    let mut buf = vec![0u8; len];
+    f.read_exact(&mut buf)?;
+    let json: Value = serde_json::from_slice(&buf).context("safetensors header parse")?;
+    Ok((len, json))
+}
+
 /// The folder's config.json declares a vision tower (natively-multimodal
 /// architectures like the Qwen3.5 family) — vision works once loaded.
 pub fn mlx_dir_has_vision(path: &Path) -> bool {
@@ -213,10 +335,10 @@ impl MlxEngine {
         progress: impl Fn(f32),
     ) -> Result<(Self, ModelInfo)> {
         let sidecar = find_sidecar().ok_or_else(|| {
-            anyhow!(
-                "未找到 MLX 引擎组件 chaty-mlx，请重新安装应用 \
-                 (the chaty-mlx sidecar is missing; please reinstall)"
-            )
+            anyhow!(crate::agent::tr(
+                "未找到 MLX 引擎组件 chaty-mlx，请重新安装应用",
+                "the chaty-mlx sidecar is missing; please reinstall",
+            ))
         })?;
         Self::load_with_sidecar(&sidecar, dir, n_ctx, progress)
     }
@@ -230,9 +352,23 @@ impl MlxEngine {
         let dir_path = PathBuf::from(dir);
         if !is_mlx_dir(&dir_path) {
             bail!(
-                "不是有效的 MLX 模型文件夹（需要 config.json 与 .safetensors） \
-                 (not an MLX model folder: config.json + .safetensors required)"
+                "{}",
+                crate::agent::tr(
+                    "不是有效的 MLX 模型文件夹（需要 config.json 与 .safetensors）",
+                    "not an MLX model folder: config.json + .safetensors required",
+                )
             );
+        }
+        // Some community quants of TEXT models keep a VLM-style
+        // `language_model.` wrapper on every weight key (the LFM2.5 case) —
+        // the text factory then dies with keyNotFound(model.embed_tokens…).
+        // Strip the wrapper in place before the sidecar looks; errors here
+        // must never block a load that might work anyway.
+        if let Err(e) = heal_wrapped_weight_prefix(&dir_path) {
+            eprintln!("[mlx] weight-prefix heal skipped: {e}");
+        }
+        if let Err(e) = heal_lfm2_ff_dim(&dir_path) {
+            eprintln!("[mlx] lfm2 config heal skipped: {e}");
         }
 
         let mut child = Command::new(sidecar)
@@ -240,7 +376,13 @@ impl MlxEngine {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .with_context(|| format!("无法启动 MLX 引擎 (failed to spawn sidecar) {sidecar:?}"))?;
+            .with_context(|| {
+                trf!(
+                    "无法启动 MLX 引擎 {:?}",
+                    "failed to spawn sidecar {:?}",
+                    sidecar
+                )
+            })?;
         SIDECAR_PIDS.lock().unwrap().push(child.id());
         let mut stdin_pipe = child.stdin.take().context("sidecar stdin unavailable")?;
         let stdout = child.stdout.take().context("sidecar stdout unavailable")?;
@@ -262,7 +404,12 @@ impl MlxEngine {
             loop {
                 let remain = deadline
                     .checked_duration_since(Instant::now())
-                    .ok_or_else(|| anyhow!("MLX 引擎响应超时 (sidecar timed out)"))?;
+                    .ok_or_else(|| {
+                        anyhow!(crate::agent::tr(
+                            "MLX 引擎响应超时",
+                            "sidecar timed out",
+                        ))
+                    })?;
                 match line_rx.recv_timeout(remain) {
                     Ok(line) => {
                         if let Ok(v) = serde_json::from_str::<Value>(&line) {
@@ -272,10 +419,19 @@ impl MlxEngine {
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        bail!("MLX 引擎响应超时 (sidecar timed out)")
+                        bail!(
+                            "{}",
+                            crate::agent::tr("MLX 引擎响应超时", "sidecar timed out")
+                        )
                     }
                     Err(RecvTimeoutError::Disconnected) => {
-                        bail!("MLX 引擎意外退出 (sidecar exited unexpectedly)")
+                        bail!(
+                            "{}",
+                            crate::agent::tr(
+                                "MLX 引擎意外退出",
+                                "sidecar exited unexpectedly",
+                            )
+                        )
                     }
                 }
             }
@@ -284,7 +440,14 @@ impl MlxEngine {
         // Handshake, then load.
         let ev = recv_event(READY_TIMEOUT)?;
         if ev["event"] != "ready" {
-            bail!("MLX 引擎握手失败 (unexpected first event: {ev})");
+            bail!(
+                "{}",
+                trf!(
+                    "MLX 引擎握手失败 ({})",
+                    "unexpected first event: {}",
+                    ev
+                )
+            );
         }
         writeln!(stdin_pipe, "{}", json!({ "cmd": "load", "path": dir, "nCtx": n_ctx }))?;
         stdin_pipe.flush()?;
@@ -301,7 +464,9 @@ impl MlxEngine {
             loop {
                 let remain = deadline
                     .checked_duration_since(Instant::now())
-                    .ok_or_else(|| anyhow!("MLX 模型加载超时 (load timed out)"))?;
+                    .ok_or_else(|| {
+                        anyhow!(crate::agent::tr("MLX 模型加载超时", "load timed out"))
+                    })?;
                 let ev = recv_event(remain.min(Duration::from_millis(250)).max(Duration::from_millis(50)))
                     .or_else(|e| {
                         // Distinguish "still loading" ticks from real death.
@@ -360,13 +525,20 @@ impl MlxEngine {
             // (template kwarg or empty-<think> prefill in the sidecar) —
             // never the `/no_think` prompt-suffix switch.
             think_switch: false,
+            // The sidecar reports the ladder its chat template accepts.
+            effort_levels: loaded["effortLevels"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default(),
             supports_tools: loaded["supportsTools"].as_bool().unwrap_or(false),
             multimodal: loaded["multimodal"].as_bool().unwrap_or(false),
             // MLX VLMs carry their vision tower in the same weights — loaded
             // model ⇒ vision works; there is no separate mmproj to miss.
+            // (A folder missing its processor config loads text-only: the
+            // sidecar reports multimodal=false plus a warning.)
             vision_ready: loaded["multimodal"].as_bool().unwrap_or(false),
             mmproj: None,
-            warning: None,
+            warning: loaded["warning"].as_str().map(str::to_string),
         };
 
         let child = Arc::new(Mutex::new(Some(child)));
@@ -374,7 +546,11 @@ impl MlxEngine {
         let (jobs_tx, jobs_rx) = mpsc::channel::<Job>();
         {
             let stdin = stdin.clone();
-            std::thread::spawn(move || actor(jobs_rx, line_rx, stdin));
+            let vision_cap = vision_cap_for(
+                info.size_mb.unwrap_or(0),
+                crate::gpu::detect_gpu().map(|g| g.vram_mb),
+            );
+            std::thread::spawn(move || actor(jobs_rx, line_rx, stdin, vision_cap));
         }
         Ok((Self { jobs: jobs_tx, child, stdin }, info))
     }
@@ -438,16 +614,18 @@ impl InferenceBackend for MlxEngine {
         let (done, rx) = tokio::sync::oneshot::channel();
         self.jobs
             .send(Job::Generate { req, sink, cancel, done })
-            .map_err(|_| anyhow!("MLX 引擎已停止 (engine stopped)"))?;
-        rx.await.map_err(|_| anyhow!("MLX 引擎已停止 (engine stopped)"))?
+            .map_err(|_| anyhow!(crate::agent::tr("MLX 引擎已停止", "engine stopped")))?;
+        rx.await
+            .map_err(|_| anyhow!(crate::agent::tr("MLX 引擎已停止", "engine stopped")))?
     }
 
     async fn generate_collect(&self, req: GenRequest, cancel: Arc<AtomicBool>) -> Result<String> {
         let (done, rx) = tokio::sync::oneshot::channel();
         self.jobs
             .send(Job::Collect { req, cancel, done })
-            .map_err(|_| anyhow!("MLX 引擎已停止 (engine stopped)"))?;
-        rx.await.map_err(|_| anyhow!("MLX 引擎已停止 (engine stopped)"))?
+            .map_err(|_| anyhow!(crate::agent::tr("MLX 引擎已停止", "engine stopped")))?;
+        rx.await
+            .map_err(|_| anyhow!(crate::agent::tr("MLX 引擎已停止", "engine stopped")))?
     }
 }
 
@@ -455,12 +633,34 @@ impl InferenceBackend for MlxEngine {
 // Actor: owns the sidecar conversation, one job at a time
 // ---------------------------------------------------------------------------
 
-fn actor(jobs: Receiver<Job>, lines: Receiver<String>, stdin: Arc<Mutex<Option<ChildStdin>>>) {
+/// Vision pixel budget by RUNTIME HEADROOM — the Metal working-set ceiling
+/// minus the resident weights — not by model size alone (owner call: a 35 GB
+/// model on a 128 GB Studio has tens of GB spare and deserves the full
+/// budget; the same model on a 48 GB box leaves ~5 GB, where the 1 MP encode
+/// transient was the last straw — 2026-08-01 crash). Under 8 GB of headroom
+/// the budget halves to 0.5 MP: layout, colors and structure survive fine,
+/// and pixel-reading body text was never the right tool (browser_read
+/// exists). Ceiling unknown ⇒ conservative weight heuristic.
+fn vision_cap_for(size_mb: u64, metal_ceiling_mb: Option<u64>) -> u64 {
+    const TIGHT_HEADROOM_MB: u64 = 8_000;
+    let tight = match metal_ceiling_mb {
+        Some(ceiling) => ceiling.saturating_sub(size_mb) < TIGHT_HEADROOM_MB,
+        None => size_mb >= 24_000,
+    };
+    if tight { 500_000 } else { 1_000_000 }
+}
+
+fn actor(
+    jobs: Receiver<Job>,
+    lines: Receiver<String>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    vision_cap: u64,
+) {
     for job in jobs {
         match job {
             Job::Generate { req, sink, cancel, done } => {
                 let sink2 = sink.clone();
-                let res = run_generation(&req, &lines, &stdin, &cancel, |ev| {
+                let res = run_generation(&req, &lines, &stdin, &cancel, vision_cap, |ev| {
                     let _ = sink2.send(ev);
                 });
                 let _ = match res {
@@ -474,7 +674,7 @@ fn actor(jobs: Receiver<Job>, lines: Receiver<String>, stdin: Arc<Mutex<Option<C
             Job::Collect { req, cancel, done } => {
                 let text = Arc::new(Mutex::new(String::new()));
                 let text2 = text.clone();
-                let res = run_generation(&req, &lines, &stdin, &cancel, move |ev| {
+                let res = run_generation(&req, &lines, &stdin, &cancel, vision_cap, move |ev| {
                     if let StreamEvent::Token { text } = ev {
                         if let Ok(mut t) = text2.lock() {
                             t.push_str(&text);
@@ -495,7 +695,7 @@ fn send_cmd(stdin: &Arc<Mutex<Option<ChildStdin>>>, cmd: &Value) -> Result<()> {
         .map_err(|_| anyhow!("stdin poisoned"))?;
     let pipe = guard
         .as_mut()
-        .ok_or_else(|| anyhow!("MLX 引擎已卸载 (engine unloaded)"))?;
+        .ok_or_else(|| anyhow!(crate::agent::tr("MLX 引擎已卸载", "engine unloaded")))?;
     writeln!(pipe, "{cmd}")?;
     pipe.flush()?;
     Ok(())
@@ -506,6 +706,7 @@ fn run_generation(
     lines: &Receiver<String>,
     stdin: &Arc<Mutex<Option<ChildStdin>>>,
     cancel: &Arc<AtomicBool>,
+    vision_cap: u64,
     mut emit: impl FnMut(StreamEvent),
 ) -> Result<()> {
     emit(StreamEvent::Started);
@@ -535,7 +736,7 @@ fn run_generation(
                 // source path+size+mtime, so the sidecar's image KV cache
                 // still hits across turns.
                 "images": m.images.iter()
-                    .map(|p| super::llama::downscale_for_vision_capped(p, 1_000_000))
+                    .map(|p| super::llama::downscale_for_vision_capped(p, vision_cap))
                     .collect::<Vec<_>>(),
             })
         })
@@ -555,6 +756,7 @@ fn run_generation(
                 "maxTokens": p.max_tokens,
                 "seed": p.seed,
                 "think": p.think,
+                "effort": p.effort,
             },
         }),
     )?;
@@ -575,12 +777,18 @@ fn run_generation(
             Ok(l) => l,
             Err(RecvTimeoutError::Timeout) => {
                 if last_activity.elapsed() > IDLE_TIMEOUT {
-                    bail!("MLX 生成超时无响应 (generation stalled)");
+                    bail!(
+                        "{}",
+                        crate::agent::tr("MLX 生成超时无响应", "generation stalled")
+                    );
                 }
                 continue;
             }
             Err(RecvTimeoutError::Disconnected) => {
-                bail!("MLX 引擎意外退出 (sidecar exited unexpectedly)")
+                bail!(
+                    "{}",
+                    crate::agent::tr("MLX 引擎意外退出", "sidecar exited unexpectedly")
+                )
             }
         };
         last_activity = Instant::now();
@@ -638,6 +846,129 @@ fn run_generation(
 
 #[cfg(test)]
 mod tests {
+
+    /// Build a minimal valid safetensors file: `u64 len | header JSON | data`.
+    fn write_st(path: &std::path::Path, keys: &[&str], data: &[u8]) -> usize {
+        let mut header = serde_json::Map::new();
+        let mut off = 0usize;
+        for k in keys {
+            let end = off + data.len() / keys.len();
+            header.insert(
+                k.to_string(),
+                serde_json::json!({"dtype": "U8", "shape": [data.len() / keys.len()], "data_offsets": [off, end]}),
+            );
+            off = end;
+        }
+        let json = serde_json::to_string(&serde_json::Value::Object(header)).unwrap();
+        let mut bytes = (json.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(json.as_bytes());
+        bytes.extend_from_slice(data);
+        std::fs::write(path, &bytes).unwrap();
+        bytes.len()
+    }
+
+    /// The wrapper heal strips a uniform `language_model.` prefix in place —
+    /// same file size, data bytes untouched — and leaves VLM configs and
+    /// mixed trees alone.
+    #[test]
+    fn wrapped_weight_prefix_heals_in_place() {
+        let dir = std::env::temp_dir().join(format!("chaty-sthea-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), r#"{"model_type":"lfm2"}"#).unwrap();
+        let shard = dir.join("model.safetensors");
+        let data = b"ABCDEFGH".to_vec();
+        let total = write_st(
+            &shard,
+            &["language_model.model.embed_tokens.weight", "language_model.model.norm.weight"],
+            &data,
+        );
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"language_model.model.embed_tokens.weight":"model.safetensors","language_model.model.norm.weight":"model.safetensors"}}"#,
+        )
+        .unwrap();
+
+        super::heal_wrapped_weight_prefix(&dir).unwrap();
+
+        let bytes = std::fs::read(&shard).unwrap();
+        assert_eq!(bytes.len(), total, "file size must not change");
+        assert_eq!(&bytes[bytes.len() - 8..], data.as_slice(), "tensor data must not move");
+        let (_, json) = super::read_st_header(&shard).unwrap();
+        let keys: Vec<&str> = json.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        assert!(keys.contains(&"model.embed_tokens.weight"), "{keys:?}");
+        assert!(keys.contains(&"model.norm.weight"));
+        assert!(!keys.iter().any(|k| k.starts_with("language_model.")));
+        let idx = std::fs::read_to_string(dir.join("model.safetensors.index.json")).unwrap();
+        assert!(idx.contains(r#""model.embed_tokens.weight""#));
+        assert!(!idx.contains("language_model."));
+
+        // Idempotent: a second heal is a no-op (keys no longer wear the prefix).
+        super::heal_wrapped_weight_prefix(&dir).unwrap();
+        assert_eq!(std::fs::read(&shard).unwrap().len(), total);
+
+        // A VL config SHELL on a text-only weight tree still heals — the
+        // LFM2.5 quats ship exactly this (vision_config present, zero
+        // vision_tower weights).
+        let vdir = dir.join("vlshell");
+        std::fs::create_dir_all(&vdir).unwrap();
+        std::fs::write(vdir.join("config.json"), r#"{"model_type":"x","vision_config":{}}"#).unwrap();
+        let vshard = vdir.join("model.safetensors");
+        write_st(&vshard, &["language_model.model.a"], b"12345678");
+        super::heal_wrapped_weight_prefix(&vdir).unwrap();
+        let (_, vjson) = super::read_st_header(&vshard).unwrap();
+        assert!(vjson.as_object().unwrap().contains_key("model.a"), "VL shell over text tree heals");
+
+        // A mixed tree (vision_tower sibling) stays untouched even without
+        // a vision_config — the uniform-wrapper condition fails.
+        let mdir = dir.join("mixed");
+        std::fs::create_dir_all(&mdir).unwrap();
+        std::fs::write(mdir.join("config.json"), r#"{"model_type":"x"}"#).unwrap();
+        let mshard = mdir.join("model.safetensors");
+        write_st(&mshard, &["language_model.model.a", "vision_tower.b"], b"12345678");
+        let before = std::fs::read(&mshard).unwrap();
+        super::heal_wrapped_weight_prefix(&mdir).unwrap();
+        assert_eq!(std::fs::read(&mshard).unwrap(), before, "mixed tree must stay untouched");
+
+        // LFM2.5 config heal: block_ff_dim mirrored from intermediate_size,
+        // only for lfm2, only when absent.
+        let ldir = dir.join("lfm");
+        std::fs::create_dir_all(&ldir).unwrap();
+        std::fs::write(
+            ldir.join("config.json"),
+            r#"{"model_type":"lfm2","intermediate_size":10752}"#,
+        )
+        .unwrap();
+        super::heal_lfm2_ff_dim(&ldir).unwrap();
+        let cfg = std::fs::read_to_string(ldir.join("config.json")).unwrap();
+        assert!(cfg.contains(r#""block_ff_dim": 10752"#), "{cfg}");
+        // Idempotent + other archs untouched.
+        super::heal_lfm2_ff_dim(&ldir).unwrap();
+        std::fs::write(ldir.join("config.json"), r#"{"model_type":"qwen3","intermediate_size":5}"#)
+            .unwrap();
+        super::heal_lfm2_ff_dim(&ldir).unwrap();
+        assert!(!std::fs::read_to_string(ldir.join("config.json")).unwrap().contains("block_ff_dim"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The vision pixel budget follows HEADROOM (Metal ceiling − weights):
+    /// tight boxes halve to 0.5 MP regardless of model size, roomy boxes keep
+    /// the full megapixel — a big model on a big machine is not punished.
+    #[test]
+    fn vision_cap_follows_runtime_headroom() {
+        // The 2026-08-01 crash config: 35.5 GB weights, 40.2 GB ceiling.
+        assert_eq!(super::vision_cap_for(35_500, Some(40_200)), 500_000);
+        // Same model on a 128 GB Studio (~100 GB ceiling): full budget.
+        assert_eq!(super::vision_cap_for(35_500, Some(100_000)), 1_000_000);
+        // Mid model on a small box: tight even though the model is "small".
+        assert_eq!(super::vision_cap_for(12_000, Some(17_000)), 500_000);
+        // Comfortable headroom exactly at / above the line.
+        assert_eq!(super::vision_cap_for(17_000, Some(40_200)), 1_000_000);
+        // Ceiling unknown → conservative weight fallback.
+        assert_eq!(super::vision_cap_for(35_500, None), 500_000);
+        assert_eq!(super::vision_cap_for(17_000, None), 1_000_000);
+    }
 
     /// A sidecar copy without its Metal resource bundle dies at startup with
     /// an unhelpful "sidecar exited unexpectedly"; the search must prefer a

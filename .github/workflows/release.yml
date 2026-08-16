@@ -70,15 +70,15 @@ jobs:
         # `tauri dev` works without Xcode).
         run: npm run tauri build -- --bundles app --config src-tauri/tauri.mlx.conf.json
       - name: Bundle MLX resource bundles (metallib) + re-sign
-        run: ./scripts/bundle-mlx-resources.sh src-tauri/target/release/bundle/macos/Chaty.app
+        run: ./scripts/bundle-mlx-resources.sh src-tauri/target/release/bundle/macos/Daria.app
       - name: Package .dmg (headless hdiutil)
         run: |
           VER="${GITHUB_REF_NAME#v}"
           STAGE=$(mktemp -d)
-          cp -R src-tauri/target/release/bundle/macos/Chaty.app "$STAGE/"
+          cp -R src-tauri/target/release/bundle/macos/Daria.app "$STAGE/"
           ln -s /Applications "$STAGE/Applications"
-          hdiutil create -volname "Chaty" -srcfolder "$STAGE" -ov -format UDZO \
-            "Chaty_${VER}_aarch64.dmg"
+          hdiutil create -volname "DARIA" -srcfolder "$STAGE" -ov -format UDZO \
+            "DARIA_${VER}_aarch64.dmg"
       - uses: actions/upload-artifact@v5
         with:
           name: macos-dmg
@@ -112,7 +112,7 @@ jobs:
           cmake -S SPIRV-Headers -B SPIRV-Headers/build
           cmake --install SPIRV-Headers/build --prefix "$env:VULKAN_SDK"
       - run: npm ci
-      - name: Build chaty.exe (Vulkan, no bundler)
+      - name: Build daria.exe (Vulkan, no bundler)
         run: npm run tauri build -- --no-bundle
         env:
           # newer llama.cpp's Vulkan backend does find_package(SPIRV-Headers/-Tools);
@@ -247,21 +247,21 @@ jobs:
 
             | Platform | File |
             |---|---|
-            | **Windows x64** | `Chaty_*_x64-setup.exe` — per-user installer, no admin |
-            | **macOS (Apple Silicon)** | `Chaty_*_aarch64.dmg` |
-            | **Linux x64 (beta)** | `Chaty_*_amd64.AppImage` — `chmod +x` and run. First Linux release — please report anything odd |
+            | **Windows x64** | `DARIA_*_x64-setup.exe` — per-user installer, no admin |
+            | **macOS (Apple Silicon)** | `DARIA_*_aarch64.dmg` |
+            | **Linux x64 (beta)** | `DARIA_*_amd64.AppImage` — `chmod +x` and run. First Linux release — please report anything odd |
 
             ### ⚠️ macOS first launch — "Apple could not verify…" / "damaged"
 
-            Chaty is **ad-hoc signed but not notarized** (no paid Apple Developer
+            DARIA is **ad-hoc signed but not notarized** (no paid Apple Developer
             account), so Gatekeeper flags it on first launch. The app is safe —
             everything runs locally. Clear the download quarantine once, in Terminal:
 
             ```sh
-            xattr -dr com.apple.quarantine /Applications/Chaty.app
+            xattr -dr com.apple.quarantine /Applications/Daria.app
             ```
 
-            Then open Chaty normally. (Alternatively: try to open it once, then go to
+            Then open DARIA normally. (Alternatively: try to open it once, then go to
             **System Settings → Privacy & Security → Open Anyway**.)
 
             ---

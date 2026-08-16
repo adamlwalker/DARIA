@@ -1,8 +1,8 @@
 // Visual test harness for chat code-block rendering (think-style collapse
 // with streaming focus-follow, light/dark code palettes, scroll behavior).
 // Real Markdown component, real App.css — served by plain vite at
-// /codeblock-harness.html, no Tauri needed. 模拟流式 feeds a long block in
-// line by line to exercise the focus window.
+// /codeblock-harness.html, no Tauri needed. Simulated streaming feeds a long
+// block in line by line to exercise the focus window.
 import React, { useEffect, useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
 import "../App.css";

@@ -3,9 +3,9 @@ import { createPortal } from "react-dom";
 import { useI18n } from "../lib/i18n";
 import { useConfirm } from "./ConfirmModal";
 import { Icon } from "./Icon";
-import { withStorageShim } from "./Markdown";
+import { STORAGE_SHIM } from "./Markdown";
 import { IconDownload, IconEdit } from "./icons";
-import { annotate, buildFixPayload, highlightLines, INSPECT_SHIM, precheckScripts } from "../lib/canvasSource";
+import { annotate, buildFixPayload, highlightLines, INSPECT_SHIM, instrumentHtml, precheckScripts } from "../lib/canvasSource";
 import { diffLines } from "../lib/diff";
 import { buildScanView } from "../lib/canvasStream";
 
@@ -65,26 +65,83 @@ const COMPAT_SHIM = `<script>(function(){
  * output. Capped; strings truncated.
  */
 const CONSOLE_SHIM = `<script>(function(){
-  var count = 0;
-  function send(level, args, fault){
-    if (count >= 300) return; count++;
-    var text = '';
-    try { text = Array.prototype.map.call(args, function(a){
+  // Budget by UNIQUE lines, not total sends: a broken interval repeating one
+  // error must not exhaust the pipe and silence later, different errors.
+  // Repeats still post (the panel folds them into a ×N badge) up to 50.
+  var uniq = 0; var seenN = {};
+  // DevTools-grade argument rendering: Errors show their (line-fixed) stack,
+  // DOM nodes a readable tag, undefined/null/functions their real names —
+  // JSON.stringify alone turned console.error(new Error(...)) into "{}".
+  function fmt(a){
+    try {
+      if (a === undefined) return 'undefined';
+      if (a === null) return 'null';
       if (typeof a === 'string') return a;
-      try { return JSON.stringify(a); } catch(_) { return String(a); }
-    }).join(' '); } catch(_) { text = '[unserializable]'; }
-    try { parent.postMessage({ __chatyCvConsole: { level: level, text: String(text).slice(0, level === 'error' ? 2000 : 600), nonce: window.__CV_NONCE || '', fault: !!fault } }, '*'); } catch(_){}
+      if (typeof a === 'function' || typeof a === 'symbol') return String(a);
+      if (a && (a instanceof Error || (a.stack && a.message !== undefined))) {
+        var head = (a.name || 'Error') + (a.message ? ': ' + a.message : '');
+        var st = a.stack ? String(a.stack) : '';
+        if (st.indexOf(head) === 0) return ufix(st);
+        return head + (st ? '\\n' + ufix(st) : '');
+      }
+      if (a && a.nodeType === 1 && a.tagName) return '<' + String(a.tagName).toLowerCase() + (a.id ? '#' + a.id : '') + '>';
+      var j; try { j = JSON.stringify(a); } catch(_) { return String(a); }
+      return j === undefined ? String(a) : j;
+    } catch(_) { return '[unserializable]'; }
+  }
+  function send(level, args, fault){
+    var text = '';
+    try { text = Array.prototype.map.call(args, fmt).join(' '); } catch(_) { text = '[unserializable]'; }
+    // Caller location, like devtools shows for every console line. Fault
+    // paths (uncaught errors) carry their own location already.
+    if (!fault) {
+      try {
+        var K = window.__CV_LINEOFF || 0;
+        var st = String(new Error().stack || '').split('\\n');
+        for (var i = 0; i < st.length; i++) {
+          var mm = /about:srcdoc:(\\d+)/.exec(st[i]);
+          if (mm && +mm[1] > K) { text += ' @canvas:' + (+mm[1] - K); break; }
+        }
+      } catch(_){}
+    }
+    text = String(text).slice(0, level === 'error' ? 2000 : 600);
+    var key = level + '|' + text;
+    var n = seenN[key] || 0;
+    if (n === 0 && uniq >= 300) return;
+    if (n >= 50) return;
+    if (n === 0) uniq++;
+    seenN[key] = n + 1;
+    try { parent.postMessage({ __chatyCvConsole: { level: level, text: text, nonce: window.__CV_NONCE || '', fault: !!fault } }, '*'); } catch(_){}
   }
   ['log','info','warn','error','debug'].forEach(function(l){
     var orig = console[l] && console[l].bind(console);
     console[l] = function(){ send(l === 'info' || l === 'debug' ? 'log' : l, arguments); if (orig) orig.apply(null, arguments); };
   });
+  function ufix(s){
+    var K = window.__CV_LINEOFF || 0;
+    return String(s).split('\\n').filter(function(l){ return l.indexOf('__cvGuard') < 0; }).join('\\n')
+      .replace(/about:srcdoc:(\\d+)/g, function(_, n){ n = +n; return n > K ? 'canvas:' + (n - K) : 'canvas:eval'; });
+  }
   window.addEventListener('error', function(e){
     if (e && e.target && (e.target.src || e.target.href)) send('error', ['Failed to load resource: ' + (e.target.src || e.target.href)], true);
-    else if (e && e.message) send('error', [e.message + ' (' + (e.filename||'') + ':' + (e.lineno||0) + ')' + (e.error && e.error.stack ? '\\n' + e.error.stack : '')], true);
+    else if (e && e.message) {
+      // The trap shim replays caught errors as detailed synthetic events
+      // (filename 'canvas') — drop the browser's own follow-up for the same
+      // throw: the anonymized "Script error." (WebKit) or the duplicate
+      // detailed event (Chromium/WebView2).
+      var fresh = Date.now() - (window.__CV_TRAP_AT || 0) < 200;
+      if (fresh && e.filename !== 'canvas' && (/^Script error/.test(e.message) || (window.__CV_TRAP_MSG && String(e.message).indexOf(window.__CV_TRAP_MSG) >= 0))) return;
+      var K = window.__CV_LINEOFF || 0, ln = e.lineno || 0;
+      var srcdocFile = String(e.filename || '').indexOf('srcdoc') >= 0;
+      if (srcdocFile && ln > K) ln -= K;
+      var fname = e.filename && !srcdocFile ? e.filename : 'canvas';
+      var loc = ln ? ' (' + fname + ':' + ln + ')' : '';
+      send('error', [e.message + loc + (e.error && e.error.stack ? '\\n' + ufix(e.error.stack) : '')], true);
+    }
   }, true);
   window.addEventListener('unhandledrejection', function(e){
-    var r = e && e.reason; send('error', ['Unhandled rejection: ' + ((r && r.message) || String(r))], true);
+    var r = e && e.reason;
+    send('error', ['Unhandled rejection: ' + ((r && r.message) || String(r)) + (r && r.stack ? '\\n' + ufix(r.stack) : '')], true);
   });
 })();</script>`;
 
@@ -100,17 +157,179 @@ const ERROR_SHIM = `<script>(function(){
     if (seen[sig]) return; seen[sig] = 1;
     try { parent.postMessage({ __chatyCanvasError: { kind: kind, message: String(msg).slice(0,1000), detail: String(detail||'').slice(0,2000), nonce: window.__CV_NONCE || '' } }, '*'); } catch(_){}
   }
+  function ufix(s){
+    var K = window.__CV_LINEOFF || 0;
+    return String(s).split('\\n').filter(function(l){ return l.indexOf('__cvGuard') < 0; }).join('\\n')
+      .replace(/about:srcdoc:(\\d+)/g, function(_, n){ n = +n; return n > K ? 'canvas:' + (n - K) : 'canvas:eval'; });
+  }
   window.addEventListener('error', function(e){
     if (e && e.target && (e.target.src || e.target.href)) {
       send('resource', 'Failed to load ' + (e.target.src || e.target.href), e.target.tagName);
     } else if (e && e.message) {
-      send('error', e.message, (e.filename||'') + ':' + (e.lineno||0) + ':' + (e.colno||0) + (e.error && e.error.stack ? '\\n' + e.error.stack : ''));
+      // Same duplicate-drop as the console shim: the trap shim already
+      // replayed this throw as a detailed synthetic event.
+      var fresh = Date.now() - (window.__CV_TRAP_AT || 0) < 200;
+      if (fresh && e.filename !== 'canvas' && (/^Script error/.test(e.message) || (window.__CV_TRAP_MSG && String(e.message).indexOf(window.__CV_TRAP_MSG) >= 0))) return;
+      var K = window.__CV_LINEOFF || 0, ln = e.lineno || 0;
+      var srcdocFile = String(e.filename || '').indexOf('srcdoc') >= 0;
+      if (srcdocFile && ln > K) ln -= K;
+      var fname = e.filename && !srcdocFile ? e.filename : 'canvas';
+      send('error', e.message, fname + ':' + ln + ':' + (e.colno||0) + (e.error && e.error.stack ? '\\n' + ufix(e.error.stack) : ''));
     }
   }, true);
   window.addEventListener('unhandledrejection', function(e){
     var r = e && e.reason;
-    send('promise', (r && r.message) ? r.message : String(r), (r && r.stack) ? r.stack : '');
+    send('promise', (r && r.message) ? r.message : String(r), (r && r.stack) ? ufix(r.stack) : '');
   });
+})();</script>`;
+
+/**
+ * Async-entry error trap. WebKit anonymizes every uncaught error inside the
+ * sandboxed null-origin srcdoc frame to "Script error." — no line, no stack.
+ * Same-realm CAUGHT errors keep everything, so the big async entry points
+ * (timers, rAF, microtasks, event listeners — where interaction bugs live)
+ * run through a guard that catches, replays the error as a DETAILED
+ * synthetic ErrorEvent (picked up by the console/error shims above, lines
+ * already in user-source space), then rethrows so page semantics don't
+ * change. Residual: top-level synchronous throws and inline on*= attribute
+ * handlers stay anonymized — the digest note covers them.
+ */
+const TRAP_SHIM = `<script>(function(){
+  var wraps = typeof WeakMap === 'function' ? new WeakMap() : null;
+  function fixline(n){ var K = window.__CV_LINEOFF || 0; n = +n; return n > K ? n - K : 0; }
+  function ufix(s){ return String(s).split('\\n').filter(function(l){ return l.indexOf('__cvGuard') < 0; }).join('\\n').replace(/about:srcdoc:(\\d+)/g, function(_, n){ var f = fixline(n); return f ? 'canvas:' + f : 'canvas:eval'; }); }
+  function report(err){
+    try {
+      var st = err && err.stack ? String(err.stack) : '';
+      var m = /about:srcdoc:(\\d+):(\\d+)/.exec(st);
+      var ln = m ? fixline(m[1]) : 0, cn = m ? +m[2] : 0;
+      if (st) { try { err.stack = ufix(st); } catch(_){} }
+      window.__CV_TRAP_AT = Date.now();
+      window.__CV_TRAP_MSG = (err && err.message) ? String(err.message)
+        : (function(){ try { return (err && typeof err === 'object') ? JSON.stringify(err) : String(err); } catch(_) { return String(err); } })();
+      window.dispatchEvent(new ErrorEvent('error', {
+        message: window.__CV_TRAP_MSG,
+        filename: 'canvas', lineno: ln, colno: cn, error: err
+      }));
+    } catch(_){}
+  }
+  function guard(fn){
+    if (typeof fn !== 'function') return fn;
+    if (wraps) { var w0 = wraps.get(fn); if (w0) return w0; }
+    var w = function __cvGuard(){ try { return fn.apply(this, arguments); } catch(err){ report(err); throw err; } };
+    try { w.__cvOrig = fn; } catch(_){}
+    if (wraps) wraps.set(fn, w);
+    return w;
+  }
+  function patch(obj, name){
+    try {
+      var orig = obj[name];
+      if (!orig) return;
+      obj[name] = function(){
+        var a = Array.prototype.slice.call(arguments);
+        if (typeof a[0] === 'function') a[0] = guard(a[0]);
+        else if ((name === 'setTimeout' || name === 'setInterval') && typeof a[0] === 'string' && a[0] && a[0].indexOf('__cvReport') < 0)
+          a[0] = 'try{' + a[0] + '}catch(__cvE){window.__cvReport&&window.__cvReport(__cvE);throw __cvE}';
+        return orig.apply(this, a);
+      };
+    } catch(_){}
+  }
+  patch(window, 'setTimeout');
+  patch(window, 'setInterval');
+  patch(window, 'requestAnimationFrame');
+  patch(window, 'queueMicrotask');
+  patch(window, 'requestIdleCallback');
+  try {
+    var ET = window.EventTarget;
+    var proto = ET && ET.prototype;
+    if (proto) {
+      var add = proto.addEventListener, rem = proto.removeEventListener;
+      proto.addEventListener = function(type, fn, opts){ return add.call(this, type, guard(fn), opts); };
+      proto.removeEventListener = function(type, fn, opts){
+        var w = (wraps && typeof fn === 'function') ? (wraps.get(fn) || fn) : fn;
+        return rem.call(this, type, w, opts);
+      };
+    }
+  } catch(_){}
+  // on-PROPERTY handlers (el.onclick = fn, xhr.onload = fn, ws.onmessage = fn)
+  // are the other big async entry — wrap through the accessor pair so the
+  // getter still hands back what the page assigned.
+  function patchOnProps(proto){
+    if (!proto) return;
+    Object.getOwnPropertyNames(proto).forEach(function(name){
+      if (name.slice(0, 2) !== 'on') return;
+      var d;
+      try { d = Object.getOwnPropertyDescriptor(proto, name); } catch(_) { return; }
+      if (!d || !d.set || !d.configurable) return;
+      try {
+        Object.defineProperty(proto, name, {
+          configurable: true, enumerable: d.enumerable,
+          get: function(){ var v = d.get ? d.get.call(this) : undefined; return v && v.__cvOrig || v; },
+          set: function(v){ d.set.call(this, guard(v)); }
+        });
+      } catch(_){}
+    });
+  }
+  [
+    window.HTMLElement && HTMLElement.prototype,
+    window.HTMLMediaElement && HTMLMediaElement.prototype,
+    window.Window && Window.prototype,
+    window.Document && Document.prototype,
+    window.XMLHttpRequest && XMLHttpRequest.prototype,
+    window.WebSocket && WebSocket.prototype,
+    window.FileReader && FileReader.prototype,
+    window.Worker && Worker.prototype,
+  ].forEach(function(p){ try { patchOnProps(p); } catch(_){} });
+  patch(window.MediaQueryList && MediaQueryList.prototype, 'addListener');
+  // Observer callbacks live outside every entry point above.
+  ['MutationObserver', 'ResizeObserver', 'IntersectionObserver', 'PerformanceObserver'].forEach(function(n){
+    try {
+      var O = window[n];
+      if (!O) return;
+      var W = function(cb, opts){ return new O(guard(cb), opts); };
+      W.prototype = O.prototype;
+      window[n] = W;
+    } catch(_){}
+  });
+  // Dynamically-injected inline handlers (setAttribute('onclick', …),
+  // innerHTML with on*= attributes) compile in the muzzled world too — give
+  // them the same in-attribute try/catch the static rewrite applies.
+  var CATCH = 'catch(__cvE){window.__cvReport&&window.__cvReport(__cvE);throw __cvE}';
+  function rewriteAttrs(v){
+    try {
+      var str = String(v);
+      if (str.indexOf('on') < 0 || str.indexOf('<script') >= 0) return v;
+      return str
+        .replace(/(\\son[a-z]+\\s*=\\s*)"(?!try\\{)([^"]*)"/gi, function(_, pre, code){ return code.replace(/\\s/g, '') ? pre + '"try{' + code + '}' + CATCH + '"' : pre + '"' + code + '"'; })
+        .replace(/(\\son[a-z]+\\s*=\\s*)'(?!try\\{)([^']*)'/gi, function(_, pre, code){ return code.replace(/\\s/g, '') ? pre + "'try{" + code + '}' + CATCH + "'" : pre + "'" + code + "'"; });
+    } catch(_) { return v; }
+  }
+  try {
+    var EP = window.Element && Element.prototype;
+    if (EP && EP.setAttribute) {
+      var setAttr = EP.setAttribute;
+      EP.setAttribute = function(name, value){
+        try {
+          if (typeof name === 'string' && name.slice(0, 2).toLowerCase() === 'on' && typeof value === 'string' && value && value.indexOf('__cvReport') < 0)
+            value = 'try{' + value + '}' + CATCH;
+        } catch(_){}
+        return setAttr.call(this, name, value);
+      };
+    }
+    var ihd = EP && Object.getOwnPropertyDescriptor(EP, 'innerHTML');
+    if (ihd && ihd.set && ihd.configurable) {
+      Object.defineProperty(EP, 'innerHTML', {
+        configurable: true, enumerable: ihd.enumerable, get: ihd.get,
+        set: function(v){ ihd.set.call(this, rewriteAttrs(v)); }
+      });
+    }
+    if (EP && EP.insertAdjacentHTML) {
+      var iah = EP.insertAdjacentHTML;
+      EP.insertAdjacentHTML = function(pos, v){ return iah.call(this, pos, rewriteAttrs(v)); };
+    }
+  } catch(_){}
+  // The source instrumentation (script wrap + attribute rewrite) reports here.
+  window.__cvReport = report;
 })();</script>`;
 
 /**
@@ -132,21 +351,29 @@ const NAV_GUARD = `<script>(function(){
 })()<\/script>`;
 
 /**
- * Scrollbar that matches the previewed page. With "show scrollbars: always"
- * (or a mouse plugged in) the UA paints a light track+gutter in the srcdoc
- * frame, which glares beside the dark pages models like to build — WebKit only
- * draws a dark scrollbar when the document declares a `color-scheme`.
- *
- * So declare one FOR the page, inferred from what it actually renders, and let
- * the UA draw its own native scrollbar. Deliberately not `::-webkit-scrollbar`
- * rules: styling those switches the engine to a custom scrollbar whose gutter
- * is backed by the white canvas, not by the page's background — a transparent
- * track then reads as PURE WHITE (measured: rgb(255,255,255)), which is worse
- * than the bug. Setting color-scheme also darkens that canvas base, so the
- * gutter stops glowing at all.
- *
- * A page that declares its own color-scheme is left completely alone.
+ * In-page native-widget scheme (form controls, popups), inferred from what
+ * the page renders. NOT the scrollbar fix it was originally written as:
+ * WKWebView paints a sandboxed subframe's scrollbar by the TOP document's
+ * color-scheme — probe-measured, nothing declared INSIDE the frame (static
+ * or dynamic scheme, ::-webkit-scrollbar, scrollbar-color) moves it, which
+ * is why the preview scrollbar stayed white through two fix rounds. The
+ * scrollbar is now governed by the app root's `color-scheme` (App.css,
+ * theme-matched). This shim still earns its keep for the page's own
+ * controls; a page that declares its own color-scheme is left alone.
  */
+/** Deterministic scrollbar paint. Native subframe scrollbars proved
+ *  ungovernable across three rounds (page color-scheme, top-document scheme,
+ *  stage backing — each fixed a probe and left the real window white), so the
+ *  frame paints its OWN: track = the page's actual background, thumb =
+ *  translucent ink picked by the page's brightness. Injected FIRST, so a page
+ *  that styles its own scrollbars still wins. */
+const SCROLLBAR_PAINT_SHIM = `<style id="__cv_sb">
+::-webkit-scrollbar{width:12px;height:12px}
+::-webkit-scrollbar-track{background:var(--cv-sb-track,transparent)}
+::-webkit-scrollbar-thumb{background:var(--cv-sb-thumb,rgba(128,128,128,.45));border-radius:6px;border:3px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-corner{background:var(--cv-sb-track,transparent)}
+</style>`;
+
 const SCROLL_SCHEME_SHIM = `<script>(function(){
   function bright(c){
     var m=/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)(?:,\\s*([\\d.]+))?/.exec(c||'');
@@ -168,6 +395,15 @@ const SCROLL_SCHEME_SHIM = `<script>(function(){
         dark = t!==null && t > 128;
       }
       de.style.colorScheme = dark ? 'dark' : 'light';
+      // Feed the deterministic scrollbar paint: track = the page's own
+      // background, thumb = translucent ink for the page's brightness.
+      var track=getComputedStyle(b).backgroundColor;
+      if(!track||track==='rgba(0, 0, 0, 0)') track=getComputedStyle(de).backgroundColor;
+      if(track&&track!=='rgba(0, 0, 0, 0)') de.style.setProperty('--cv-sb-track',track);
+      de.style.setProperty('--cv-sb-thumb', dark?'rgba(255,255,255,.32)':'rgba(0,0,0,.35)');
+      // The parent needs the verdict too: the stage behind the (transparent-
+      // backed) frame flips dark behind dark pages.
+      try{parent.postMessage({__chatyCvScheme:dark?'dark':'light',nonce:window.__CV_NONCE},'*');}catch(_){}
     }catch(_){}
   }
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',apply); else apply();
@@ -183,19 +419,55 @@ export const PREVIEW_SHIMS: Record<string, string> = {
   COMPAT_SHIM,
   CONSOLE_SHIM,
   ERROR_SHIM,
+  TRAP_SHIM,
   NAV_GUARD,
   INSPECT_SHIM,
   SCROLL_SCHEME_SHIM,
+  SCROLLBAR_PAINT_SHIM,
 };
 
-function withShims(html: string, nonce: string): string {
+/** One console line as the panel stores it. */
+export interface ConsoleEntry {
+  level: string;
+  text: string;
+  nonce?: string;
+  fault?: boolean;
+  /** How many times this exact (level,text) line arrived — devtools-style
+   *  duplicate folding. Absent means 1. */
+  count?: number;
+}
+
+/** Chrome-style duplicate folding: a repeated (level,text) line bumps the
+ *  existing entry's counter instead of appending — a broken button clicked
+ *  ten times must not bury the rest of the console. */
+export function foldConsoleEntry(prev: ConsoleEntry[], entry: ConsoleEntry, cap = 300): ConsoleEntry[] {
+  const i = prev.findIndex((c) => c.level === entry.level && c.text === entry.text);
+  if (i !== -1) {
+    const next = prev.slice();
+    next[i] = { ...next[i], count: (next[i].count ?? 1) + 1 };
+    return next;
+  }
+  return prev.length >= cap ? prev : [...prev, entry];
+}
+
+export function withShims(html: string, nonce: string): string {
   // The nonce ties every message from this document generation to the
   // srcDoc that produced it: WKWebView can start reparsing (and posting
   // errors) BEFORE React's post-commit clear effect runs, so a timing-based
   // clear silently ate early errors — generation filtering is order-proof.
-  const shims =
-    `<script>window.__CV_NONCE=${JSON.stringify(nonce)};</script>` +
-    COMPAT_SHIM + CONSOLE_SHIM + ERROR_SHIM + NAV_GUARD + INSPECT_SHIM + SCROLL_SCHEME_SHIM;
+  // STORAGE_SHIM must live in THIS block too: injecting it separately (the
+  // old withStorageShim wrapper) put its newlines outside __CV_LINEOFF and
+  // every reported error line drifted by its height — the owner's 4-line
+  // repro reported canvas:16.
+  let shims =
+    `<script>window.__CV_NONCE=${JSON.stringify(nonce)};window.__CV_LINEOFF=0;</script>` +
+    STORAGE_SHIM + SCROLLBAR_PAINT_SHIM +
+    COMPAT_SHIM + CONSOLE_SHIM + ERROR_SHIM + TRAP_SHIM + NAV_GUARD + INSPECT_SHIM + SCROLL_SCHEME_SHIM;
+  // Error lines arrive in srcdoc coordinates: user source shifted down by the
+  // shim block's newline count. Bake that offset into the page so the shims
+  // can report USER-source line numbers (swapping digits keeps the count).
+  const lineOff = (shims.match(/\n/g) || []).length;
+  shims = shims.replace("__CV_LINEOFF=0", `__CV_LINEOFF=${lineOff}`);
   // Inject at the very TOP of the document (only the doctype may precede us,
   // or it would flip the page into quirks mode). Injecting "after <head>" by
   // regex trusted the DOCUMENT's structure: models produce html like
@@ -248,13 +520,20 @@ export function CanvasPanel({
   const { t, lang } = useI18n();
   const [instruction, setInstruction] = useState("");
   const [error, setError] = useState<CanvasError | null>(null);
+  // How many DISTINCT errors this page generation produced (the banner shows
+  // the first, the count keeps the rest visible).
+  const [errorCount, setErrorCount] = useState(0);
   const [muted, setMuted] = useState(false);
   const [view, setView] = useState<"code" | "diff" | "console">("code");
-  const [consoleLog, setConsoleLog] = useState<{ level: string; text: string; nonce?: string; fault?: boolean }[]>([]);
+  const [consoleLog, setConsoleLog] = useState<ConsoleEntry[]>([]);
   // DEV-only pipeline diagnostics: how many console messages ARRIVED vs were
   // kept, and why the last one was dropped — reads the fault location off the
   // screen instead of guessing (the empty-console hunt).
   const [conDiag, setConDiag] = useState({ raw: 0, dropped: "" });
+  // Inferred scheme of the PREVIEWED page (shim postMessage). Drives the
+  // stage backing: WebKit's dark-scheme subframe scrollbar has a transparent
+  // track, so a white stage behind a dark page read as a blank white gutter.
+  const [previewScheme, setPreviewScheme] = useState<"light" | "dark">("light");
   // Bumping remounts the iframe: scripts re-run from scratch (page refresh).
   const [reloadNonce, setReloadNonce] = useState(0);
   // Inspect selection: cv ids the user clicked (⌘/Ctrl toggles membership).
@@ -312,7 +591,7 @@ export function CanvasPanel({
   const nonceRef = useRef(frameNonce);
   nonceRef.current = frameNonce;
   const srcDoc = useMemo(
-    () => (annotated ? withShims(withStorageShim(annotated.html), frameNonce) : ""),
+    () => (annotated ? withShims(instrumentHtml(annotated.html), frameNonce) : ""),
     [annotated, frameNonce],
   );
   const codeLines = useMemo(() => (current ? highlightLines(current.html) : []), [current]);
@@ -338,8 +617,9 @@ export function CanvasPanel({
   // Old error / hot line don't apply across version switches; and a version
   // with no predecessor has no diff to show — fall back to the code view.
   useEffect(() => {
-    setError(null);
+    setError(null); setErrorCount(0);
     setHotLine(null);
+    setPreviewScheme("light");
     // Keep entries from the CURRENT document generation: on WKWebView the
     // new srcdoc can post its first errors before this effect runs, and a
     // blind wipe ate them (the reported "console shows nothing" file).
@@ -357,8 +637,9 @@ export function CanvasPanel({
   useEffect(() => {
     if (!open) {
       setConsoleLog([]);
-      setError(null);
+      setError(null); setErrorCount(0);
       setConDiag({ raw: 0, dropped: "" });
+      setPreviewScheme("light");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
@@ -378,14 +659,22 @@ export function CanvasPanel({
       if (con) {
         if (import.meta.env.DEV) setConDiag((d) => ({ ...d, raw: d.raw + 1 }));
         if (!con.nonce || con.nonce === nonceRef.current) {
-          setConsoleLog((prev) => (prev.length >= 300 ? prev : [...prev, con]));
+          setConsoleLog((prev) => foldConsoleEntry(prev, con));
         } else if (import.meta.env.DEV) {
           setConDiag((d) => ({ ...d, dropped: `${con.nonce}≠${nonceRef.current}` }));
         }
       }
+      const scheme = (data as { __chatyCvScheme?: "light" | "dark"; nonce?: string })?.__chatyCvScheme;
+      if (scheme) {
+        const n = (data as { nonce?: string }).nonce;
+        if (!n || n === nonceRef.current) setPreviewScheme(scheme);
+      }
       if (data?.__chatyCanvasError && !muted) {
         const d = data.__chatyCanvasError as CanvasError & { nonce?: string };
-        if (!d.nonce || d.nonce === nonceRef.current) setError((prev) => prev ?? d);
+        if (!d.nonce || d.nonce === nonceRef.current) {
+          setError((prev) => prev ?? d);
+          setErrorCount((c) => c + 1);
+        }
       }
       const sel = (data as { __chatyCvSelect?: { cv: string; multi: boolean } })?.__chatyCvSelect;
       if (sel && annotated) {
@@ -589,7 +878,7 @@ export function CanvasPanel({
               title={t("canvasReload")}
               onClick={() => {
                 setConsoleLog([]);
-                setError(null);
+                setError(null); setErrorCount(0);
                 setReloadNonce((n) => n + 1);
               }}
             >
@@ -663,7 +952,10 @@ export function CanvasPanel({
             onPointerDown={startDrag("rail")}
             onDoubleClick={() => setRailW(150)}
           />
-          <div className="canvas-stage split">
+          <div
+            className="canvas-stage split"
+            style={previewScheme === "dark" ? { background: "#161616" } : undefined}
+          >
             <div className="canvas-pane preview" style={{ flex: `1 1 ${100 - codePct}%` }}>
               <iframe
                 key={`${index}-${reloadNonce}`}
@@ -881,6 +1173,7 @@ export function CanvasPanel({
                     consoleLog.map((c, i) => (
                       <div key={i} className={`cvp-con-row ${c.level}`}>
                         <span className="cvp-con-lv">{c.level}</span>
+                        {(c.count ?? 1) > 1 && <span className="cvp-con-count">×{c.count}</span>}
                         {c.text}
                       </div>
                     ))
@@ -920,6 +1213,7 @@ export function CanvasPanel({
             <span className="canvas-heal-msg">
               {t("canvasHealMsg")}
               <code>{error.message}</code>
+              {errorCount > 1 && <span className="canvas-heal-more">{t("canvasErrMore", { n: errorCount })}</span>}
             </span>
             <div className="canvas-heal-actions">
               <button
@@ -936,19 +1230,19 @@ export function CanvasPanel({
                       lang as "zh" | "en",
                     ),
                   );
-                  setError(null);
+                  setError(null); setErrorCount(0);
                 }}
               >
                 {t("canvasFixBtn")}
               </button>
-              <button className="canvas-heal-ghost" onClick={() => setError(null)}>
+              <button className="canvas-heal-ghost" onClick={() => { setError(null); setErrorCount(0); }}>
                 {t("canvasIgnore")}
               </button>
               <button
                 className="canvas-heal-ghost"
                 onClick={() => {
                   setMuted(true);
-                  setError(null);
+                  setError(null); setErrorCount(0);
                 }}
               >
                 {t("canvasMute")}

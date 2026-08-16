@@ -755,7 +755,7 @@ dependencies = [
 
 [[package]]
 name = "chaty"
-version = "2.0.2"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -764,9 +764,11 @@ dependencies = [
  "bzip2",
  "calamine",
  "chaty-gpu-backend",
+ "chrono",
  "cpal",
  "dom_smoothie",
  "encoding_rs",
+ "flate2",
  "glob",
  "hf-hub",
  "htmd",
@@ -775,6 +777,7 @@ dependencies = [
  "llama-cpp-2",
  "lopdf",
  "metal",
+ "minimp3",
  "objc2",
  "objc2-app-kit",
  "objc2-av-foundation",
@@ -789,6 +792,7 @@ dependencies = [
  "scraper",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sherpa-rs",
  "sysinfo 0.32.1",
  "tar",
@@ -3556,6 +3560,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
+name = "minimp3"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a3ed9d34ed1a9190336a2b165bf09ac447693dfd9a61684597aaae2ee12df53"
+dependencies = [
+ "minimp3-sys",
+ "slice-ring-buffer",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "minimp3-sys"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e21c73734c69dc95696c9ed8926a2b393171d98b3f5f5935686a26a487ab9b90"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5749,6 +5773,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
+name = "slice-ring-buffer"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84ae312bda09b2368f79f985fdb4df4a0b5cbc75546b511303972d195f8c27d6"
+dependencies = [
+ "libc",
+ "mach2",
+ "winapi",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7040,6 +7075,7 @@ dependencies = [
  "http",
  "httparse",
  "log",
+ "native-tls",
  "rand 0.10.2",
  "sha1",
  "thiserror 2.0.18",

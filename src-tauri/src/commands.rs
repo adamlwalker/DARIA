@@ -1,7 +1,7 @@
 //! Tauri command surface exposed to the frontend.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -87,11 +87,10 @@ pub async fn load_model(
             match main_gguf_in_dir(p) {
                 Some(main) => main.to_string_lossy().to_string(),
                 None => {
-                    return Err(
-                        "该文件夹里没有可加载的模型（需要 .gguf 权重，或 MLX 的 config.json + safetensors） \
-                         (no loadable model in this folder — needs a .gguf, or an MLX config.json + safetensors)"
-                            .into(),
-                    )
+                    return Err(crate::agent::tr(
+                        "该文件夹里没有可加载的模型（需要 .gguf 权重，或 MLX 的 config.json + safetensors）",
+                        "no loadable model in this folder — needs a .gguf, or an MLX config.json + safetensors",
+                    ))
                 }
             }
         } else {
@@ -104,11 +103,10 @@ pub async fn load_model(
     let is_mlx = crate::inference::mlx::is_mlx_dir(std::path::Path::new(&path));
     #[cfg(not(target_os = "macos"))]
     if is_mlx {
-        return Err(
-            "MLX 模型仅支持 macOS (Apple Silicon)，请改用 GGUF 版本 \
-             (MLX models run on macOS only — use a GGUF build instead)"
-                .into(),
-        );
+        return Err(crate::agent::tr(
+            "MLX 模型仅支持 macOS (Apple Silicon)，请改用 GGUF 版本",
+            "MLX models run on macOS only — use a GGUF build instead",
+        ));
     }
 
     let _ = on_progress.send(LoadProgress { phase: "eject", frac: 0.0 });
@@ -178,17 +176,15 @@ pub async fn load_model(
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 now = probe(&mut sys);
             }
-            Err(format!(
-                "旧模型的内存未能释放（{} MiB → {} MiB），为避免系统卡死已中止本次加载，请重试或重启应用。\
-                 (The previous model's memory was not released ({} → {} MiB); load aborted to avoid freezing the system — retry or restart the app.)",
+            Err(trf!(
+                "旧模型的内存未能释放（{} MiB → {} MiB），为避免系统卡死已中止本次加载，请重试或重启应用。",
+                "The previous model's memory was not released ({} → {} MiB); load aborted to avoid freezing the system — retry or restart the app.",
                 pre / (1024 * 1024),
                 now / (1024 * 1024),
-                pre / (1024 * 1024),
-                now / (1024 * 1024)
             ))
         })
         .await
-        .map_err(|e| format!("卸载校验任务异常 (eject check failed): {e}"))?;
+        .map_err(|e| trf!("卸载校验任务异常: {}", "eject check failed: {}", e))?;
         verified?;
     }
     state.cancel.store(false, Ordering::SeqCst);
@@ -246,7 +242,7 @@ pub async fn load_model(
     // Saturate the mark so a straggling poller tick can't undercut "ready".
     gate.saturate();
     let (backend, mut info) = result
-        .map_err(|e| format!("加载任务异常 (load task panicked): {e}"))?
+        .map_err(|e| crate::agent::localize_mixed(&format!("加载任务异常 (load task panicked): {e}")))?
         .map_err(|e| format!("{e:#}"))?;
     let _ = on_progress.send(LoadProgress { phase: "ready", frac: 1.0 });
 
@@ -299,7 +295,7 @@ pub fn get_gpu_usage() -> Option<crate::gpu::GpuUsage> {
 /// Write `content` to `path` (used by conversation export after a save dialog).
 #[tauri::command]
 pub fn write_text_file(path: String, content: String) -> Result<(), String> {
-    std::fs::write(&path, content).map_err(|e| format!("写入文件失败 (failed to write file): {e}"))
+    std::fs::write(&path, content).map_err(|e| crate::agent::localize_mixed(&format!("写入文件失败 (failed to write file): {e}")))
 }
 
 /// Write base64 little-endian f32 mono PCM to `path` as a 16-bit PCM WAV file
@@ -308,7 +304,7 @@ pub fn write_text_file(path: String, content: String) -> Result<(), String> {
 pub fn write_wav_file(path: String, audio: String, sample_rate: u32) -> Result<(), String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(audio.as_bytes())
-        .map_err(|e| format!("音频解码失败 (audio decode failed): {e}"))?;
+        .map_err(|e| crate::agent::localize_mixed(&format!("音频解码失败 (audio decode failed): {e}")))?;
     let samples: Vec<f32> = bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -335,7 +331,7 @@ pub fn write_wav_file(path: String, audio: String, sample_rate: u32) -> Result<(
         let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
         out.extend_from_slice(&v.to_le_bytes());
     }
-    std::fs::write(&path, out).map_err(|e| format!("写入文件失败 (failed to write file): {e}"))
+    std::fs::write(&path, out).map_err(|e| crate::agent::localize_mixed(&format!("写入文件失败 (failed to write file): {e}")))
 }
 
 #[derive(Serialize)]
@@ -467,17 +463,19 @@ pub fn migrate_or_prompt_models(app: &tauri::AppHandle) {
 fn prompt_models_migration(app: &tauri::AppHandle, n: usize) {
     use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
-    let title = "整理模型文件 (Organize models)";
-    let msg = format!(
-        "检测到 {n} 个旧版本散放的模型文件。新版本按「一个模型一个文件夹」管理 —— 点击「立即整理」自动归位（只移动文件位置，不删除任何内容，20GB 大模型也是秒级完成）。\n选择「以后再说」则暂不整理。\n\nFound {n} loose model file(s) from an older version. This version keeps one folder per model — click Organize to move them into place (files are only relocated, never deleted; instant even for 20 GB models). Or choose Later to skip for now."
+    let title = crate::agent::tr("整理模型文件", "Organize models");
+    let msg = trf!(
+        "检测到 {} 个旧版本散放的模型文件。新版本按「一个模型一个文件夹」管理 —— 点击「立即整理」自动归位（只移动文件位置，不删除任何内容，20GB 大模型也是秒级完成）。\n选择「以后再说」则暂不整理。",
+        "Found {} loose model file(s) from an older version. This version keeps one folder per model — click Organize to move them into place (files are only relocated, never deleted; instant even for 20 GB models). Or choose Later to skip for now.",
+        n,
     );
     let handle = app.clone();
     app.dialog()
         .message(msg)
-        .title(title)
+        .title(&title)
         .buttons(MessageDialogButtons::OkCancelCustom(
-            "立即整理 (Organize)".into(),
-            "以后再说 (Later)".into(),
+            crate::agent::tr("立即整理", "Organize"),
+            crate::agent::tr("以后再说", "Later"),
         ))
         .show(move |organize| {
             if !organize {
@@ -486,10 +484,12 @@ fn prompt_models_migration(app: &tauri::AppHandle, n: usize) {
             migrate_models_layout(&handle);
             handle
                 .dialog()
-                .message(format!(
-                    "已整理好 {n} 个模型，现在可以在模型列表里直接选用。\nOrganized {n} model(s) — they now appear in the model list."
+                .message(trf!(
+                    "已整理好 {} 个模型，现在可以在模型列表里直接选用。",
+                    "Organized {} model(s) — they now appear in the model list.",
+                    n,
                 ))
-                .title(title)
+                .title(&title)
                 .show(|_| {});
         });
 }
@@ -599,7 +599,7 @@ pub fn ensure_models_dir(app: &tauri::AppHandle) {
 /// `Command::spawn` goes through `posix_spawn`, which is atomic and fork-free, so
 /// it's both safe and fast. A short reaper thread `wait()`s the launcher child
 /// (which exits in milliseconds) so we don't leak zombies.
-fn open_default(target: &str) -> Result<(), String> {
+pub(crate) fn open_default(target: &str) -> Result<(), String> {
     #[allow(unused_mut)]
     let mut cmd;
     #[cfg(target_os = "macos")]
@@ -635,7 +635,7 @@ fn open_default(target: &str) -> Result<(), String> {
             });
             Ok(())
         }
-        Err(e) => Err(format!("无法打开 (failed to open): {e}")),
+        Err(e) => Err(crate::agent::localize_mixed(&format!("无法打开 (failed to open): {e}"))),
     }
 }
 
@@ -758,10 +758,70 @@ pub fn open_html_report(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let path = dir.join(format!("{stem}-{ts}.html"));
-    std::fs::write(&path, html).map_err(|e| format!("写入文件失败 (failed to write file): {e}"))?;
+    std::fs::write(&path, html).map_err(|e| crate::agent::localize_mixed(&format!("写入文件失败 (failed to write file): {e}")))?;
     let p = path.to_string_lossy().to_string();
     open_default(&p)?;
     Ok(p)
+}
+
+/// Canvas sessions (version history per opened document) live as one JSON
+/// file per session under app-data/canvas-sessions/. The in-memory map alone
+/// meant every iteration was gone after an app restart — the chat message
+/// only carries v1.
+fn canvas_sessions_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("canvas-sessions");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+/// Keep the newest `keep` session files; delete the rest. Sorted by mtime.
+fn prune_canvas_sessions(dir: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| {
+            let m = e.metadata().ok()?.modified().ok()?;
+            Some((m, e.path()))
+        })
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    for (_, p) in files.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Persist one canvas session (key = content hash chosen by the frontend).
+#[tauri::command]
+pub fn canvas_session_save(app: tauri::AppHandle, key: String, data: String) -> Result<(), String> {
+    // The key is a frontend-computed hex hash — refuse anything path-like.
+    if key.is_empty() || key.len() > 64 || !key.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("bad canvas session key".into());
+    }
+    let dir = canvas_sessions_dir(&app)?;
+    std::fs::write(dir.join(format!("{key}.json")), data).map_err(|e| e.to_string())?;
+    prune_canvas_sessions(&dir, 100);
+    Ok(())
+}
+
+/// Load one canvas session; Ok(None) when there is none.
+#[tauri::command]
+pub fn canvas_session_load(app: tauri::AppHandle, key: String) -> Result<Option<String>, String> {
+    if key.is_empty() || key.len() > 64 || !key.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("bad canvas session key".into());
+    }
+    let dir = canvas_sessions_dir(&app)?;
+    match std::fs::read_to_string(dir.join(format!("{key}.json"))) {
+        Ok(s) => Ok(Some(s)),
+        Err(_) => Ok(None),
+    }
 }
 
 /// List `.gguf` models discovered in the scanned directories, for the in-app
@@ -908,12 +968,12 @@ pub async fn delete_model_file(
     if target.is_dir() {
         if !crate::inference::mlx::is_mlx_dir(&target) {
             return Err(
-                "只能删除模型文件夹 (only model folders can be deleted this way)".into()
+                crate::agent::localize_mixed("只能删除模型文件夹 (only model folders can be deleted this way)")
             );
         }
         let canon = target
             .canonicalize()
-            .map_err(|e| format!("文件夹不存在 (folder not found): {e}"))?;
+            .map_err(|e| crate::agent::localize_mixed(&format!("文件夹不存在 (folder not found): {e}")))?;
         let in_models = model_dirs(&app)
             .iter()
             .any(|d| d.canonicalize().map_or(false, |dc| canon.starts_with(&dc)));
@@ -935,17 +995,17 @@ pub async fn delete_model_file(
             }
         }
         return std::fs::remove_dir_all(&canon)
-            .map_err(|e| format!("删除失败 (delete failed): {e}"));
+            .map_err(|e| crate::agent::localize_mixed(&format!("删除失败 (delete failed): {e}")));
     }
     if !target
         .extension()
         .map_or(false, |x| x.eq_ignore_ascii_case("gguf"))
     {
-        return Err("只能删除 .gguf 模型文件 (only .gguf model files can be deleted)".into());
+        return Err(crate::agent::localize_mixed("只能删除 .gguf 模型文件 (only .gguf model files can be deleted)"));
     }
     let canon = target
         .canonicalize()
-        .map_err(|e| format!("文件不存在 (file not found): {e}"))?;
+        .map_err(|e| crate::agent::localize_mixed(&format!("文件不存在 (file not found): {e}")))?;
     let in_models = model_dirs(&app)
         .iter()
         .any(|d| d.canonicalize().map_or(false, |dc| canon.starts_with(&dc)));
@@ -978,7 +1038,7 @@ pub async fn delete_model_file(
     });
     if parent_is_models_root {
         let mmproj = crate::inference::llama::find_mmproj(&canon.to_string_lossy());
-        std::fs::remove_file(&canon).map_err(|e| format!("删除失败 (delete failed): {e}"))?;
+        std::fs::remove_file(&canon).map_err(|e| crate::agent::localize_mixed(&format!("删除失败 (delete failed): {e}")))?;
         // Remove a flat-dir mmproj orphaned by this delete (it only paired
         // because this was the folder's single main model).
         if let Some(p) = mmproj {
@@ -988,7 +1048,7 @@ pub async fn delete_model_file(
         }
     } else {
         let dir = parent.expect("non-root parent");
-        std::fs::remove_dir_all(&dir).map_err(|e| format!("删除失败 (delete failed): {e}"))?;
+        std::fs::remove_dir_all(&dir).map_err(|e| crate::agent::localize_mixed(&format!("删除失败 (delete failed): {e}")))?;
     }
     Ok(())
 }
@@ -999,8 +1059,8 @@ pub async fn delete_model_file(
 pub async fn save_file(src: String, dest: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || std::fs::copy(&src, &dest).map(|_| ()))
         .await
-        .map_err(|e| format!("保存任务异常 (save task failed): {e}"))?
-        .map_err(|e| format!("保存失败 (save failed): {e}"))
+        .map_err(|e| crate::agent::localize_mixed(&format!("保存任务异常 (save task failed): {e}")))?
+        .map_err(|e| crate::agent::localize_mixed(&format!("保存失败 (save failed): {e}")))
 }
 
 /// Full-resolution image as a data URL (no downscaling) — for the crisp
@@ -1008,7 +1068,7 @@ pub async fn save_file(src: String, dest: String) -> Result<(), String> {
 #[tauri::command]
 pub async fn image_data_url(path: String) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
-        let bytes = std::fs::read(&path).map_err(|e| format!("读取失败 (read failed): {e}"))?;
+        let bytes = std::fs::read(&path).map_err(|e| crate::agent::localize_mixed(&format!("读取失败 (read failed): {e}")))?;
         use base64::Engine as _;
         let lower = path.to_lowercase();
         // Serve PNG/JPEG/etc. verbatim so the preview is pixel-exact; downscale
@@ -1026,18 +1086,18 @@ pub async fn image_data_url(path: String) -> Result<String, String> {
             let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
             return Ok(format!("data:{mime};base64,{b64}"));
         }
-        let img = image::load_from_memory(&bytes).map_err(|e| format!("解码失败 (decode failed): {e}"))?;
+        let img = image::load_from_memory(&bytes).map_err(|e| crate::agent::localize_mixed(&format!("解码失败 (decode failed): {e}")))?;
         let scaled = img.thumbnail(2400, 2400);
         let mut buf = std::io::Cursor::new(Vec::new());
         scaled
             .to_rgb8()
             .write_to(&mut buf, image::ImageFormat::Jpeg)
-            .map_err(|e| format!("编码失败 (encode failed): {e}"))?;
+            .map_err(|e| crate::agent::localize_mixed(&format!("编码失败 (encode failed): {e}")))?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
         Ok(format!("data:image/jpeg;base64,{b64}"))
     })
     .await
-    .map_err(|e| format!("图片任务异常 (image task failed): {e}"))?
+    .map_err(|e| crate::agent::localize_mixed(&format!("图片任务异常 (image task failed): {e}")))?
 }
 
 /// Downscaled data-URL thumbnail of a local image, for chat-bubble previews.
@@ -1046,7 +1106,7 @@ pub async fn image_data_url(path: String) -> Result<String, String> {
 #[tauri::command]
 pub async fn image_thumb(path: String, max_dim: Option<u32>) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
-        let img = image::open(&path).map_err(|e| format!("无法读取图片 (failed to read image): {e}"))?;
+        let img = image::open(&path).map_err(|e| crate::agent::localize_mixed(&format!("无法读取图片 (failed to read image): {e}")))?;
         let max = max_dim.unwrap_or(512).clamp(64, 1024);
         let thumb = img.thumbnail(max, max);
         let mut buf = std::io::Cursor::new(Vec::new());
@@ -1054,22 +1114,22 @@ pub async fn image_thumb(path: String, max_dim: Option<u32>) -> Result<String, S
         thumb
             .to_rgb8()
             .write_to(&mut buf, image::ImageFormat::Jpeg)
-            .map_err(|e| format!("缩略图编码失败 (thumbnail encode failed): {e}"))?;
+            .map_err(|e| crate::agent::localize_mixed(&format!("缩略图编码失败 (thumbnail encode failed): {e}")))?;
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
         Ok(format!("data:image/jpeg;base64,{b64}"))
     })
     .await
-    .map_err(|e| format!("缩略图任务异常 (thumbnail task failed): {e}"))?
+    .map_err(|e| crate::agent::localize_mixed(&format!("缩略图任务异常 (thumbnail task failed): {e}")))?
 }
 
 /// Rebuild the system-tray menu in the given UI language (`"zh"` | `"en"`).
 #[tauri::command]
 pub fn set_tray_language(app: tauri::AppHandle, lang: String) -> Result<(), String> {
     let (show, quit) = if lang == "zh" {
-        ("显示 Chaty", "退出")
+        ("显示 DARIA", "退出")
     } else {
-        ("Show Chaty", "Quit")
+        ("Show DARIA", "Quit")
     };
     let show_i = MenuItem::with_id(&app, "show", show, true, None::<&str>)
         .map_err(|e| e.to_string())?;
@@ -1090,10 +1150,11 @@ pub async fn generate(
     on_event: Channel<StreamEvent>,
 ) -> Result<(), String> {
     let Some(backend) = state.backend().await else {
+        let msg = crate::agent::tr("尚未加载模型", "No model loaded");
         let _ = on_event.send(StreamEvent::Error {
-            message: "尚未加载模型".into(),
+            message: msg.clone(),
         });
-        return Err("no model loaded".into());
+        return Err(msg);
     };
 
     // Clear any stale cancel request from a previous run, then hand a fresh
@@ -1105,7 +1166,7 @@ pub async fn generate(
         .generate(request, on_event.clone(), cancel)
         .await
         .map_err(|e| {
-            let msg = format!("{e:#}");
+            let msg = crate::agent::localize_mixed(&format!("{e:#}"));
             let _ = on_event.send(StreamEvent::Error {
                 message: msg.clone(),
             });
@@ -1138,17 +1199,17 @@ pub async fn vision_query(
         .map(|m| m.vision_ready)
         .unwrap_or(false);
     if !vision_ready {
-        return Err(
-            "当前模型不支持图像识别（未加载视觉编码器 mmproj）。(The active model can't see images — no vision encoder loaded.)"
-                .into(),
-        );
+        return Err(crate::agent::tr(
+            "当前模型不支持图像识别（未加载视觉编码器 mmproj）。",
+            "The active model can't see images — no vision encoder loaded.",
+        ));
     }
     let Some(backend) = state.backend().await else {
-        return Err("尚未加载模型 (no model loaded)".into());
+        return Err(crate::agent::tr("尚未加载模型", "No model loaded"));
     };
     for p in &images {
         if !std::path::Path::new(p).exists() {
-            return Err(format!("图片不存在 (image not found): {p}"));
+            return Err(trf!("图片不存在: {}", "image not found: {}", p));
         }
     }
     state.cancel.store(false, Ordering::SeqCst);
@@ -1229,6 +1290,17 @@ pub async fn transcribe(
         .map_err(|e| format!("{e:#}"))
 }
 
+fn encode_pcm(samples: &[f32], sample_rate: u32) -> SynthAudio {
+    let mut bytes = Vec::with_capacity(samples.len() * 4);
+    for s in samples {
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    SynthAudio {
+        audio: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        sample_rate,
+    }
+}
+
 /// Synthesize speech for `text` (Kokoro). Returns base64 f32 PCM + sample rate.
 #[tauri::command]
 pub async fn synthesize(
@@ -1242,13 +1314,36 @@ pub async fn synthesize(
         crate::voice::synthesize(dir, text, speed.unwrap_or(1.0), sid.unwrap_or(0))
             .await
             .map_err(|e| format!("{e:#}"))?;
+    Ok(encode_pcm(&samples, sample_rate))
+}
 
-    let mut bytes = Vec::with_capacity(samples.len() * 4);
-    for s in &samples {
-        bytes.extend_from_slice(&s.to_le_bytes());
-    }
-    let audio = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Ok(SynthAudio { audio, sample_rate })
+/// English Microsoft Edge neural voices (online). Falls back to a built-in list.
+#[tauri::command]
+pub async fn list_edge_voices() -> Result<Vec<crate::edge_tts::EdgeVoice>, String> {
+    crate::edge_tts::list_english_voices()
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Synthesize speech via Microsoft Edge TTS. Read-aloud only — not used by Live.
+#[tauri::command]
+pub async fn synthesize_edge(
+    text: String,
+    voice: Option<String>,
+    speed: Option<f32>,
+    pitch: Option<f32>,
+    volume: Option<f32>,
+) -> Result<SynthAudio, String> {
+    let (samples, sample_rate) = crate::edge_tts::synthesize_edge(
+        text,
+        voice.unwrap_or_else(|| "en-US-JennyNeural".into()),
+        speed.unwrap_or(1.0),
+        pitch.unwrap_or(0.0),
+        volume.unwrap_or(0.0),
+    )
+    .await
+    .map_err(|e| format!("{e:#}"))?;
+    Ok(encode_pcm(&samples, sample_rate))
 }
 
 #[cfg(test)]
@@ -1289,6 +1384,30 @@ mod tests {
         let g2 = super::MonotonicProgress::new();
         assert!(g2.permit(7.0));
         assert!(!g2.permit(0.99));
+    }
+
+    /// Session pruning keeps the NEWEST files and never deletes below the cap.
+    #[test]
+    fn canvas_session_prune_keeps_newest() {
+        let tmp = std::env::temp_dir().join(format!("chaty-cv-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        for i in 0..5 {
+            std::fs::write(tmp.join(format!("{i:02x}.json")), "{}").unwrap();
+            // Distinct mtimes, oldest first (APFS keeps sub-second precision).
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        super::prune_canvas_sessions(&tmp, 3);
+        let mut left: Vec<String> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["02.json", "03.json", "04.json"], "newest three survive");
+        super::prune_canvas_sessions(&tmp, 10);
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 3);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     use super::{loose_main_ggufs, migrate_models_dir};

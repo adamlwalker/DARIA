@@ -28,7 +28,7 @@ async fn ensure_models(dir: &Path) -> Result<(PathBuf, PathBuf)> {
 async fn download(url: &str, to: &Path) -> Result<()> {
     let bytes = reqwest::get(url)
         .await
-        .with_context(|| format!("下载 OCR 模型失败: {url}"))?
+        .with_context(|| trf!("下载 OCR 模型失败: {}", "failed to download OCR model: {}", url))?
         .error_for_status()?
         .bytes()
         .await?;
@@ -43,9 +43,13 @@ pub async fn ocr_image(models_dir: PathBuf, image_path: String) -> Result<String
     // Model loading + inference is CPU-bound and synchronous.
     tokio::task::spawn_blocking(move || -> Result<String> {
         let detection_model =
-            Model::load_file(&det).map_err(|e| anyhow::anyhow!("加载检测模型失败: {e}"))?;
+            Model::load_file(&det).map_err(|e| {
+                anyhow::anyhow!(trf!("加载检测模型失败: {}", "failed to load detection model: {}", e))
+            })?;
         let recognition_model =
-            Model::load_file(&rec).map_err(|e| anyhow::anyhow!("加载识别模型失败: {e}"))?;
+            Model::load_file(&rec).map_err(|e| {
+                anyhow::anyhow!(trf!("加载识别模型失败: {}", "failed to load recognition model: {}", e))
+            })?;
 
         let engine = OcrEngine::new(OcrEngineParams {
             detection_model: Some(detection_model),
@@ -54,14 +58,14 @@ pub async fn ocr_image(models_dir: PathBuf, image_path: String) -> Result<String
         })?;
 
         let img = image::open(&image_path)
-            .context("打开图片失败")?
+            .context(crate::agent::tr("打开图片失败", "failed to open image"))?
             .into_rgb8();
         let (w, h) = img.dimensions();
         let source = ImageSource::from_bytes(img.as_raw(), (w, h))
-            .map_err(|e| anyhow::anyhow!("图像预处理失败: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!(trf!("图像预处理失败: {:?}", "image preprocess failed: {:?}", e)))?;
         let input = engine.prepare_input(source)?;
         engine.get_text(&input)
     })
     .await
-    .context("OCR 任务异常")?
+    .context(crate::agent::tr("OCR 任务异常", "OCR task failed"))?
 }

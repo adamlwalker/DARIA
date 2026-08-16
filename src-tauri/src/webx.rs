@@ -12,8 +12,6 @@
 //!    walk into sub-pages.
 //! Everything is key-less and talks to the sites directly (no proxy service).
 
-use std::time::Duration;
-
 use scraper::{Html, Selector};
 use serde::Serialize;
 use serde_json::Value;
@@ -97,6 +95,8 @@ pub async fn site_search(site: String, query: String) -> Result<Vec<SiteResult>,
         "reddit.com" | "reddit" => reddit_search(&query, None).await,
         "youtube.com" | "youtube" | "youtu.be" => youtube_search(&query).await,
         "bilibili.com" | "bilibili" | "b23.tv" => bilibili_search(&query).await,
+        // US/international TikTok only — not Douyin (douyin.com).
+        "tiktok.com" | "tiktok" | "vm.tiktok.com" => tiktok_search(&query).await,
         // r/rust style scoping: site "reddit.com/r/rust"
         _ if s.starts_with("reddit.com/r/") => {
             let sub = s.trim_start_matches("reddit.com/r/").to_string();
@@ -422,7 +422,7 @@ async fn fetch_youtube(video_id: &str) -> Result<PageEx, String> {
     let status = v["playabilityStatus"]["status"].as_str().unwrap_or("?");
     if status != "OK" {
         let reason = v["playabilityStatus"]["reason"].as_str().unwrap_or(status);
-        return Err(format!("视频不可用 (video unavailable): {reason}"));
+        return Err(crate::agent::localize_mixed(&format!("视频不可用 (video unavailable): {reason}")));
     }
     let d = &v["videoDetails"];
     let title = d["title"].as_str().unwrap_or("").to_string();
@@ -431,10 +431,15 @@ async fn fetch_youtube(video_id: &str) -> Result<PageEx, String> {
     let views = d["viewCount"].as_str().unwrap_or("?");
     let desc: String = d["shortDescription"].as_str().unwrap_or("").chars().take(600).collect();
 
-    let mut text = format!(
-        "视频 (video): {title}\n频道 (channel): {author} · 时长 (length): {}:{:02} · 播放 (views): {views}\n\n简介 (description):\n{desc}\n",
+    let mut text = trf!(
+        "视频: {}\n频道: {} · 时长: {}:{:02} · 播放: {}\n\n简介:\n{}\n",
+        "video: {}\nchannel: {} · length: {}:{:02} · views: {}\n\ndescription:\n{}\n",
+        title,
+        author,
         secs / 60,
-        secs % 60
+        secs % 60,
+        views,
+        desc
     );
 
     let tracks = v["captions"]["playerCaptionsTracklistRenderer"]["captionTracks"]
@@ -445,17 +450,33 @@ async fn fetch_youtube(video_id: &str) -> Result<PageEx, String> {
         Some(track) => {
             let base = track["baseUrl"].as_str().unwrap_or_default();
             let lang = track["languageCode"].as_str().unwrap_or("?");
-            let kind = if track["kind"].as_str() == Some("asr") { " 自动生成/auto" } else { "" };
+            let kind = if track["kind"].as_str() == Some("asr") {
+                crate::agent::tr(" 自动生成", " auto")
+            } else {
+                String::new()
+            };
             let xml = c.get(base).send().await.map_err(|e| e.to_string())?.text().await.map_err(|e| e.to_string())?;
             let transcript = timedtext_to_transcript(&xml);
             if transcript.is_empty() {
-                text.push_str("\n(字幕轨为空 / caption track came back empty)\n");
+                text.push_str(&crate::agent::tr(
+                    "\n(字幕轨为空)\n",
+                    "\n(caption track came back empty)\n",
+                ));
             } else {
-                text.push_str(&format!("\n—— 字幕转写 (transcript, {lang}{kind}) ——\n{transcript}\n"));
+                text.push_str(&trf!(
+                    "\n—— 字幕转写 ({}{}) ——\n{}\n",
+                    "\n—— transcript ({}{}) ——\n{}\n",
+                    lang,
+                    kind,
+                    transcript
+                ));
             }
         }
         None => {
-            text.push_str("\n(此视频没有字幕轨,无法转写 / no caption track on this video)\n");
+            text.push_str(&crate::agent::tr(
+                "\n(此视频没有字幕轨,无法转写)\n",
+                "\n(no caption track on this video)\n",
+            ));
         }
     }
 
@@ -520,7 +541,7 @@ async fn bilibili_search(query: &str) -> Result<Vec<SiteResult>, String> {
             meta.push(author.to_string());
         }
         if plays > 0 {
-            meta.push(format!("{plays} 播放"));
+            meta.push(trf!("{} 播放", "{} views", plays));
         }
         out.push(SiteResult {
             kind: "video".into(),
@@ -570,10 +591,10 @@ async fn fetch_bilibili(bvid: &str) -> Result<PageEx, String> {
         .map_err(|e| e.to_string())?;
     let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
     if v["code"].as_i64() != Some(0) {
-        return Err(format!(
+        return Err(crate::agent::localize_mixed(&format!(
             "B站视频不可用 (unavailable): {}",
             v["message"].as_str().unwrap_or("?")
-        ));
+        )));
     }
     let d = &v["data"];
     let title = d["title"].as_str().unwrap_or("").to_string();
@@ -584,10 +605,17 @@ async fn fetch_bilibili(bvid: &str) -> Result<PageEx, String> {
     let likes = stat["like"].as_i64().unwrap_or(0);
     let danmaku = stat["danmaku"].as_i64().unwrap_or(0);
     let desc: String = d["desc"].as_str().unwrap_or("").chars().take(800).collect();
-    let text = format!(
-        "视频 (video): {title}\nUP 主 (uploader): {author} · 时长 (length): {}:{:02} · 播放 (views): {views} · 点赞 (likes): {likes} · 弹幕 (danmaku): {danmaku}\n\n简介 (description):\n{desc}\n\n（B站视频正文以弹幕/字幕形式存在,需登录才能取字幕;此处提供公开元信息与简介 / public metadata only — captions require login）",
+    let text = trf!(
+        "视频: {}\nUP 主: {} · 时长: {}:{:02} · 播放: {} · 点赞: {} · 弹幕: {}\n\n简介:\n{}\n\n（B站视频正文以弹幕/字幕形式存在,需登录才能取字幕;此处提供公开元信息与简介）",
+        "video: {}\nuploader: {} · length: {}:{:02} · views: {} · likes: {} · danmaku: {}\n\ndescription:\n{}\n\n(public metadata only — captions require login)",
+        title,
+        author,
         secs / 60,
-        secs % 60
+        secs % 60,
+        views,
+        likes,
+        danmaku,
+        desc
     );
     let (text, truncated) = cap(text.trim(), TEXT_CAP);
     Ok(PageEx {
@@ -603,8 +631,178 @@ async fn fetch_bilibili(bvid: &str) -> Result<PageEx, String> {
     })
 }
 
-/// Manual captions beat auto-generated; within each class prefer Chinese,
-/// then English, then whatever is first.
+// ---------------------------------------------------------------- tiktok (US)
+
+fn is_tiktok_host(host: &str) -> bool {
+    let h = host.trim_start_matches("www.").trim_start_matches("m.");
+    h == "tiktok.com" || h == "vm.tiktok.com"
+}
+
+fn is_tiktok_url(url: &str) -> bool {
+    Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(is_tiktok_host))
+        .unwrap_or(false)
+}
+
+/// Video id from a tiktok.com URL (`/@user/video/123…` or `/embed[/v2]/123…`).
+/// Short `vm.tiktok.com` links have no id until they redirect.
+fn tiktok_video_id(url: &str) -> Option<String> {
+    let u = Url::parse(url).ok()?;
+    let host = u.host_str()?.trim_start_matches("www.").trim_start_matches("m.");
+    if host != "tiktok.com" {
+        return None;
+    }
+    let segs: Vec<&str> = u.path().trim_matches('/').split('/').collect();
+    let id_ok = |s: &str| {
+        (s.len() >= 8 && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.to_string())
+    };
+    if segs.len() >= 3 && segs[1] == "video" {
+        return id_ok(segs[2]);
+    }
+    if segs.len() >= 2 && segs[0] == "embed" {
+        let id = if segs[1] == "v2" { *segs.get(2)? } else { segs[1] };
+        return id_ok(id);
+    }
+    None
+}
+
+/// US TikTok in-site search. The site is JS-heavy, so we scrape whatever
+/// video URLs the HTML still embeds, then fall back to a `site:tiktok.com`
+/// engine query. Always targets tiktok.com (not Douyin).
+async fn tiktok_search(query: &str) -> Result<Vec<SiteResult>, String> {
+    let c = client(15)?;
+    let url = format!(
+        "https://www.tiktok.com/search/video?q={}",
+        urlencoding(query)
+    );
+    let html = match c
+        .get(&url)
+        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+        .send()
+        .await
+    {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(_) => String::new(),
+    };
+    let mut out = collect_tiktok_results(&html);
+    if out.is_empty() {
+        return engine_site_search("tiktok.com", query).await;
+    }
+    out.truncate(10);
+    Ok(out)
+}
+
+fn collect_tiktok_results(html: &str) -> Vec<SiteResult> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let bytes = html.as_bytes();
+    let needle = b"/video/";
+    let mut i = 0;
+    while let Some(rel) = bytes[i..].windows(needle.len()).position(|w| w == needle) {
+        let at = i + rel;
+        // Walk back for `/@user`
+        let prefix = &html[..at];
+        let user_start = prefix.rfind("/@").unwrap_or(at);
+        let after = &html[at + needle.len()..];
+        let id: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        i = at + needle.len() + id.len();
+        if id.len() < 8 {
+            continue;
+        }
+        let handle: String = html[user_start + 2..at]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+            .collect();
+        if handle.is_empty() || !seen.insert(id.clone()) {
+            continue;
+        }
+        let url = format!("https://www.tiktok.com/@{handle}/video/{id}");
+        out.push(SiteResult {
+            kind: "video".into(),
+            title: format!("@{handle}"),
+            url,
+            snippet: String::new(),
+        });
+        if out.len() >= 12 {
+            break;
+        }
+    }
+    out
+}
+
+/// Fetch a US TikTok video: follow short-links, then oembed + page metadata.
+async fn fetch_tiktok(url: &str) -> Result<PageEx, String> {
+    let c = client(20)?;
+    let resp = c
+        .get(url)
+        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let final_url = resp.url().to_string();
+    let html = resp.text().await.unwrap_or_default();
+
+    let mut title = String::new();
+    let mut author = String::new();
+    let mut desc = String::new();
+
+    let oembed_target = if tiktok_video_id(&final_url).is_some() {
+        final_url.as_str()
+    } else {
+        url
+    };
+    if let Ok(oe) = c
+        .get(format!(
+            "https://www.tiktok.com/oembed?url={}",
+            urlencoding(oembed_target)
+        ))
+        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+        .send()
+        .await
+    {
+        if let Ok(body) = oe.text().await {
+            if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                title = v["title"].as_str().unwrap_or("").to_string();
+                author = v["author_name"].as_str().unwrap_or("").to_string();
+            }
+        }
+    }
+
+    if desc.is_empty() {
+        if let Some(og) = html.split("property=\"og:description\" content=\"").nth(1) {
+            desc = og.split('"').next().unwrap_or("").to_string();
+        }
+    }
+    if title.is_empty() {
+        if let Some(og) = html.split("property=\"og:title\" content=\"").nth(1) {
+            title = og.split('"').next().unwrap_or("").to_string();
+        }
+    }
+    if title.is_empty() {
+        title = "TikTok video".into();
+    }
+
+    let text = format!(
+        "Video (TikTok): {title}\nAuthor: {author}\nURL: {final_url}\n\nDescription:\n{desc}\n"
+    );
+    let (text, truncated) = cap(text.trim(), TEXT_CAP);
+    Ok(PageEx {
+        url: final_url,
+        kind: "video".into(),
+        content_type: "video/tiktok".into(),
+        title,
+        text,
+        truncated,
+        links: Vec::new(),
+        images: Vec::new(),
+        bytes: None,
+    })
+}
+
+/// Manual captions beat auto-generated; within each class prefer the
+/// session language (English UI → English tracks, Chinese UI → Chinese),
+/// then the other, then whatever is first.
 fn pick_caption_track(tracks: &[Value]) -> Option<&Value> {
     for want_asr in [false, true] {
         let best = tracks
@@ -612,10 +810,11 @@ fn pick_caption_track(tracks: &[Value]) -> Option<&Value> {
             .filter(|t| (t["kind"].as_str() == Some("asr")) == want_asr)
             .min_by_key(|t| {
                 let lang = t["languageCode"].as_str().unwrap_or("");
-                if lang.starts_with("zh") {
-                    0
-                } else if lang.starts_with("en") {
-                    1
+                let en_first = crate::agent::lang_is_en();
+                if lang.starts_with("en") {
+                    if en_first { 0 } else { 1 }
+                } else if lang.starts_with("zh") {
+                    if en_first { 1 } else { 0 }
                 } else {
                     2
                 }
@@ -786,6 +985,11 @@ pub async fn fetch_page_ex(url: String, raw: Option<bool>) -> Result<PageEx, Str
         return fetch_bilibili(&bvid).await;
     }
 
+    // US TikTok (tiktok.com), including short vm.tiktok.com links.
+    if is_tiktok_url(&url) {
+        return fetch_tiktok(&url).await;
+    }
+
     let c = client(20)?;
     let resp = c.get(&url).send().await.map_err(|e| e.to_string())?;
     let status = resp.status();
@@ -820,7 +1024,7 @@ pub async fn fetch_page_ex(url: String, raw: Option<bool>) -> Result<PageEx, Str
             return Err(format!("PDF too large ({} MB)", bytes.len() / 1024 / 1024));
         }
         let text = pdf_extract::extract_text_from_mem(&bytes)
-            .map_err(|e| format!("PDF 解析失败: {e}"))?;
+            .map_err(|e| crate::agent::localize_mixed(&format!("PDF 解析失败: {e}")))?;
         let (text, truncated) = cap(text.trim(), TEXT_CAP);
         return Ok(PageEx {
             url: final_url,
@@ -951,14 +1155,14 @@ async fn fetch_reddit(rss_url: &str) -> Result<PageEx, String> {
     let resp = c.get(rss_url).send().await.map_err(|e| e.to_string())?;
     let status = resp.status();
     if !status.is_success() {
-        return Err(format!(
+        return Err(crate::agent::localize_mixed(&format!(
             "Reddit HTTP {status} — 被限流了,过一会再试 (rate limited, retry in a minute)"
-        ));
+        )));
     }
     let body = resp.text().await.map_err(|e| e.to_string())?;
     let entries = parse_atom(&body);
     if entries.is_empty() {
-        return Err("Reddit 返回了空 feed (empty feed)".to_string());
+        return Err(crate::agent::localize_mixed("Reddit 返回了空 feed (empty feed)"));
     }
     let title = entries[0].title.clone();
     let mut md = String::new();
@@ -1156,6 +1360,33 @@ mod tests {
         );
         assert_eq!(bilibili_bvid("https://www.bilibili.com/"), None);
         assert_eq!(bilibili_bvid("https://example.com/video/BV1xx411c7mD"), None);
+    }
+
+    #[test]
+    fn tiktok_ids_parse_from_us_urls() {
+        assert_eq!(
+            tiktok_video_id("https://www.tiktok.com/@scout2015/video/6718335390845095173").as_deref(),
+            Some("6718335390845095173")
+        );
+        assert_eq!(
+            tiktok_video_id("https://www.tiktok.com/embed/v2/6718335390845095173").as_deref(),
+            Some("6718335390845095173")
+        );
+        assert_eq!(tiktok_video_id("https://vm.tiktok.com/ZMxxxx/"), None);
+        assert_eq!(tiktok_video_id("https://www.douyin.com/video/1234567890"), None);
+        assert!(is_tiktok_url("https://www.tiktok.com/@x/video/1"));
+        assert!(is_tiktok_url("https://vm.tiktok.com/ZMxxxx/"));
+        assert!(!is_tiktok_url("https://www.douyin.com/video/123"));
+    }
+
+    #[test]
+    fn tiktok_search_html_collects_us_video_urls() {
+        let html = r#"<a href="https://www.tiktok.com/@demo.user/video/6718335390845095173">x</a>
+                      <a href="/@other_user/video/6987654321098765432">y</a>"#;
+        let hits = collect_tiktok_results(html);
+        assert_eq!(hits.len(), 2);
+        assert!(hits[0].url.contains("tiktok.com/@demo.user/video/6718335390845095173"));
+        assert!(hits.iter().all(|h| h.url.contains("tiktok.com") && !h.url.contains("douyin")));
     }
 
     #[test]

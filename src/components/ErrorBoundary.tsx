@@ -30,9 +30,9 @@ export class ErrorBoundary extends React.Component<Props, State> {
         <div className="crash-card">
           <div className="crash-title">应用出现异常 · Something went wrong</div>
           <p className="crash-msg">
-            Chaty 遇到了一个意外错误，但你的对话已经保存在本地、不会丢失。
+            DARIA 遇到了一个意外错误，但你的对话已经保存在本地、不会丢失。
             <br />
-            Chaty hit an unexpected error. Your conversations are safe on disk.
+            DARIA hit an unexpected error. Your conversations are safe on disk.
           </p>
           <pre className="crash-detail">{error.message || String(error)}</pre>
           <div className="crash-actions">

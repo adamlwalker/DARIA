@@ -216,6 +216,11 @@ function handle(cmd: string, args: Record<string, unknown> | undefined): unknown
     // ---- extended web tools (Code mode) ----
     case "site_search": {
       const site = String(args?.site ?? "");
+      if (/tiktok/.test(site)) {
+        return [
+          { kind: "video", title: "@demo · rust tips (0:21)", url: "https://www.tiktok.com/@demo/video/6718335390845095173", snippet: "US TikTok search fixture" },
+        ];
+      }
       if (/bilibili/.test(site)) {
         return [
           { kind: "video", title: "Rust 编程语言入门教程（已完结）(729:37, 软件工艺师, 1672594 播放)", url: "https://www.bilibili.com/video/BV1hp4y1k7SV", snippet: "Rust 权威指南配套视频教程" },
@@ -228,6 +233,14 @@ function handle(cmd: string, args: Record<string, unknown> | undefined): unknown
     }
     case "fetch_page_ex": {
       const u = String(args?.url ?? "");
+      if (/tiktok\.com/.test(u)) {
+        return {
+          url: u, kind: "video", contentType: "video/tiktok",
+          title: "rust tips", truncated: false,
+          text: "Video (TikTok): rust tips\nAuthor: demo\nURL: https://www.tiktok.com/@demo/video/6718335390845095173\n\nDescription:\nA short US TikTok fixture.",
+          links: [], images: [], bytes: null,
+        };
+      }
       if (/youtube\.com|youtu\.be/.test(u)) {
         return {
           url: u, kind: "video", contentType: "video/youtube",
@@ -334,7 +347,7 @@ function handle(cmd: string, args: Record<string, unknown> | undefined): unknown
       const ch = args?.onEvent as { onmessage?: (ev: unknown) => void } | undefined;
       const emit = (ev: unknown) => ch?.onmessage?.(ev);
       const total = 6144;
-      // Code-agent script: typing a task containing 外部文件 makes the mock
+      // Code-agent script: typing a task containing an external file makes the mock
       // model read an out-of-workspace file, driving the dir-grant pipeline
       // (marker error → approval card → grant → retry) end-to-end in preview.
       const req = args?.request as { messages?: { role: string; content: string }[] } | undefined;
@@ -345,7 +358,7 @@ function handle(cmd: string, args: Record<string, unknown> | undefined): unknown
       const isTitleReq = /12个汉字|short chat title|作为对话标题/.test(sysAll);
       const wantsOutside = msgs.some((m) => m.role === "user" && (m.content.includes("外部文件") || /dataset manifest/i.test(m.content)));
       const outsideEn = msgs.some((m) => m.role === "user" && /dataset manifest/i.test(m.content));
-      // Typing a task with 安装/sudo makes the mock model emit a sudo bash call,
+      // Typing a task with install/sudo makes the mock model emit a sudo bash call,
       // driving the high-risk sudo approval dialog end-to-end in preview.
       const wantsSudo = msgs.some((m) => m.role === "user" && m.content.includes("sudo"));
       // Asking about the date makes the mock model echo the current-date line
@@ -415,7 +428,8 @@ function handle(cmd: string, args: Record<string, unknown> | undefined): unknown
       return null;
     }
     // 0.4s of silence so the Settings voice preview is testable in the browser.
-    case "synthesize": {
+    case "synthesize":
+    case "synthesize_edge": {
       const silence = new Uint8Array(4 * 9600);
       let bin = "";
       for (let i = 0; i < silence.length; i += 8192) {
@@ -423,6 +437,15 @@ function handle(cmd: string, args: Record<string, unknown> | undefined): unknown
       }
       return { audio: btoa(bin), sampleRate: 24000 };
     }
+    case "list_edge_voices":
+      return [
+        { shortName: "en-US-JennyNeural", locale: "en-US", gender: "Female", friendlyName: "Jenny (US)" },
+        { shortName: "en-US-GuyNeural", locale: "en-US", gender: "Male", friendlyName: "Guy (US)" },
+        { shortName: "en-US-AriaNeural", locale: "en-US", gender: "Female", friendlyName: "Aria (US)" },
+        { shortName: "en-GB-SoniaNeural", locale: "en-GB", gender: "Female", friendlyName: "Sonia (UK)" },
+        { shortName: "en-GB-RyanNeural", locale: "en-GB", gender: "Male", friendlyName: "Ryan (UK)" },
+        { shortName: "en-AU-NatashaNeural", locale: "en-AU", gender: "Female", friendlyName: "Natasha (AU)" },
+      ];
 
     case "hf_author_avatar": {
       const av: Record<string, string> = {

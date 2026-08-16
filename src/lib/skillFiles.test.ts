@@ -98,6 +98,15 @@ describe("precedence & discovery", () => {
     }
   });
 
+  test("official skills are knowledge-only (no bundled support trees)", async () => {
+    const { officialSkillSupport, skillRoot } = await import("./skillFiles");
+    expect(officialSkills().some((s) => s.name === "tiktok-video")).toBe(false);
+    for (const s of officialSkills()) {
+      expect(officialSkillSupport(s.name)).toBeNull();
+    }
+    expect(skillRoot("mac-app")).toBe(".chaty/skills/mac-app");
+  });
+
   test("user skills shadow official ones; disabled ones drop out", async () => {
     const files: Record<string, string> = {
       ".chaty/skills/verify-before-push.md": SKILL.replace("name: release", "name: verify-before-push").replace("Bump the version", "MY OWN STEPS"),

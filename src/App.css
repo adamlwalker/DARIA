@@ -2220,6 +2220,14 @@ body.resizing-x {
   position: relative;
   display: inline-flex;
 }
+/* The settings pane-in animation (fill: both) leaves every card a persistent
+ * stacking context, so a menu's z-index can't escape its own card — later
+ * sibling cards paint over an open dropdown. Lift the open card, and portal
+ * the menu (see Select.tsx) so overflow:auto on the pane cannot clip it. */
+.settings-pane-body > *:has(.csel.open) {
+  position: relative;
+  z-index: 75;
+}
 .csel-trigger {
   display: inline-flex;
   align-items: center;
@@ -2276,6 +2284,21 @@ body.resizing-x {
   border-radius: var(--r-md);
   box-shadow: var(--shadow-3);
   animation: ctxin 0.1s ease-out;
+}
+.csel-menu-portal {
+  position: fixed;
+  top: auto;
+  left: auto;
+  right: auto;
+  z-index: 3200;
+}
+.csel-group {
+  padding: 8px 10px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
 }
 .csel-opt {
   display: flex;
@@ -4050,6 +4073,16 @@ a:focus-visible,
   font-size: 11.5px;
   line-height: 1.45;
   color: var(--text-dim);
+}
+.settings-warn {
+  margin: 4px 0 12px;
+  padding: 9px 11px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+  border-radius: var(--r-md);
 }
 .hw-panel {
   width: 322px;

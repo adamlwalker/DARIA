@@ -24,6 +24,10 @@ export interface GenParams {
   /** Reasoning control for switch-less models (Qwen3.5+): false force-disables
    *  thinking, true/undefined leaves the model default. */
   think?: boolean | null;
+  /** Native reasoning-effort rung for models whose chat template takes a
+   *  `reasoning_effort` kwarg (Qwen3.8: "low" | "medium" | "xhigh"). Ignored
+   *  by every other model. */
+  effort?: string | null;
 }
 
 export interface GenRequest {
@@ -51,6 +55,9 @@ export interface ModelInfo {
   supportsThinking: boolean;
   /** The chat template honours the `/no_think` soft switch (Qwen3, not 3.5+). */
   thinkSwitch: boolean;
+  /** Native reasoning-effort ladder, weakest first (Qwen3.8:
+   *  ["low","medium","xhigh"]). Empty ⇒ plain on/off thinking. */
+  effortLevels?: string[];
   supportsTools: boolean;
   multimodal: boolean;
   /** The vision encoder (mmproj) is loaded — images actually work this session. */
@@ -227,6 +234,13 @@ export async function agentSetWorkspace(path: string): Promise<string> {
 /** Language for model-visible tool output (Rust renders one language, not both). */
 export async function agentSetLang(lang: "zh" | "en"): Promise<void> {
   return invoke<void>("agent_set_lang", { lang });
+}
+/** Official-skill live support layer (skillsync). Disabled here — no remote
+ *  skill trees are fetched. Always returns null so use_skill uses the bundle. */
+export async function skillLiveSupport(
+  _name: string,
+): Promise<{ rev: string; files: { path: string; text: string }[] } | null> {
+  return null;
 }
 export async function agentSetEditAnchorsIpc(on: boolean): Promise<void> {
   return invoke<void>("agent_set_edit_anchors", { on });
@@ -417,6 +431,15 @@ export async function openDataDir(): Promise<string> {
  *  Research report → print to PDF, since WKWebView can't print itself). */
 export async function openHtmlReport(html: string, name?: string): Promise<string> {
   return invoke<string>("open_html_report", { html, name });
+}
+
+/** Canvas session persistence: one JSON per opened document (key = content
+ *  hash), so version history survives an app restart. */
+export async function canvasSessionSave(key: string, data: string): Promise<void> {
+  await invoke("canvas_session_save", { key, data });
+}
+export async function canvasSessionLoad(key: string): Promise<string | null> {
+  return invoke<string | null>("canvas_session_load", { key });
 }
 
 /** Open a URL/file in the default browser. Routed through Rust (fork-free
@@ -1045,6 +1068,29 @@ export async function synthesize(
   return await invoke<SynthAudio>("synthesize", { text, speed, sid });
 }
 
+export interface EdgeVoice {
+  shortName: string;
+  locale: string;
+  gender: string;
+  friendlyName: string;
+}
+
+/** English Microsoft Edge neural voices (online). */
+export async function listEdgeVoices(): Promise<EdgeVoice[]> {
+  return await invoke<EdgeVoice[]>("list_edge_voices");
+}
+
+/** Synthesize via Microsoft Edge TTS (read-aloud only). */
+export async function synthesizeEdge(
+  text: string,
+  voice: string,
+  speed?: number,
+  pitch?: number,
+  volume?: number,
+): Promise<SynthAudio> {
+  return await invoke<SynthAudio>("synthesize_edge", { text, voice, speed, pitch, volume });
+}
+
 // ---------- Attachments ----------
 
 export interface Attachment {
@@ -1065,7 +1111,7 @@ export async function pickAttachmentFile(): Promise<string | null> {
     directory: false,
     filters: [
       {
-        name: "文档 / 图片",
+        name: "Documents / images",
         extensions: [
           "txt", "md", "markdown", "pdf", "docx", "xlsx", "pptx", "csv", "json", "log", "rs", "py",
           "js", "ts", "tsx", "jsx", "java", "c", "cpp", "h", "hpp", "go",
@@ -1126,4 +1172,13 @@ export const VISION_IMAGE_EXTS = ["png", "jpg", "jpeg", "webp", "bmp", "gif"];
 export function isVisionImagePath(path: string): boolean {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
   return VISION_IMAGE_EXTS.includes(ext);
+}
+
+/** Append a front-end error to the user-attachable error log. */
+export async function logAppError(kind: string, detail: string): Promise<void> {
+  await invoke("log_app_error", { kind, detail });
+}
+/** Open logs/chaty-error.log in the OS default viewer. */
+export async function openErrorLog(): Promise<void> {
+  await invoke("open_error_log");
 }

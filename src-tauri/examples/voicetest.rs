@@ -9,7 +9,7 @@ async fn main() -> Result<()> {
     let dir = std::env::temp_dir().join("chaty-voice-models");
     eprintln!("models dir: {}", dir.display());
 
-    let text = "Hello, this is Chaty speaking.";
+    let text = "Hello, this is DARIA speaking.";
     eprintln!("synthesizing: {text:?}");
     let (samples, sr) = chaty_lib::voice::synthesize(dir.clone(), text.into(), 1.0, 0).await?;
     eprintln!(
