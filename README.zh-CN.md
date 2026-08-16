@@ -31,8 +31,6 @@ DARIA 最初基于 [Fangyuan Lin](https://github.com/Fangyuan025/Chaty) 的 [Cha
 
 <br />
 
-<img src="docs/screenshots/demo.gif" width="860" alt="DARIA 本地编码智能体:一键授权后读取工作区外文件并总结" />
-
 <sub>一个本地编码智能体 —— 搜 GitHub、读源码、改你的文件、跑测试。**全在你自己的机器上。**</sub>
 
 </div>
@@ -88,38 +86,21 @@ DARIA 最初基于 [Fangyuan Lin](https://github.com/Fangyuan025/Chaty) 的 [Cha
 | opencode 1.18 | 7/45(16%) |
 | 裸 bash 智能体——单工具消融对照 | 6/45(13%) |
 
-同模型、同任务、同判分、同一台机器——五种智能体设计同台。DARIA 领跑全场:领先模型家族自家的官方 CLI([qwen-code](https://github.com/QwenLM/qwen-code))且**只用它一半的上下文窗口**,是裸 bash 消融的 **2.5 倍**。这正是设计论点的实测版:前沿大模型配一层薄脚手架就够用,而**小模型上,智能必须下沉到工具里**——仓库感知检索、符号级阅读、精确编辑、恢复护栏、编辑后诊断。方法学、各家配置与诚实对比说明(子集、macOS 环境——**不可**与官方排行榜数字直接对比):[docs/BENCHMARKS.md](docs/BENCHMARKS.md)。
+同模型、同任务、同判分、同一台机器——五种智能体设计同台。DARIA 领跑全场:领先模型家族自家的官方 CLI([qwen-code](https://github.com/QwenLM/qwen-code))且**只用它一半的上下文窗口**,是裸 bash 消融的 **2.5 倍**。这正是设计论点的实测版:前沿大模型配一层薄脚手架就够用,而**小模型上,智能必须下沉到工具里**——仓库感知检索、符号级阅读、精确编辑、恢复护栏、编辑后诊断。数字来自 45 任务的 macOS 子集,**不可**与官方排行榜数字直接对比。
 
 <br />
 
 ## 设计画布
 
-<picture>
-  <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/canvas-hero-light.jpg" />
-  <img src="docs/screenshots/canvas-hero-dark.jpg" width="860" alt="设计画布:实时预览与真实源码并排,元素↔代码行对照,控制台" />
-</picture>
-
 - **预览 | 代码,并排呈现** —— 每个页面都在分栏工作室中打开:左边实时预览,右边**真实源码**,语法高亮、跟随你的代码配色。三栏宽度自由拖拽,支持全屏、页面刷新,以及镜像页面日志与报错的**控制台**标签。
 - **指哪改哪** —— 对照模式把两栏双向连起来:悬停元素,代码跳到对应行;点代码行,页面元素闪烁定位。**点击即选中**(⌘/Ctrl 多选),下一条指令只改选中的元素 —— 想亲手改就点**编辑**按钮直接开源码。
 - **亲眼看着它改** —— 迭代过程 Cursor 式流式呈现:代码栏逐行扫描全文,完成后落到**变更**视图(+N/−N,与 Code 模式同款红绿 diff)。
-
-<picture>
-  <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/canvas-scan-light.jpg" />
-  <img src="docs/screenshots/canvas-scan-dark.jpg" width="860" alt="模型修改页面时的逐行扫描" />
-</picture>
 
 - **自愈修复,版本留存** —— 运行时错误给出一键**修复**(始终先征求同意);兼容层保证真浏览器里能跑的页面在画布里同样干净(history 路由、cookie、剪贴板);每条回答的画布会话关闭再开都在,版本历史可回退、可确认重置,并可导出为独立 `.html`。
 
 <br />
 
 ## 什么都能渲染的聊天
-
-<table>
-<tr>
-<td width="50%"><img src="docs/screenshots/shot-chat.jpg" alt="富文本渲染:语法高亮代码、表格与 KaTeX 数学" /></td>
-<td width="50%"><img src="docs/screenshots/shot-chat-light.jpg" alt="同一段对话在 DARIA 浅色主题下" /></td>
-</tr>
-</table>
 
 - 流式、可折叠的 **`<think>`** 面板,随生成自动跟随模型推理。
 - **KaTeX** 数学、表格、**Mermaid** 图、逐块代码复制,以及应用内渲染单文件 HTML —— 含可玩的网页游戏。
@@ -152,19 +133,10 @@ DARIA 最初基于 [Fangyuan Lin](https://github.com/Fangyuan025/Chaty) 的 [Cha
 
 ## 一个私密的知识库
 
-<table>
-<tr>
-<td width="52%">
-
 - 把 **PDF、Word、Excel、Markdown、约 90 种文本/代码格式、图片**索引进本地库 —— 单文件或整文件夹。图片会走 **OCR**,配合视觉模型还会**用文字描述画面内容**,让你能搜到图里画的是什么。
 - **混合检索**:bge-m3 向量 + BM25 关键词,RRF 融合、MMR 去重、邻接分块扩展。
 - **严格 grounding** —— 答案只来自你的文档,**按文件引用**并悬停预览出处段落;没覆盖到的内容 DARIA 会直说,而不是瞎猜。
 - **一键报告** —— 对整个知识库生成带引用的 NotebookLM 式综述,可导出 PDF / Markdown。
-
-</td>
-<td width="48%"><img src="docs/screenshots/shot-knowledge.jpg" alt="本地知识库:带逐文件开关的索引文档,以及一键报告 / 播客" /></td>
-</tr>
-</table>
 
 <br />
 
@@ -178,37 +150,19 @@ DARIA 最初基于 [Fangyuan Lin](https://github.com/Fangyuan025/Chaty) 的 [Cha
 
 ## 免手语音
 
-<table>
-<tr>
-<td width="48%"><img src="docs/screenshots/shot-live.jpg" alt="实时语音模式:一个动态光球,连续免手对话" /></td>
-<td width="52%">
-
 - **实时模式** —— 配一个动态光球的连续、免手语音对话。
 - 语音输入/输出,静音自动发送 + 朗读 —— **11 种嗓音** + 语速调节。
 - **深读播客** —— 把知识库变成 NotebookLM 风格的双主持人音频节目,支持 WAV 导出。
 - 所有语音都跑在 **CPU** 上,绝不与大模型抢显存。
 
-</td>
-</tr>
-</table>
-
 <br />
 
 ## 一切都留在你的机器上
-
-<table>
-<tr>
-<td width="52%">
 
 - 会话、模型、索引都在一个**本地数据文件夹**里 —— 拷走即备份,一键即清空。
 - **GPU 加速**:跨厂商 **Vulkan**(Windows)与 **Metal**(Apple Silicon,统一内存下全量卸载),按显存自动调优,带 OOM 回退与 CPU 兜底。
 - **任意 `.gguf` 或 MLX 文件夹** —— 分词器与对话模板都取自文件本身;一流支持 Llama 3、Gemma 3 / 4 与 Qwen 3 / 3.5 / 3.6。
 - **可调上下文**,自动把模型训练长度适配到你的内存,接近上限时总结较早的对话;**安全切换模型**,完整采样控制 + 可保存预设。
-
-</td>
-<td width="48%"><img src="docs/screenshots/shot-settings.jpg" alt="设置:展示会话、模型与知识库统计的本地数据面板" /></td>
-</tr>
-</table>
 
 > **离线优先。** 网络仅用于可选的联网搜索和一次性模型下载。
 

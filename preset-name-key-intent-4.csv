@@ -1,0 +1,5 @@
+﻿Preset name,Key intent,Temperature,Top P,Top K,Repeat Penalty,Num Predict,Mirostat
+"Thinking Mode (deep, careful)","High-quality, deliberative responses; reasoning, analysis, code review",0.4,0.95,80,1.2,"'-1",0
+"Non‑Thinking Mode (chat, creative)","Free, creative, playful output; brainstorming, fiction, casual chat",1.4,0.9,40,1.0,"'-1",0
+Default (balanced),Middle‑of‑the‑road general use for chat and writing,0.8,0.9,40,1.1,"'-1",0
+Fast Mode (quickest return),"Lowest latency, deterministic short replies; thinking off, fastest throughput",0.0,1.0,1,1.0,64,0

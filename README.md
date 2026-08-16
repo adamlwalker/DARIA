@@ -1,7 +1,5 @@
 <div align="center">
 
-**English** · [简体中文](README.zh-CN.md)
-
 <img src="logo.png" width="128" alt="D.A.R.I.A." />
 
 # D.A.R.I.A.
@@ -30,8 +28,6 @@ discrete as in local, contained, and not phoned home.
 DARIA is originally based on [Chaty](https://chaty.ca/) by [Fangyuan Lin](https://github.com/Fangyuan025/Chaty).
 
 <br />
-
-<img src="docs/screenshots/demo.gif" width="860" alt="DARIA's local coding agent reading an out-of-workspace file behind a one-click permission grant" />
 
 <sub>A local coding agent — searches GitHub, reads the source, edits your files, and runs the tests. **All on your machine.**</sub>
 
@@ -89,38 +85,21 @@ One local model for every row — **Qwen3.5-35B-A3B** (MoE, ~3 B active per toke
 | opencode 1.18 | 7/45 (16 %) |
 | bare bash agent — single-tool ablation | 6/45 (13 %) |
 
-Same model, same tasks, same grading, one machine — five agent designs. DARIA leads the field, including the model family's own first-party CLI ([qwen-code](https://github.com/QwenLM/qwen-code)) while using **half its context window**, and resolves **2.5×** the bare-bash ablation. That's the design thesis measured: with frontier models a thin scaffold is enough — on small local models, the intelligence has to live in the tools (repo-aware search, symbol reads, precise edits, recovery guards, post-edit diagnostics). Methodology, per-agent configs, and honest-comparison notes (subset, macOS harness — *not* comparable to leaderboard numbers): [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Same model, same tasks, same grading, one machine — five agent designs. DARIA leads the field, including the model family's own first-party CLI ([qwen-code](https://github.com/QwenLM/qwen-code)) while using **half its context window**, and resolves **2.5×** the bare-bash ablation. That's the design thesis measured: with frontier models a thin scaffold is enough — on small local models, the intelligence has to live in the tools (repo-aware search, symbol reads, precise edits, recovery guards, post-edit diagnostics). Numbers are a 45-task macOS subset and are *not* comparable to official leaderboard scores.
 
 <br />
 
 ## Design Canvas
 
-<picture>
-  <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/canvas-hero-light.jpg" />
-  <img src="docs/screenshots/canvas-hero-dark.jpg" width="860" alt="Design Canvas: live preview beside the actual source, element↔line inspect, console" />
-</picture>
-
 - **Preview | code, side by side** — every page opens as a split studio: live preview left, the **actual source** right, syntax-highlighted and palette-following. Three drag-resizable columns, fullscreen, page reload, and a **Console** tab for the page's logs and errors.
 - **Point at what you mean** — Inspect links the panes both ways: hover an element and the code jumps to its line; click a code line and the element flashes. **Click to select** (⌘/Ctrl multi-select) and your next instruction edits exactly those elements — or open the source yourself with the **Edit** button.
 - **Watch the edit happen** — iterations stream in Cursor-style: the code pane scans the document line by line and lands on a **Changes** diff (+N/−N, same language as Code mode).
-
-<picture>
-  <source media="(prefers-color-scheme: light)" srcset="docs/screenshots/canvas-scan-light.jpg" />
-  <img src="docs/screenshots/canvas-scan-dark.jpg" width="860" alt="Live line-by-line scan while the model edits the page" />
-</picture>
 
 - **Self-healing, persistent** — runtime errors offer a one-click **Fix** (always asks first); a compat layer keeps browser-clean pages clean here too (history API, cookies, clipboard); and each reply keeps its canvas session across close/reopen, with version history, a confirmed reset, and export to a standalone `.html`.
 
 <br />
 
 ## Chat that renders everything
-
-<table>
-<tr>
-<td width="50%"><img src="docs/screenshots/shot-chat.jpg" alt="Rich chat rendering — syntax-highlighted code, tables, and KaTeX math" /></td>
-<td width="50%"><img src="docs/screenshots/shot-chat-light.jpg" alt="The same conversation in DARIA's light theme" /></td>
-</tr>
-</table>
 
 - A streaming, foldable **`<think>`** panel that follows the model's reasoning as it generates.
 - **KaTeX** math, tables, **Mermaid** diagrams, per-block code copy, and in-app rendering of single-file HTML — including playable web games.
@@ -153,19 +132,10 @@ Text-only models keep the OCR path, so nothing regresses — and updating from a
 
 ## A private knowledge base
 
-<table>
-<tr>
-<td width="52%">
-
 - Index **PDF, Word, Excel, Markdown, ~90 text/code formats, and images** into an on-device store — one file or a whole folder. Images are read by **OCR *and*, with a vision model, described in words** so you can search what's *in* the picture.
 - **Hybrid retrieval**: bge-m3 vectors + BM25 keywords, fused with RRF, de-duplicated with MMR, expanded with neighbors.
 - **Strict grounding** — answers come only from your files, with **per-file citations** and hover-preview of the source passage. DARIA says when something isn't covered instead of guessing.
 - **One-click report** — a cited, NotebookLM-style overview of the whole base, exportable to PDF or Markdown.
-
-</td>
-<td width="48%"><img src="docs/screenshots/shot-knowledge.jpg" alt="Local knowledge base — indexed documents with per-file toggles and one-click report / podcast" /></td>
-</tr>
-</table>
 
 <br />
 
@@ -179,37 +149,19 @@ Text-only models keep the OCR path, so nothing regresses — and updating from a
 
 ## Hands-free voice
 
-<table>
-<tr>
-<td width="48%"><img src="docs/screenshots/shot-live.jpg" alt="Live voice mode — an animated orb for continuous, hands-free conversation" /></td>
-<td width="52%">
-
 - **Live mode** — continuous, hands-free conversation with an animated orb.
 - Voice in/out with silence auto-send and read-aloud — **11 voices** with speed control.
 - **Deep-dive podcast** — turn your knowledge base into a NotebookLM-style two-host audio show, with WAV export.
 - All voice runs on the **CPU**, so it never competes with the LLM for VRAM.
 
-</td>
-</tr>
-</table>
-
 <br />
 
 ## Everything stays on your machine
-
-<table>
-<tr>
-<td width="52%">
 
 - Conversations, models, and indexes live in one **local data folder** — copy it to back up, clear it in a click.
 - **GPU acceleration**: cross-vendor **Vulkan** (Windows) and **Metal** (Apple Silicon, offload-all on unified memory), VRAM-aware auto-tuning with OOM back-off and CPU fallback.
 - **Any `.gguf` — or MLX folder** — tokenizer and chat template come from the model itself; first-class handling for Llama 3, Gemma 3 / 4, and Qwen 3 / 3.5 / 3.6.
 - **Adjustable context** that auto-fits the model's trained length to your memory and summarizes older turns near the limit; **safe model switching** and full sampling controls with saveable presets.
-
-</td>
-<td width="48%"><img src="docs/screenshots/shot-settings.jpg" alt="Settings — a local data dashboard showing conversations, models, and knowledge-base stats" /></td>
-</tr>
-</table>
 
 > **Offline-first.** The network is used only for optional web search and one-time model downloads.
 
