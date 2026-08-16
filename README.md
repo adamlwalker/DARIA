@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="logo.png" width="128" alt="D.A.R.I.A." />
+<img src="logo.png" width="500" alt="D.A.R.I.A." />
 
 # D.A.R.I.A.
 
