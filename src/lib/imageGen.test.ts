@@ -3,9 +3,12 @@ import {
   clampImageGenQuant,
   clampImageGenSize,
   clampImageGenSteps,
+  formatImageSeedContent,
   imageGenDiskHintGb,
+  parseImageSeed,
   recommendedImageGenQuant,
 } from "./imageGen";
+import { matchingPersonality, PERSONALITY_PRESETS } from "./personalityPresets";
 import en from "../locales/en.json";
 import zh from "../locales/zh.json";
 
@@ -34,6 +37,40 @@ describe("image gen helpers", () => {
     expect(imageGenDiskHintGb(4)).toContain("7");
     expect(imageGenDiskHintGb(8)).toContain("12");
     expect(imageGenDiskHintGb(16)).toContain("21");
+  });
+
+  it("round-trips a seed in message content", () => {
+    expect(formatImageSeedContent(42)).toBe("seed:42");
+    expect(parseImageSeed("seed:42")).toBe(42);
+    expect(parseImageSeed("  seed:184928301  ")).toBe(184928301);
+    expect(parseImageSeed("")).toBeNull();
+    expect(parseImageSeed("nice picture")).toBeNull();
+  });
+});
+
+describe("personality presets", () => {
+  it("ships the seven built-in personalities", () => {
+    expect(PERSONALITY_PRESETS.map((p) => p.id)).toEqual([
+      "concise",
+      "formal",
+      "tutor",
+      "comprehensive",
+      "unhinged",
+      "storyteller",
+      "sexy",
+    ]);
+  });
+
+  it("keeps the storyteller brief as specified", () => {
+    const p = PERSONALITY_PRESETS.find((x) => x.id === "storyteller")!;
+    expect(p.prompt).toContain("master storyteller");
+    expect(p.prompt).toContain("Never stop telling the story");
+    expect(p.prompt.toLowerCase()).not.toContain("grok");
+  });
+
+  it("matches an applied prompt", () => {
+    expect(matchingPersonality(PERSONALITY_PRESETS[0].prompt)).toBe("concise");
+    expect(matchingPersonality("custom stuff")).toBeNull();
   });
 });
 

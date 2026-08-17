@@ -26,17 +26,50 @@ import os
 import sys
 import traceback
 
-# Force line-buffered stdout even when not a TTY (piped from Rust).
+# Libraries (huggingface_hub, tqdm, mlx) love stdout. Steal it before they
+# import so the Rust host only ever sees protocol lines.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("TQDM_DISABLE", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
 try:
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
 except Exception:
     pass
 
+_REAL_STDOUT = sys.stdout
+
+
+class _StderrOnly:
+    """Stand-in for sys.stdout: anything printed by deps goes to stderr."""
+
+    def write(self, s):
+        if s:
+            sys.stderr.write(s)
+        return len(s) if s else 0
+
+    def flush(self):
+        sys.stderr.flush()
+
+    def reconfigure(self, *args, **kwargs):
+        return None
+
+    def fileno(self):
+        return sys.stderr.fileno()
+
+    def isatty(self):
+        return False
+
+
+sys.stdout = _StderrOnly()
+
 
 def emit(obj: dict) -> None:
-    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    _REAL_STDOUT.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    _REAL_STDOUT.flush()
 
 
 def log(msg: str) -> None:
@@ -57,10 +90,24 @@ def parse_quant(raw) -> int | None:
     return None
 
 
+class _StepProgress:
+    """mflux InLoopCallback — one emit per denoising step, never a 0/N teaser."""
+
+    def __init__(self, state: dict) -> None:
+        self.state = state
+
+    def call_in_loop(self, t, seed, prompt, latents, config, time_steps) -> None:
+        n = int(self.state.get("step") or 0) + 1
+        total = int(self.state.get("total") or 9)
+        self.state["step"] = n
+        emit({"event": "progress", "step": min(n, total), "total": total})
+
+
 class Engine:
     def __init__(self) -> None:
         self.model = None
         self.quant: int | None = None
+        self._progress = {"step": 0, "total": 9}
 
     def load(self, quant_raw) -> None:
         q = parse_quant(quant_raw)
@@ -78,6 +125,8 @@ class Engine:
         try:
             self.model = ZImageTurbo(quantize=q)
             self.quant = q
+            if hasattr(self.model, "callbacks"):
+                self.model.callbacks.register(_StepProgress(self._progress))
         except Exception as e:
             log(traceback.format_exc())
             emit({"event": "error", "message": f"failed to load Z-Image-Turbo: {e}"})
@@ -117,7 +166,10 @@ class Engine:
             width = max(256, min(2048, int(cmd.get("width") or 1024)))
             height = max(256, min(2048, int(cmd.get("height") or 1024)))
             steps = max(1, min(50, int(cmd.get("steps") or 9)))
-            seed = int(cmd.get("seed") if cmd.get("seed") is not None else os.urandom(4).hex(), 16) & 0x7FFFFFFF
+            if cmd.get("seed") is not None:
+                seed = int(cmd.get("seed")) & 0x7FFFFFFF
+            else:
+                seed = int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
         except (TypeError, ValueError) as e:
             emit({"event": "error", "message": f"bad generate params: {e}"})
             return
@@ -126,7 +178,8 @@ class Engine:
         width = max(256, (width // 16) * 16)
         height = max(256, (height // 16) * 16)
 
-        emit({"event": "progress", "step": 0, "total": steps})
+        self._progress["step"] = 0
+        self._progress["total"] = steps
         try:
             image = self.model.generate_image(
                 prompt=prompt,

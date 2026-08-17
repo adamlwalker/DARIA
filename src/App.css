@@ -949,10 +949,13 @@ body.resizing-x {
   padding: 28px 0 12px;
   scroll-behavior: smooth;
 }
+.chat:has(.empty) {
+  padding-top: 4px;
+}
 
 .empty {
   max-width: 720px;
-  margin: 5vh auto 0;
+  margin: 0 auto;
   padding: 0 24px;
   text-align: center;
   position: relative;
@@ -969,7 +972,7 @@ body.resizing-x {
   width: 256px;
   max-width: min(256px, 72%);
   height: auto;
-  margin: 0 0 28px;
+  margin: 0;
   object-fit: contain;
   user-select: none;
   pointer-events: none;
@@ -1021,7 +1024,7 @@ body.resizing-x {
 }
 
 .empty-sub {
-  margin-top: 14px;
+  margin-top: 8px;
   font-size: 16px;
   color: var(--text-dim);
 }
@@ -1030,7 +1033,7 @@ body.resizing-x {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 12px;
-  margin-top: 40px;
+  margin-top: 22px;
   text-align: left;
   position: relative;
   z-index: 1;
@@ -2359,6 +2362,10 @@ body.resizing-x {
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   overflow: hidden;
+}
+.preset-chip.on {
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+  background: var(--accent-soft);
 }
 
 .preset-apply {
@@ -4857,6 +4864,13 @@ a:focus-visible,
   gap: 10px;
   margin: 4px 0 10px;
 }
+.gen-image-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  max-width: min(512px, 100%);
+}
 .gen-image {
   display: block;
   padding: 0;
@@ -4865,7 +4879,7 @@ a:focus-visible,
   overflow: hidden;
   background: var(--panel);
   cursor: zoom-in;
-  max-width: min(512px, 100%);
+  max-width: 100%;
 }
 .gen-image img {
   display: block;
@@ -4875,6 +4889,23 @@ a:focus-visible,
 }
 .gen-image:hover {
   border-color: var(--accent);
+}
+.gen-seed {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.gen-seed-val {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+.gen-seed-val:hover {
+  color: var(--accent);
 }
 
 /* ---------- Deep Research (docked into the chat area) ---------- */

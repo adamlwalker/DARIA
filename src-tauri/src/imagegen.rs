@@ -185,34 +185,74 @@ fn script_path(root: &Path) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn find_system_python() -> Option<(PathBuf, String)> {
-    const CANDIDATES: &[&str] = &[
+/// macOS GUI apps do not inherit the shell PATH, so Homebrew's 3.14 is
+/// invisible and `/usr/bin/python3` (Apple 3.9) would otherwise win.
+pub(crate) fn python_version_ok(ver: &str) -> bool {
+    let mut it = ver.split('.');
+    let maj = it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    let min = it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    maj > 3 || (maj == 3 && min >= 10)
+}
+
+fn probe_python(bin: &Path) -> Option<String> {
+    if !bin.is_file() {
+        // Bare names like `python3.14` are allowed — Command looks them up.
+        if bin.components().count() != 1 {
+            return None;
+        }
+    }
+    let out = Command::new(bin)
+        .args(["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    python_version_ok(&ver).then_some(ver)
+}
+
+fn python_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    const DIRS: &[&str] = &[
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/opt/local/bin",
+    ];
+    const NAMES: &[&str] = &[
+        "python3.14",
         "python3.13",
         "python3.12",
         "python3.11",
         "python3.10",
         "python3",
     ];
-    for name in CANDIDATES {
-        let Ok(out) = Command::new(name)
-            .args(["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"])
-            .output()
-        else {
-            continue;
-        };
-        if !out.status.success() {
-            continue;
+    for dir in DIRS {
+        for name in NAMES {
+            out.push(PathBuf::from(dir).join(name));
         }
-        let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let (maj, min) = {
-            let mut it = ver.split('.');
-            (
-                it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0),
-                it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0),
-            )
-        };
-        if maj > 3 || (maj == 3 && min >= 10) {
-            return Some((PathBuf::from(name), ver));
+    }
+    if let Some(home) = &home {
+        for name in NAMES {
+            out.push(home.join(".local/bin").join(name));
+        }
+        out.push(
+            home.join("Library/Frameworks/Python.framework/Versions/Current/bin/python3"),
+        );
+    }
+    for name in NAMES {
+        out.push(PathBuf::from("/Library/Frameworks/Python.framework/Versions/Current/bin").join(name));
+        out.push(PathBuf::from(name));
+    }
+    out.push(PathBuf::from("/usr/bin/python3"));
+    out
+}
+
+fn find_system_python() -> Option<(PathBuf, String)> {
+    for bin in python_candidates() {
+        if let Some(ver) = probe_python(&bin) {
+            return Some((bin, ver));
         }
     }
     None
@@ -268,6 +308,17 @@ fn unload_locked(rt: &mut Runtime) {
     }
 }
 
+/// Protocol lines are a single JSON object. Hugging Face / tqdm / MLX often
+/// leak banners or progress bars onto stdout — skip those instead of failing
+/// the generate (that was the first-run "bad sidecar json" error).
+pub(crate) fn parse_sidecar_line(line: &str) -> Option<serde_json::Value> {
+    let t = line.trim();
+    if t.is_empty() || !t.starts_with('{') {
+        return None;
+    }
+    serde_json::from_str(t).ok()
+}
+
 fn read_event(reader: &mut BufReader<std::process::ChildStdout>, timeout: Duration) -> Result<serde_json::Value, String> {
     let start = Instant::now();
     let mut line = String::new();
@@ -282,11 +333,13 @@ fn read_event(reader: &mut BufReader<std::process::ChildStdout>, timeout: Durati
         match reader.read_line(&mut line) {
             Ok(0) => return Err(crate::agent::tr("图像引擎已退出", "image engine exited")),
             Ok(_) => {
-                let t = line.trim();
-                if t.is_empty() {
-                    continue;
+                if let Some(v) = parse_sidecar_line(&line) {
+                    return Ok(v);
                 }
-                return serde_json::from_str(t).map_err(|e| format!("bad sidecar json: {e}"));
+                let t = line.trim();
+                if !t.is_empty() {
+                    eprintln!("[imagegen] skipped non-protocol stdout: {t}");
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.to_string()),
@@ -316,6 +369,10 @@ fn spawn_sidecar(root: &Path) -> Result<Sidecar, String> {
         .env("HUGGINGFACE_HUB_CACHE", hf.join("hub"))
         .env("TRANSFORMERS_CACHE", hf.join("transformers"))
         .env("HF_HUB_DISABLE_TELEMETRY", "1")
+        .env("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+        .env("TQDM_DISABLE", "1")
+        .env("TOKENIZERS_PARALLELISM", "false")
+        .env("TRANSFORMERS_VERBOSITY", "error")
         .env("PYTHONUNBUFFERED", "1");
     let mut child = cmd.spawn().map_err(|e| {
         crate::agent::tr(
@@ -551,6 +608,13 @@ pub fn imagegen_cancel() -> Result<(), String> {
     imagegen_unload()
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageGenResult {
+    pub path: String,
+    pub seed: u64,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerateArgs {
@@ -568,7 +632,7 @@ pub async fn imagegen_generate(
     app: AppHandle,
     args: GenerateArgs,
     on_progress: Channel<ImageGenProgress>,
-) -> Result<String, String> {
+) -> Result<ImageGenResult, String> {
     if !is_apple_silicon() {
         return Err(crate::agent::tr(
             "图像生成仅支持 Apple Silicon Mac",
@@ -624,11 +688,13 @@ pub async fn imagegen_generate(
                     Some("progress") => {
                         let step = ev.get("step").and_then(|v| v.as_u64()).unwrap_or(0);
                         let total = ev.get("total").and_then(|v| v.as_u64()).unwrap_or(9).max(1);
-                        let frac = step as f32 / total as f32;
-                        let _ = progress.send(ImageGenProgress::Progress {
-                            frac,
-                            message: format!("{step}/{total}"),
-                        });
+                        if step > 0 {
+                            let frac = step as f32 / total as f32;
+                            let _ = progress.send(ImageGenProgress::Progress {
+                                frac,
+                                message: format!("{step}/{total}"),
+                            });
+                        }
                     }
                     Some("done") => {
                         let path = ev
@@ -636,7 +702,12 @@ pub async fn imagegen_generate(
                             .and_then(|v| v.as_str())
                             .unwrap_or(dest_s.as_str())
                             .to_string();
-                        return Ok(path);
+                        let used = ev
+                            .get("seed")
+                            .and_then(|v| v.as_u64())
+                            .or(seed)
+                            .unwrap_or(0);
+                        return Ok(ImageGenResult { path, seed: used });
                     }
                     Some("error") => {
                         let msg = ev
@@ -651,9 +722,9 @@ pub async fn imagegen_generate(
             }
         })();
         match &result {
-            Ok(path) => {
+            Ok(out) => {
                 let _ = progress.send(ImageGenProgress::Done {
-                    path: Some(path.clone()),
+                    path: Some(out.path.clone()),
                 });
             }
             Err(e) => {
@@ -732,5 +803,40 @@ mod tests {
         assert!(SCRIPT.contains("daria-image-mlx"));
         assert!(SCRIPT.contains("ZImageTurbo"));
         assert!(SCRIPT.contains("\"cmd\""));
+        assert!(SCRIPT.contains("_StderrOnly"));
+    }
+
+    #[test]
+    fn python_314_is_accepted_apple_39_is_not() {
+        assert!(python_version_ok("3.14"));
+        assert!(python_version_ok("3.14.7"));
+        assert!(python_version_ok("3.10"));
+        assert!(python_version_ok("4.0"));
+        assert!(!python_version_ok("3.9"));
+        assert!(!python_version_ok("3.9.6"));
+        assert!(!python_version_ok("2.7"));
+        assert!(!python_version_ok(""));
+    }
+
+    #[test]
+    fn python_candidates_include_homebrew() {
+        let s: Vec<String> = python_candidates()
+            .into_iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(s.iter().any(|p| p.contains("/opt/homebrew/bin/python3.14")));
+        assert!(s.iter().any(|p| p.contains("/opt/homebrew/bin/python3")));
+    }
+
+    #[test]
+    fn sidecar_skips_banners_and_progress_bars() {
+        assert!(parse_sidecar_line("").is_none());
+        assert!(parse_sidecar_line("Fetching 12 files:  45%|████").is_none());
+        assert!(parse_sidecar_line("warning: mlx compiled with...").is_none());
+        assert!(parse_sidecar_line("{not json").is_none());
+        let v = parse_sidecar_line(r#"{"event":"ready"}"#).expect("protocol");
+        assert_eq!(v["event"], "ready");
+        let v = parse_sidecar_line("  {\"event\":\"done\",\"path\":\"/tmp/a.png\"} \n").expect("padded");
+        assert_eq!(v["path"], "/tmp/a.png");
     }
 }

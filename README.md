@@ -88,6 +88,7 @@ itself — every step shown live, every change behind an approval + diff.
 - A streaming, foldable **`<think>`** panel that follows the model's reasoning as it generates.
 - **KaTeX** math, tables, **Mermaid** diagrams, per-block code copy, and in-app rendering of single-file HTML — including playable web games.
 - A **⌘K command palette**, pinnable / renameable conversations, drag-and-drop attachments, export (Markdown / JSON), and full-text search.
+- **Personalities** under Settings → Chat: Concise, Formal, Tutor, Comprehensive, Unhinged, Storyteller, and Sexy. One click fills the system prompt; click again to clear. Your own named presets still save underneath.
 - Four palettes (two dark, two light) with system-theme following, native UI zoom, reduced-motion support, and an **English / 简体中文** UI. Interface strings live in `src/locales/en.json` and `src/locales/zh.json` — the app stays English unless Chinese is selected.
 
 <br />
@@ -133,12 +134,13 @@ Text-only models keep the OCR path, so nothing regresses — and updating from a
 
 ## On-device image generation (Apple Silicon)
 
-Turn on **Image gen** in the chat tools menu (or `/imagegen`) and the next prompt returns a PNG — not a chat reply. Click the image to open it full-size in Preview.
+Turn on **Image gen** in the chat tools menu (or `/imagegen`) and the next prompt returns a PNG — not a chat reply. Click the image to open it full-size in Preview. The **seed** is shown under the picture; click it to copy and reuse it for the next generate.
 
 - **Z-Image-Turbo** via a local **MLX** sidecar ([mflux](https://pypi.org/project/mflux/)). Generation stays on the Mac.
 - **Lazy load** — the sidecar never starts with the app. Weights load on the first generate, and turning Image gen off kills the process so the memory comes back.
 - **Memory profiles** in Settings → Image gen: **4-bit** (~7 GB, 16–18 GB Macs), **8-bit** (~12 GB, the default), **full quality** (~21 GB, 40 GB+). Size, steps, and seed live there too.
 - First use installs a private Python env and downloads the weights from Hugging Face. After that, generation is offline. Saved files live in the app-data **images** folder (Settings has an **Open images folder** button).
+- The engine finds Homebrew / Framework Python even when the `.app` has no shell PATH (so Apple's `/usr/bin/python3` 3.9 is not mistaken for “no Python”). 3.10 through 3.14 are fine.
 
 Apple Silicon only. Needs Python 3.10+ on the Mac for the one-time engine install.
 

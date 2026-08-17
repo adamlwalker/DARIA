@@ -36,6 +36,7 @@ import {
   type ImageGenQuant,
   type ImageGenSize,
 } from "../lib/imageGen";
+import { matchingPersonality, PERSONALITY_PRESETS } from "../lib/personalityPresets";
 import logoUrl from "../assets/logo.png";
 
 export interface PromptPreset {
@@ -629,6 +630,24 @@ export function SettingsPanel({
               </label>
               <div className="field">
                 <span>{t("presets")}</span>
+                <div className="settings-hint">{t("personalityHint")}</div>
+                <div className="preset-chips">
+                  {PERSONALITY_PRESETS.map((p) => {
+                    const on = matchingPersonality(value.systemPrompt) === p.id;
+                    return (
+                      <span key={p.id} className={`preset-chip ${on ? "on" : ""}`}>
+                        <button
+                          type="button"
+                          className="preset-apply"
+                          title={p.prompt}
+                          onClick={() => set("systemPrompt", on ? "" : p.prompt)}
+                        >
+                          {t(p.labelKey)}
+                        </button>
+                      </span>
+                    );
+                  })}
+                </div>
                 {value.presets.length > 0 && (
                   <div className="preset-chips">
                     {value.presets.map((p) => (

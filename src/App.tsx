@@ -98,7 +98,7 @@ import {
 } from "./lib/ipc";
 import "./App.css";
 import { fmtGbFromMb } from "./lib/fmt";
-import { clampImageGenQuant, clampImageGenSize, clampImageGenSteps, imageGenDiskHintGb } from "./lib/imageGen";
+import { clampImageGenQuant, clampImageGenSize, clampImageGenSteps, formatImageSeedContent, imageGenDiskHintGb, parseImageSeed } from "./lib/imageGen";
 
 interface UiMessage extends ChatMessage {
   id: string;
@@ -167,7 +167,21 @@ function UserCopy({ content, title }: { content: string; title: string }) {
   );
 }
 
-function GeneratedImage({ path, openLabel }: { path: string; openLabel: string }) {
+function GeneratedImage({
+  path,
+  seed,
+  openLabel,
+  seedLabel,
+  useSeedLabel,
+  onUseSeed,
+}: {
+  path: string;
+  seed: number | null;
+  openLabel: string;
+  seedLabel: string;
+  useSeedLabel: string;
+  onUseSeed?: (seed: number) => void;
+}) {
   const [src, setSrc] = useState<string | null>(thumbCache.get(path) ?? null);
   useEffect(() => {
     let live = true;
@@ -187,14 +201,31 @@ function GeneratedImage({ path, openLabel }: { path: string; openLabel: string }
   }, [path]);
   if (src === "") return null;
   return (
-    <button
-      type="button"
-      className="gen-image"
-      title={openLabel}
-      onClick={() => void openExternal(path).catch(() => {})}
-    >
-      {src ? <img src={src} alt="" /> : <span className="img-thumb-ph" />}
-    </button>
+    <div className="gen-image-wrap">
+      <button
+        type="button"
+        className="gen-image"
+        title={openLabel}
+        onClick={() => void openExternal(path).catch(() => {})}
+      >
+        {src ? <img src={src} alt="" /> : <span className="img-thumb-ph" />}
+      </button>
+      {seed != null && (
+        <div className="gen-seed">
+          <button
+            type="button"
+            className="gen-seed-val"
+            title={useSeedLabel}
+            onClick={() => {
+              void copyToClipboard(String(seed));
+              onUseSeed?.(seed);
+            }}
+          >
+            {seedLabel}
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -2033,7 +2064,7 @@ export default function App() {
       cur.map((m) => (m.id === asstId ? { ...m, content: t("imageGenLoading") } : m)),
     );
     try {
-      const path = await imagegenGenerate(
+      const result = await imagegenGenerate(
         {
           prompt: text,
           quant: clampImageGenQuant(settings.imageGenQuant),
@@ -2048,17 +2079,19 @@ export default function App() {
             setImageGenBusy(label);
             setMessages((cur) => cur.map((m) => (m.id === asstId ? { ...m, content: label } : m)));
           } else if (p.type === "progress") {
-            const label = `${t("imageGenGenerating")} ${p.message}`;
+            const stepped = p.message && !p.message.startsWith("0/");
+            const label = stepped ? `${t("imageGenGenerating")} ${p.message}` : t("imageGenGenerating");
             setImageGenBusy(label);
             setMessages((cur) => cur.map((m) => (m.id === asstId ? { ...m, content: label } : m)));
           }
         },
       );
+      const seedContent = formatImageSeedContent(result.seed);
       setMessages((cur) =>
-        cur.map((m) => (m.id === asstId ? { ...m, content: "", images: [path] } : m)),
+        cur.map((m) => (m.id === asstId ? { ...m, content: seedContent, images: [result.path] } : m)),
       );
       try {
-        await saveMessage(asstId, convId, "assistant", "", [path]);
+        await saveMessage(asstId, convId, "assistant", seedContent, [result.path]);
         await refreshConversations();
       } catch (e) {
         reportChatSaveFailure(convId, e);
@@ -2909,11 +2942,22 @@ export default function App() {
                     {m.images && m.images.length > 0 && (
                       <div className="gen-images">
                         {m.images.map((p) => (
-                          <GeneratedImage key={p} path={p} openLabel={t("imageGenOpen")} />
+                          <GeneratedImage
+                            key={p}
+                            path={p}
+                            seed={parseImageSeed(m.content)}
+                            openLabel={t("imageGenOpen")}
+                            seedLabel={t("imageGenSeedLabel", { seed: parseImageSeed(m.content) ?? "" })}
+                            useSeedLabel={t("imageGenUseSeed")}
+                            onUseSeed={(seed) => {
+                              setSettings((s) => ({ ...s, imageGenSeed: String(seed) }));
+                              showNotice("warn", t("imageGenSeedApplied", { seed }));
+                            }}
+                          />
                         ))}
                       </div>
                     )}
-                    {(m.content.trim() || streamingId === m.id) && (
+                    {((m.content.trim() && parseImageSeed(m.content) == null) || streamingId === m.id) && (
                     <AssistantMessage
                       content={m.content}
                       streaming={streamingId === m.id}

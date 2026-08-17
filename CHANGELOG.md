@@ -5,6 +5,9 @@
 - **Image gen** chat mode (tools menu or `/imagegen`) returns a PNG from **Z-Image-Turbo** on Apple Silicon via a lazy MLX sidecar. Turning the mode off unloads the weights.
 - Settings → Image gen: 4-bit / 8-bit / full-quality memory profiles, size, steps, seed, and an **Open images folder** button.
 - First use installs a private Python env and downloads the weights from Hugging Face; generation itself stays on the Mac.
+- The seed is shown under each image and can be reused; sidecar stdout noise no longer aborts a generate.
+- Homebrew / Framework Python 3.10–3.14 is found even when the `.app` has no shell PATH.
+- Settings → Chat personalities: Concise, Formal, Tutor, Comprehensive, Unhinged, Storyteller, Sexy.
 
 ## v2.0.2 — Spin control (2026-07-29)
 

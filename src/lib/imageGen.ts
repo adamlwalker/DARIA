@@ -40,3 +40,17 @@ export function imageGenDiskHintGb(quant: ImageGenQuant): string {
   if (quant === 8) return "~12";
   return "~21";
 }
+
+/** Persist the seed in message content so it survives reload without a schema change. */
+export const IMAGE_SEED_PREFIX = "seed:";
+
+export function formatImageSeedContent(seed: number): string {
+  return `${IMAGE_SEED_PREFIX}${Math.trunc(seed)}`;
+}
+
+export function parseImageSeed(content: string | undefined | null): number | null {
+  const m = (content ?? "").trim().match(/^seed:(\d+)$/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
+}

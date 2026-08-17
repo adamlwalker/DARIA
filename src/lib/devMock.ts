@@ -431,7 +431,7 @@ function handle(cmd: string, args: Record<string, unknown> | undefined): unknown
       onProgress?.onmessage?.({ type: "phase", phase: "generate", message: "Generating image…" });
       onProgress?.onmessage?.({ type: "progress", frac: 1, message: "9/9" });
       onProgress?.onmessage?.({ type: "done", path: "/tmp/daria-images/demo.png" });
-      return "/tmp/daria-images/demo.png";
+      return { path: "/tmp/daria-images/demo.png", seed: 42 };
     }
     case "set_tray_language":
     case "open_data_dir":

@@ -480,6 +480,11 @@ export async function imagegenSetup(
   await invoke("imagegen_setup", { onProgress: channel });
 }
 
+export interface ImageGenResult {
+  path: string;
+  seed: number;
+}
+
 export async function imagegenGenerate(
   args: {
     prompt: string;
@@ -490,10 +495,10 @@ export async function imagegenGenerate(
     seed?: number | null;
   },
   onProgress: (p: ImageGenProgress) => void,
-): Promise<string> {
+): Promise<ImageGenResult> {
   const channel = new Channel<ImageGenProgress>();
   channel.onmessage = onProgress;
-  return invoke<string>("imagegen_generate", { args, onProgress: channel });
+  return invoke<ImageGenResult>("imagegen_generate", { args, onProgress: channel });
 }
 
 export async function imagegenUnload(): Promise<void> {
