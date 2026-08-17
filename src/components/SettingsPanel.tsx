@@ -5,6 +5,9 @@ import { useExitTransition } from "../lib/useExit";
 import { Icon } from "./Icon";
 import {
   openDataDir,
+  openCanvasDir,
+  openImagesDir,
+  imagegenStatus,
   clearAllConversations,
   dataStats,
   listModels,
@@ -27,6 +30,12 @@ import { loadMcpServers, saveMcpServers, syncMcpServers, type McpServerCfg } fro
 import catalog from "../lib/mcpStore.catalog.json";
 import { disabledSkills, officialSkills, setDisabledSkills } from "../lib/skillFiles";
 import { fmtBytes } from "../lib/fmt";
+import {
+  IMAGE_GEN_QUANTS,
+  IMAGE_GEN_SIZES,
+  type ImageGenQuant,
+  type ImageGenSize,
+} from "../lib/imageGen";
 import logoUrl from "../assets/logo.png";
 
 export interface PromptPreset {
@@ -121,6 +130,14 @@ export interface GenSettings {
   /** HuggingFace endpoint for search/downloads — the official host or a
    *  path-compatible mirror (e.g. https://hf-mirror.com for mainland China). */
   hfEndpoint: string;
+  /** Z-Image-Turbo MLX quant: 4 / 8 / 16 (full). */
+  imageGenQuant: ImageGenQuant;
+  /** Square output size in pixels. */
+  imageGenSize: ImageGenSize;
+  /** Turbo denoising steps (8–9 is the distilled sweet spot). */
+  imageGenSteps: number;
+  /** Fixed seed, or empty for random. */
+  imageGenSeed: string;
 }
 
 export const defaultSettings: GenSettings = {
@@ -167,6 +184,10 @@ export const defaultSettings: GenSettings = {
   autoTitle: true,
   autoLoadLast: true,
   hfEndpoint: "https://huggingface.co",
+  imageGenQuant: 8,
+  imageGenSize: 1024,
+  imageGenSteps: 9,
+  imageGenSeed: "",
 };
 
 /** The well-known HF endpoints offered as one-click choices. */
@@ -200,11 +221,12 @@ export function parseStops(raw: string): string[] {
     .filter(Boolean);
 }
 
-type CatId = "general" | "chat" | "sampling" | "model" | "code" | "voice" | "data" | "about";
+type CatId = "general" | "chat" | "image" | "sampling" | "model" | "code" | "voice" | "data" | "about";
 
 const CAT_ICONS: Record<CatId, string> = {
   general: "M12 3a9 9 0 100 18 9 9 0 000-18zM3 12h18",
   chat: "M21 12a8 8 0 01-8 8H5l-2 2V12a8 8 0 018-8h2a8 8 0 018 8z",
+  image: "M4 6.5A2.5 2.5 0 016.5 4h11A2.5 2.5 0 0120 6.5v11a2.5 2.5 0 01-2.5 2.5h-11A2.5 2.5 0 014 17.5v-11zM8 14l2.2-2.8 2.3 2.8L16 10l4 6H4l4-2z",
   sampling: "M4 20V10M10 20V4M16 20v-8M22 20H2",
   model: "M4 7l8-4 8 4v10l-8 4-8-4zM4 7l8 4m0 0l8-4m-8 4v10",
   code: "M8 6l-6 6 6 6M16 6l6 6-6 6",
@@ -320,6 +342,14 @@ export function SettingsPanel({
   useEffect(() => {
     if (open && cat === "data") refreshStats();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, cat]);
+
+  const [imageRamHint, setImageRamHint] = useState<number>(8);
+  useEffect(() => {
+    if (!open || cat !== "image") return;
+    void imagegenStatus()
+      .then((s) => setImageRamHint(s.recommendedQuant || 8))
+      .catch(() => {});
   }, [open, cat]);
 
   // ---- Voice preview ----
@@ -478,6 +508,7 @@ export function SettingsPanel({
   const cats: { id: CatId; label: string }[] = [
     { id: "general", label: t("setCatGeneral") },
     { id: "chat", label: t("setCatChat") },
+    { id: "image", label: t("setCatImage") },
     { id: "sampling", label: t("setCatSampling") },
     { id: "model", label: t("setCatModel") },
     { id: "code", label: t("setCatCode") },
@@ -658,6 +689,70 @@ export function SettingsPanel({
               </SetRow>
               <SetRow label={t("setAutoTitle")} hint={t("setAutoTitleHint")}>
                 <Switch on={value.autoTitle} onToggle={() => set("autoTitle", !value.autoTitle)} />
+              </SetRow>
+            </>
+          )}
+
+          {cat === "image" && (
+            <>
+              <div className="settings-hint">{t("imageGenHint")}</div>
+              <div className="settings-hint">{t("imageGenPrivacy")}</div>
+              <SetRow label={t("imageGenQuant")} hint={t("imageGenQuantHint", { n: imageRamHint })}>
+                <div className="lang-switch">
+                  {IMAGE_GEN_QUANTS.map((q) => (
+                    <button
+                      key={q}
+                      type="button"
+                      className={value.imageGenQuant === q ? "active" : ""}
+                      onClick={() => set("imageGenQuant", q)}
+                    >
+                      {t(q === 4 ? "imageGenQuant4" : q === 8 ? "imageGenQuant8" : "imageGenQuant16")}
+                    </button>
+                  ))}
+                </div>
+              </SetRow>
+              <SetRow label={t("imageGenSize")} hint={t("imageGenSizeHint")}>
+                <div className="lang-switch">
+                  {IMAGE_GEN_SIZES.map((s) => (
+                    <button
+                      key={s}
+                      type="button"
+                      className={value.imageGenSize === s ? "active" : ""}
+                      onClick={() => set("imageGenSize", s)}
+                    >
+                      {s}px
+                    </button>
+                  ))}
+                </div>
+              </SetRow>
+              <label className="field">
+                <span>
+                  {t("imageGenSteps")} <b>{value.imageGenSteps}</b>
+                </span>
+                <input
+                  type="range"
+                  min={4}
+                  max={12}
+                  step={1}
+                  value={value.imageGenSteps}
+                  onChange={(e) => set("imageGenSteps", Number(e.target.value))}
+                />
+              </label>
+              <div className="settings-hint">{t("imageGenStepsHint")}</div>
+              <SetRow label={t("imageGenSeed")} hint={t("imageGenSeedHint")}>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  placeholder={t("imageGenSeedRandom")}
+                  value={value.imageGenSeed}
+                  onChange={(e) => set("imageGenSeed", e.target.value.replace(/[^\d]/g, "").slice(0, 12))}
+                  style={{ width: 120, textAlign: "right" }}
+                />
+              </SetRow>
+              <SetRow label={t("imageGenFolder")} hint={t("imageGenFolderHint")}>
+                <button type="button" className="data-btn" onClick={() => void openImagesDir().catch(console.error)}>
+                  {t("openImagesDir")}
+                </button>
               </SetRow>
             </>
           )}
@@ -1238,6 +1333,12 @@ export function SettingsPanel({
                 </div>
               </div>
               <div className="settings-hint">{t("cmSkillFilesHint")}</div>
+
+              <SetRow label={t("canvasFolder")} hint={t("canvasFolderHint")}>
+                <button type="button" className="data-btn" onClick={() => void openCanvasDir().catch(console.error)}>
+                  {t("openCanvasDir")}
+                </button>
+              </SetRow>
             </>
           )}
 

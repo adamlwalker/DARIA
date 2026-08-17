@@ -39,7 +39,7 @@ DARIA is originally based on [Chaty](https://chaty.ca/) by [Fangyuan Lin](https:
 
 - 🔒 **Truly private** — every model, document, and conversation stays on your device. No sign-up, no server, nothing phoned home.
 - ⚡ **Native and fast** — a Rust + llama.cpp core with **Vulkan / Metal** GPU offload that auto-tunes to your hardware and falls back gracefully to CPU.
-- 🧰 **More than a chat box** — a coding agent, a knowledge base (RAG), Deep Research, hands-free voice, and a self-healing Design Canvas — all offline.
+- 🧰 **More than a chat box** — a coding agent, a knowledge base (RAG), Deep Research, on-device image generation, hands-free voice, and a self-healing Design Canvas — all offline.
 - 🧠 **Runs almost anything** — Llama 3, Gemma 3 / 4, Qwen 3 / 3.5 / 3.6, *any* GGUF from Hugging Face — and **MLX models natively on Apple Silicon** — plus **DARIA's own fine-tuned model**.
 - 💻 **Friendly to modest hardware** — a first-launch *“Set up for me”* picks a model sized to your RAM and downloads it in one click.
 
@@ -70,22 +70,6 @@ itself — every step shown live, every change behind an approval + diff.
 - File access never leaves the folder you pick; out-of-workspace access asks per folder; a `sudo` command asks first with a secure password prompt; downloads land in the workspace and are covered by checkpoints too.
 
 </details>
-
-<br />
-
-## Benchmarks
-
-One local model for every row — **Qwen3.5-35B-A3B** (MoE, ~3 B active per token), mxfp8 on MLX, reasoning off, entirely on one machine:
-
-| SWE-bench Verified — 45-task macOS-validated subset | Resolved |
-| --- | --- |
-| **DARIA agent (v1.9)** — the full tool loop, 16K context | **15/45 (33 %)** |
-| qwen-code 0.20 — the model family's own CLI (needs 32K) | 12/45 (27 %) |
-| pi 0.81 — minimal 4-tool agent CLI | 10/45 (22 %) |
-| opencode 1.18 | 7/45 (16 %) |
-| bare bash agent — single-tool ablation | 6/45 (13 %) |
-
-Same model, same tasks, same grading, one machine — five agent designs. DARIA leads the field, including the model family's own first-party CLI ([qwen-code](https://github.com/QwenLM/qwen-code)) while using **half its context window**, and resolves **2.5×** the bare-bash ablation. That's the design thesis measured: with frontier models a thin scaffold is enough — on small local models, the intelligence has to live in the tools (repo-aware search, symbol reads, precise edits, recovery guards, post-edit diagnostics). Numbers are a 45-task macOS subset and are *not* comparable to official leaderboard scores.
 
 <br />
 
@@ -147,6 +131,19 @@ Text-only models keep the OCR path, so nothing regresses — and updating from a
 
 <br />
 
+## On-device image generation (Apple Silicon)
+
+Turn on **Image gen** in the chat tools menu (or `/imagegen`) and the next prompt returns a PNG — not a chat reply. Click the image to open it full-size in Preview.
+
+- **Z-Image-Turbo** via a local **MLX** sidecar ([mflux](https://pypi.org/project/mflux/)). Generation stays on the Mac.
+- **Lazy load** — the sidecar never starts with the app. Weights load on the first generate, and turning Image gen off kills the process so the memory comes back.
+- **Memory profiles** in Settings → Image gen: **4-bit** (~7 GB, 16–18 GB Macs), **8-bit** (~12 GB, the default), **full quality** (~21 GB, 40 GB+). Size, steps, and seed live there too.
+- First use installs a private Python env and downloads the weights from Hugging Face. After that, generation is offline. Saved files live in the app-data **images** folder (Settings has an **Open images folder** button).
+
+Apple Silicon only. Needs Python 3.10+ on the Mac for the one-time engine install.
+
+<br />
+
 ## Hands-free voice
 
 - **Live mode** — continuous, hands-free conversation with an animated orb. Live chat always uses **Kokoro** on-device.
@@ -164,7 +161,7 @@ Text-only models keep the OCR path, so nothing regresses — and updating from a
 - **Adjustable context** that auto-fits the model's trained length to your memory and summarizes older turns near the limit; **safe model switching**.
 - **Sampling presets** under Settings — intent starters (Thinking, Chat, Default, Fast Mode) plus family recipes for Gemma, Qwen3, and LLaMA 3. Picking one fills temperature, top-p, top-k, and repeat penalty; the sliders stay editable. Length is left alone unless you pick Fast Mode (64 tokens). Reload the model so the next reply uses the new values.
 
-> **Offline-first.** The network is used only for optional web search, one-time model downloads, and **Edge TTS** if you choose it for read-aloud.
+> **Offline-first.** The network is used only for optional web search, one-time model / image-engine downloads, and **Edge TTS** if you choose it for read-aloud.
 
 <br />
 

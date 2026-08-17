@@ -36,6 +36,7 @@ import { DeepResearchPanel } from "./components/DeepResearchPanel";
 import { CodeMode } from "./components/CodeMode";
 import { answerOnly, cleanTitle, cutSentences, forSpeech, stripThink } from "./lib/voiceText";
 import { copyToClipboard } from "./lib/clipboard";
+import logoUrl from "../logo.png";
 import {
   agentSetLang,
   logAppError,
@@ -58,6 +59,11 @@ import {
   openModelsDir,
   setHfEndpoint,
   openDataDir,
+  imagegenStatus,
+  imagegenSetup,
+  imagegenGenerate,
+  imagegenUnload,
+  imagegenCancel,
   ragSearch,
   ragStatus,
   pickAttachmentFile,
@@ -92,6 +98,7 @@ import {
 } from "./lib/ipc";
 import "./App.css";
 import { fmtGbFromMb } from "./lib/fmt";
+import { clampImageGenQuant, clampImageGenSize, clampImageGenSteps, imageGenDiskHintGb } from "./lib/imageGen";
 
 interface UiMessage extends ChatMessage {
   id: string;
@@ -156,6 +163,37 @@ function UserCopy({ content, title }: { content: string; title: string }) {
           <path d="M5 15V5a2 2 0 0 1 2-2h8" strokeLinecap="round" />
         </svg>
       )}
+    </button>
+  );
+}
+
+function GeneratedImage({ path, openLabel }: { path: string; openLabel: string }) {
+  const [src, setSrc] = useState<string | null>(thumbCache.get(path) ?? null);
+  useEffect(() => {
+    let live = true;
+    if (!thumbCache.has(path)) {
+      imageThumb(path, 1024)
+        .then((d) => {
+          thumbCache.set(path, d);
+          if (live) setSrc(d);
+        })
+        .catch(() => {
+          if (live) setSrc("");
+        });
+    }
+    return () => {
+      live = false;
+    };
+  }, [path]);
+  if (src === "") return null;
+  return (
+    <button
+      type="button"
+      className="gen-image"
+      title={openLabel}
+      onClick={() => void openExternal(path).catch(() => {})}
+    >
+      {src ? <img src={src} alt="" /> : <span className="img-thumb-ph" />}
     </button>
   );
 }
@@ -424,6 +462,14 @@ export default function App() {
       return false;
     }
   });
+  const [imageGen, setImageGen] = useState(() => {
+    try {
+      return localStorage.getItem("chaty.imagegen") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const [imageGenBusy, setImageGenBusy] = useState("");
   const [searching, setSearching] = useState<"" | "web" | "kb" | "mix">("");
   const [composing, setComposing] = useState(false);
   const [attachment, setAttachment] = useState<Attachment | null>(null);
@@ -830,6 +876,20 @@ export default function App() {
       /* ignore */
     }
   }, [webDesign]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("chaty.imagegen", imageGen ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  }, [imageGen]);
+
+  // Never keep the sidecar alive after the user turns the mode off.
+  useEffect(() => {
+    if (imageGen) return;
+    void imagegenUnload().catch(() => {});
+  }, [imageGen]);
 
   // Native file drag-and-drop onto the window → load as an attachment. Tauri
   // intercepts OS file drops and emits these events (HTML5 DnD is disabled).
@@ -1913,6 +1973,113 @@ export default function App() {
     }
   }
 
+  async function toggleImageGen() {
+    if (imageGen) {
+      setImageGen(false);
+      return;
+    }
+    try {
+      const st = await imagegenStatus();
+      if (!st.supported) {
+        showNotice("error", t("imageGenUnsupported"));
+        return;
+      }
+      if (!st.python) {
+        showNotice("error", t("imageGenNeedPython"));
+        return;
+      }
+      if (!st.runtimeReady) {
+        const quant = clampImageGenQuant(settings.imageGenQuant);
+        const ok = await confirm({
+          title: t("imageGenConfirmTitle"),
+          message: t("imageGenConfirm", { size: imageGenDiskHintGb(quant) }),
+        });
+        if (!ok) return;
+        setImageGenBusy(t("imageGenSetup"));
+        try {
+          await imagegenSetup((p) => {
+            if (p.type === "phase" || p.type === "progress") {
+              setImageGenBusy(p.message || t("imageGenSetup"));
+            }
+          });
+        } catch (e) {
+          const msg = preferEnglishBackendMsg(e instanceof Error ? e.message : String(e), lang);
+          showNotice("error", msg);
+          setImageGenBusy("");
+          return;
+        }
+        setImageGenBusy("");
+      }
+      setWebDesign(false);
+      setWebEnabled(false);
+      setImageGen(true);
+    } catch (e) {
+      const msg = preferEnglishBackendMsg(e instanceof Error ? e.message : String(e), lang);
+      showNotice("error", msg);
+    }
+  }
+
+  async function streamImageGen(
+    history: UiMessage[],
+    asstId: string,
+    convId: string,
+    opts: { freshConv: boolean },
+  ) {
+    const text = [...history].reverse().find((m) => m.role === "user")?.content ?? "";
+    setBusy(true);
+    setStreamingId(asstId);
+    setImageGenBusy(t("imageGenLoading"));
+    setMessages((cur) =>
+      cur.map((m) => (m.id === asstId ? { ...m, content: t("imageGenLoading") } : m)),
+    );
+    try {
+      const path = await imagegenGenerate(
+        {
+          prompt: text,
+          quant: clampImageGenQuant(settings.imageGenQuant),
+          width: clampImageGenSize(settings.imageGenSize),
+          height: clampImageGenSize(settings.imageGenSize),
+          steps: clampImageGenSteps(settings.imageGenSteps),
+          seed: settings.imageGenSeed.trim() ? Number(settings.imageGenSeed) : null,
+        },
+        (p) => {
+          if (p.type === "phase") {
+            const label = p.phase === "generate" ? t("imageGenGenerating") : p.message || t("imageGenLoading");
+            setImageGenBusy(label);
+            setMessages((cur) => cur.map((m) => (m.id === asstId ? { ...m, content: label } : m)));
+          } else if (p.type === "progress") {
+            const label = `${t("imageGenGenerating")} ${p.message}`;
+            setImageGenBusy(label);
+            setMessages((cur) => cur.map((m) => (m.id === asstId ? { ...m, content: label } : m)));
+          }
+        },
+      );
+      setMessages((cur) =>
+        cur.map((m) => (m.id === asstId ? { ...m, content: "", images: [path] } : m)),
+      );
+      try {
+        await saveMessage(asstId, convId, "assistant", "", [path]);
+        await refreshConversations();
+      } catch (e) {
+        reportChatSaveFailure(convId, e);
+      }
+      if (opts.freshConv) void makeTitle(convId, text);
+    } catch (e) {
+      const msg = preferEnglishBackendMsg(e instanceof Error ? e.message : String(e), lang);
+      setMessages((cur) => cur.map((m) => (m.id === asstId ? { ...m, content: msg } : m)));
+      showNotice("error", msg);
+      try {
+        if (msg) await saveMessage(asstId, convId, "assistant", msg);
+      } catch (err) {
+        reportChatSaveFailure(convId, err);
+      }
+    } finally {
+      setBusy(false);
+      setStreamingId(null);
+      setImageGenBusy("");
+    }
+  }
+
   async function handleSend(override?: string) {
     const text = (override ?? input).trim();
     if (!text || busy) return;
@@ -1920,6 +2087,32 @@ export default function App() {
     if (!override && /^\/webdesign\s*$/i.test(text)) {
       setWebDesign((v) => !v);
       setInput("");
+      return;
+    }
+    if (!override && /^\/imagegen\s*$/i.test(text)) {
+      setInput("");
+      await toggleImageGen();
+      return;
+    }
+    if (imageGen) {
+      const freshConv = conversationId === null;
+      const convId = conversationId ?? uid();
+      const userMsg: UiMessage = { id: uid(), role: "user", content: text };
+      const asstMsg: UiMessage = { id: uid(), role: "assistant", content: "" };
+      const history = [...messages, userMsg];
+      setMessages([...history, asstMsg]);
+      setInput("");
+      try {
+        if (freshConv) {
+          setConversationId(convId);
+          await saveConversation(convId, convTitle(text, t("newChat")), model?.path ?? null);
+        }
+        await saveMessage(userMsg.id, convId, "user", text);
+        await refreshConversations();
+      } catch (e) {
+        reportChatSaveFailure(convId, e);
+      }
+      await streamImageGen(history, asstMsg.id, convId, { freshConv });
       return;
     }
     if (!model) {
@@ -1960,7 +2153,8 @@ export default function App() {
 
   /** Re-run the assistant turn at `index` (drops anything after it). */
   async function regenerate(index: number) {
-    if (busy || !model || !conversationId) return;
+    if (busy || !conversationId) return;
+    if (!imageGen && !model) return;
     const target = messages[index];
     if (!target || target.role !== "assistant") return;
     const history = messages.slice(0, index);
@@ -1976,14 +2170,19 @@ export default function App() {
     } catch (e) {
       console.error(e);
     }
-    await streamAssistant(history, newAsst.id, conversationId, { freshConv: false });
+    if (imageGen) {
+      await streamImageGen(history, newAsst.id, conversationId, { freshConv: false });
+    } else {
+      await streamAssistant(history, newAsst.id, conversationId, { freshConv: false });
+    }
   }
 
   /** Edit a user message in place (drops anything after it) and regenerate. */
   async function editUser(index: number, newText: string) {
     const txt = newText.trim();
     setEditingId(null);
-    if (busy || !model || !conversationId || !txt) return;
+    if (busy || !conversationId || !txt) return;
+    if (!imageGen && !model) return;
     const target = messages[index];
     if (!target || target.role !== "user") return;
     const editedUser: UiMessage = { id: target.id, role: "user", content: txt, images: target.images };
@@ -1999,12 +2198,17 @@ export default function App() {
     } catch (e) {
       console.error(e);
     }
-    await streamAssistant(history, asstMsg.id, conversationId, { freshConv: false });
+    if (imageGen) {
+      await streamImageGen(history, asstMsg.id, conversationId, { freshConv: false });
+    } else {
+      await streamAssistant(history, asstMsg.id, conversationId, { freshConv: false });
+    }
   }
 
   async function handleStop() {
     try {
-      await cancelGeneration();
+      if (imageGen) await imagegenCancel();
+      else await cancelGeneration();
     } catch (e) {
       console.error(e);
     }
@@ -2138,6 +2342,12 @@ export default function App() {
       label: webEnabled ? t("cmdkWebOff") : t("cmdkWebOn"),
       keywords: "web search 联网 搜索",
       run: () => setWebEnabled((v) => !v),
+    },
+    {
+      id: "imagegen",
+      label: imageGen ? t("cmdkImageOff") : t("cmdkImageOn"),
+      keywords: "image gen generate z-image 图像 生成",
+      run: () => void toggleImageGen(),
     },
     {
       id: "models-dir",
@@ -2652,6 +2862,7 @@ export default function App() {
             {messages.length === 0 ? (
               <div className="empty">
                 <div className="empty-hero">
+                  <img className="empty-logo" src={logoUrl} alt="DARIA" draggable={false} />
                   <div className="empty-greeting">{t(greetingKey())}</div>
                   <div className="empty-sub">
                     {model ? t("readyMsg") : t("loadToStart")}
@@ -2695,6 +2906,14 @@ export default function App() {
               messages.map((m, i) =>
                 m.role === "assistant" ? (
                   <div key={m.id} className="msg assistant">
+                    {m.images && m.images.length > 0 && (
+                      <div className="gen-images">
+                        {m.images.map((p) => (
+                          <GeneratedImage key={p} path={p} openLabel={t("imageGenOpen")} />
+                        ))}
+                      </div>
+                    )}
+                    {(m.content.trim() || streamingId === m.id) && (
                     <AssistantMessage
                       content={m.content}
                       streaming={streamingId === m.id}
@@ -2703,6 +2922,7 @@ export default function App() {
                       hideThinking={!thinkEnabled}
                       sources={m.sources}
                     />
+                    )}
                     {m.sources && m.sources.length > 0 && (
                       <div className="sources">
                         <span className="sources-label">{t("sources")}</span>
@@ -2729,7 +2949,7 @@ export default function App() {
                         </div>
                       </div>
                     )}
-                    {streamingId !== m.id && m.content.trim() && (
+                    {streamingId !== m.id && (m.content.trim() || (m.images && m.images.length > 0)) && (
                       <div className="msg-actions">
                         <button
                           className="msg-action"
@@ -2943,8 +3163,9 @@ export default function App() {
                 {attachError && <span className="attach-error">{attachError}</span>}
               </div>
             )}
-            {webDesign && (
+            {(webDesign || imageGen) && (
               <div className="mode-bar">
+                {webDesign && (
                 <span className="mode-chip">
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
                     <rect x="3" y="4.5" width="18" height="15" rx="2" />
@@ -2959,6 +3180,25 @@ export default function App() {
                     <Icon name="x" size={11} strokeWidth={2.2} />
                   </button>
                 </span>
+                )}
+                {imageGen && (
+                <span className="mode-chip">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                    <rect x="4" y="5" width="16" height="14" rx="2" />
+                    <circle cx="9" cy="10" r="1.4" />
+                    <path d="M8 16l2.5-3 2 2.2L16 11l4 5H4z" />
+                  </svg>
+                  {t("imageGenChip")}
+                  {imageGenBusy && <span className="mode-chip-busy">{imageGenBusy}</span>}
+                  <button
+                    className="mode-chip-x"
+                    onClick={() => setImageGen(false)}
+                    title={t("imageGenOff")}
+                  >
+                    <Icon name="x" size={11} strokeWidth={2.2} />
+                  </button>
+                </span>
+                )}
               </div>
             )}
             <div className="input-row">
@@ -3147,8 +3387,23 @@ export default function App() {
                     </button>
                     )}
                     <button
+                      className={`tool-item ${imageGen ? "on" : ""}`}
+                      onClick={() => void toggleImageGen()}
+                    >
+                      <svg className="ti-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
+                        <rect x="4" y="5" width="16" height="14" rx="2" />
+                        <circle cx="9" cy="10" r="1.4" />
+                        <path d="M8 16l2.5-3 2 2.2L16 11l4 5H4z" />
+                      </svg>
+                      <span className="ti-label">{t("toolImage")}</span>
+                      <span className="ti-check">{imageGen ? <Icon name="check" size={12} strokeWidth={2.4} /> : ""}</span>
+                    </button>
+                    <button
                       className={`tool-item ${webDesign ? "on" : ""}`}
-                      onClick={() => setWebDesign((v) => !v)}
+                      onClick={() => {
+                        setWebDesign((v) => !v);
+                        setImageGen(false);
+                      }}
                     >
                       <svg className="ti-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
                         <rect x="3" y="4.5" width="18" height="15" rx="2" />
@@ -3197,15 +3452,17 @@ export default function App() {
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={onKeyDown}
                 placeholder={
-                  !model
-                    ? t("inputPhNoModel")
-                    : webDesign
-                      ? t("inputPhDesign")
-                      : webEnabled
-                        ? t("inputPhWeb")
-                        : settings.sendKey === "modEnter"
-                          ? t("inputPhMod")
-                          : t("inputPh")
+                  imageGen
+                    ? t("inputPhImage")
+                    : !model
+                      ? t("inputPhNoModel")
+                      : webDesign
+                        ? t("inputPhDesign")
+                        : webEnabled
+                          ? t("inputPhWeb")
+                          : settings.sendKey === "modEnter"
+                            ? t("inputPhMod")
+                            : t("inputPh")
                 }
                 rows={1}
               />

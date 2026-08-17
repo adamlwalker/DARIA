@@ -21,6 +21,7 @@ mod state;
 mod store;
 pub mod update;
 pub mod edge_tts;
+pub mod imagegen;
 pub mod voice;
 pub mod webx;
 
@@ -335,6 +336,13 @@ pub fn run() {
             commands::open_html_report,
             commands::canvas_session_save,
             commands::canvas_session_load,
+            commands::open_canvas_dir,
+            imagegen::imagegen_status,
+            imagegen::imagegen_setup,
+            imagegen::imagegen_generate,
+            imagegen::imagegen_unload,
+            imagegen::imagegen_cancel,
+            imagegen::open_images_dir,
             commands::open_external,
             commands::set_ui_zoom,
             commands::set_tray_language,

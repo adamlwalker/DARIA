@@ -442,6 +442,72 @@ export async function canvasSessionLoad(key: string): Promise<string | null> {
   return invoke<string | null>("canvas_session_load", { key });
 }
 
+/** Reveal the saved canvas-sessions folder in Finder/Explorer. */
+export async function openCanvasDir(): Promise<string> {
+  return invoke<string>("open_canvas_dir");
+}
+
+export interface ImageGenStatus {
+  supported: boolean;
+  platform: string;
+  appleSilicon: boolean;
+  python: string | null;
+  pythonVersion: string | null;
+  runtimeReady: boolean;
+  weightsReady: boolean;
+  loaded: boolean;
+  loadedQuant: number | null;
+  recommendedQuant: number;
+  ramGb: number;
+  imagesDir: string;
+}
+
+export type ImageGenProgress =
+  | { type: "phase"; phase: string; message: string }
+  | { type: "progress"; frac: number; message: string }
+  | { type: "done"; path: string | null }
+  | { type: "error"; message: string };
+
+export async function imagegenStatus(): Promise<ImageGenStatus> {
+  return invoke<ImageGenStatus>("imagegen_status");
+}
+
+export async function imagegenSetup(
+  onProgress: (p: ImageGenProgress) => void,
+): Promise<void> {
+  const channel = new Channel<ImageGenProgress>();
+  channel.onmessage = onProgress;
+  await invoke("imagegen_setup", { onProgress: channel });
+}
+
+export async function imagegenGenerate(
+  args: {
+    prompt: string;
+    quant?: number;
+    width?: number;
+    height?: number;
+    steps?: number;
+    seed?: number | null;
+  },
+  onProgress: (p: ImageGenProgress) => void,
+): Promise<string> {
+  const channel = new Channel<ImageGenProgress>();
+  channel.onmessage = onProgress;
+  return invoke<string>("imagegen_generate", { args, onProgress: channel });
+}
+
+export async function imagegenUnload(): Promise<void> {
+  await invoke("imagegen_unload");
+}
+
+export async function imagegenCancel(): Promise<void> {
+  await invoke("imagegen_cancel");
+}
+
+export async function openImagesDir(): Promise<string> {
+  return invoke<string>("open_images_dir");
+}
+
 /** Open a URL/file in the default browser. Routed through Rust (fork-free
  *  posix_spawn) instead of the opener plugin, which forks and crashes libmalloc
  *  in this multithreaded WebKit process on macOS. */

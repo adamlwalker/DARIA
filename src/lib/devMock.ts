@@ -409,9 +409,37 @@ function handle(cmd: string, args: Record<string, unknown> | undefined): unknown
     }
 
     // ---- misc ----
+    case "imagegen_status":
+      return {
+        supported: true,
+        platform: "macos",
+        appleSilicon: true,
+        python: "python3",
+        pythonVersion: "3.12",
+        runtimeReady: true,
+        weightsReady: true,
+        loaded: false,
+        loadedQuant: null,
+        recommendedQuant: 8,
+        ramGb: 64,
+        imagesDir: "/tmp/daria-images",
+      };
+    case "imagegen_setup":
+      return null;
+    case "imagegen_generate": {
+      const onProgress = args?.onProgress as { onmessage?: (p: unknown) => void } | undefined;
+      onProgress?.onmessage?.({ type: "phase", phase: "generate", message: "Generating image…" });
+      onProgress?.onmessage?.({ type: "progress", frac: 1, message: "9/9" });
+      onProgress?.onmessage?.({ type: "done", path: "/tmp/daria-images/demo.png" });
+      return "/tmp/daria-images/demo.png";
+    }
     case "set_tray_language":
     case "open_data_dir":
     case "open_models_dir":
+    case "open_canvas_dir":
+    case "open_images_dir":
+    case "imagegen_unload":
+    case "imagegen_cancel":
     case "open_external":
     case "browser_set_headless":
       return null;

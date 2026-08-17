@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.2.0 — On-device image generation
+
+- **Image gen** chat mode (tools menu or `/imagegen`) returns a PNG from **Z-Image-Turbo** on Apple Silicon via a lazy MLX sidecar. Turning the mode off unloads the weights.
+- Settings → Image gen: 4-bit / 8-bit / full-quality memory profiles, size, steps, seed, and an **Open images folder** button.
+- First use installs a private Python env and downloads the weights from Hugging Face; generation itself stays on the Mac.
+
 ## v2.0.2 — Spin control (2026-07-29)
 
 A patch release about wasted rounds. We instrumented the agent loop, ran the

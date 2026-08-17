@@ -811,6 +811,16 @@ pub fn canvas_session_save(app: tauri::AppHandle, key: String, data: String) -> 
     Ok(())
 }
 
+/// Reveal the canvas-sessions folder in Finder/Explorer so users can browse
+/// saved canvas version histories on disk.
+#[tauri::command]
+pub fn open_canvas_dir(app: tauri::AppHandle) -> Result<String, String> {
+    let dir = canvas_sessions_dir(&app)?;
+    let path = dir.to_string_lossy().to_string();
+    open_default(&path)?;
+    Ok(path)
+}
+
 /// Load one canvas session; Ok(None) when there is none.
 #[tauri::command]
 pub fn canvas_session_load(app: tauri::AppHandle, key: String) -> Result<Option<String>, String> {
