@@ -969,8 +969,8 @@ body.resizing-x {
 }
 .empty-logo {
   display: block;
-  width: 256px;
-  max-width: min(256px, 72%);
+  width: 200px;
+  max-width: min(200px, 72%);
   height: auto;
   margin: 0;
   object-fit: contain;
