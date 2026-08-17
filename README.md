@@ -104,7 +104,7 @@ Same model, same tasks, same grading, one machine — five agent designs. DARIA 
 - A streaming, foldable **`<think>`** panel that follows the model's reasoning as it generates.
 - **KaTeX** math, tables, **Mermaid** diagrams, per-block code copy, and in-app rendering of single-file HTML — including playable web games.
 - A **⌘K command palette**, pinnable / renameable conversations, drag-and-drop attachments, export (Markdown / JSON), and full-text search.
-- Four palettes (two dark, two light) with system-theme following, native UI zoom, reduced-motion support, and an **English / 简体中文** UI.
+- Four palettes (two dark, two light) with system-theme following, native UI zoom, reduced-motion support, and an **English / 简体中文** UI. Interface strings live in `src/locales/en.json` and `src/locales/zh.json` — the app stays English unless Chinese is selected.
 
 <br />
 
@@ -149,10 +149,10 @@ Text-only models keep the OCR path, so nothing regresses — and updating from a
 
 ## Hands-free voice
 
-- **Live mode** — continuous, hands-free conversation with an animated orb.
-- Voice in/out with silence auto-send and read-aloud — **11 voices** with speed control.
+- **Live mode** — continuous, hands-free conversation with an animated orb. Live chat always uses **Kokoro** on-device.
+- Voice in/out with silence auto-send and read-aloud. Recognition is local **Whisper**. Read-aloud can stay on **Kokoro** (offline, 11 voices + speed) or switch to **Microsoft Edge TTS** for English neural voices, with speed, pitch, and volume. Edge is online — Settings shows a privacy warning, and it is never used for live chat.
 - **Deep-dive podcast** — turn your knowledge base into a NotebookLM-style two-host audio show, with WAV export.
-- All voice runs on the **CPU**, so it never competes with the LLM for VRAM.
+- On-device voice runs on the **CPU**, so it never competes with the LLM for VRAM.
 
 <br />
 
@@ -161,9 +161,10 @@ Text-only models keep the OCR path, so nothing regresses — and updating from a
 - Conversations, models, and indexes live in one **local data folder** — copy it to back up, clear it in a click.
 - **GPU acceleration**: cross-vendor **Vulkan** (Windows) and **Metal** (Apple Silicon, offload-all on unified memory), VRAM-aware auto-tuning with OOM back-off and CPU fallback.
 - **Any `.gguf` — or MLX folder** — tokenizer and chat template come from the model itself; first-class handling for Llama 3, Gemma 3 / 4, and Qwen 3 / 3.5 / 3.6.
-- **Adjustable context** that auto-fits the model's trained length to your memory and summarizes older turns near the limit; **safe model switching** and full sampling controls with saveable presets.
+- **Adjustable context** that auto-fits the model's trained length to your memory and summarizes older turns near the limit; **safe model switching**.
+- **Sampling presets** under Settings — intent starters (Thinking, Chat, Default, Fast Mode) plus family recipes for Gemma, Qwen3, and LLaMA 3. Picking one fills temperature, top-p, top-k, and repeat penalty; the sliders stay editable. Length is left alone unless you pick Fast Mode (64 tokens). Reload the model so the next reply uses the new values.
 
-> **Offline-first.** The network is used only for optional web search and one-time model downloads.
+> **Offline-first.** The network is used only for optional web search, one-time model downloads, and **Edge TTS** if you choose it for read-aloud.
 
 <br />
 
@@ -214,9 +215,9 @@ tag — GitHub Actions builds both installers onto a single release.
 | Layer | Stack |
 |---|---|
 | Shell | Tauri 2 — system tray, global shortcut, single-instance |
-| Frontend | React 19 · Vite · react-markdown · KaTeX |
+| Frontend | React 19 · Vite · react-markdown · KaTeX · UI copy in `src/locales/{en,zh}.json` |
 | Inference | Rust · `llama-cpp-2` (llama.cpp) — Vulkan (Windows) / Metal (macOS) · MLX via an `mlx-swift-lm` sidecar (Apple Silicon) |
-| Voice | `sherpa-rs` (ONNX Runtime, CPU) — Whisper-base.en + Kokoro-82M |
+| Voice | `sherpa-rs` (ONNX Runtime, CPU) — Whisper-base.en + Kokoro-82M · optional Microsoft Edge TTS for English read-aloud |
 | Knowledge base | bge-m3 embeddings + BM25 · hybrid RRF / MMR retrieval · SQLite vector store |
 | Storage | SQLite — conversations, messages, full-text search |
 
