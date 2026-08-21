@@ -13,16 +13,23 @@ local GGUF inference.
 - **Vulkan SDK** (LunarG) for the GPU build — provides `glslc` + `vulkan-1.lib`.
   Install from <https://vulkan.lunarg.com/sdk/home> (needs admin). `dev.ps1`
   auto‑detects it under `C:\VulkanSDK`. For a **CPU‑only** build that doesn't
-  need the Vulkan SDK, pass `--no-default-features` to cargo / tauri.
+  need the Vulkan SDK, pass `--no-default-features` through to cargo
+  (`tauri dev -- --no-default-features`). `dev.ps1` does this automatically
+  when the SDK is missing.
 
 `cl`, `cmake`, `libclang`, and the Vulkan SDK usually aren't on `PATH` —
-`dev.ps1` wires them up.
+`dev.ps1` wires them up. It locates `libclang.dll` from a system LLVM install
+(`winget install LLVM.LLVM`) and Ninja from the Visual Studio CMake tools; if
+the Vulkan SDK is missing it builds **CPU-only** (`--no-default-features`)
+instead of failing the default GPU feature.
 
 ## Run (dev)
 
 ```powershell
 npm install
 .\dev.ps1          # configures the build env, then `npm run tauri dev`
+                   # GPU when the Vulkan SDK is present; otherwise CPU-only
+.\dev.ps1 --no-default-features   # force CPU-only
 ```
 
 First run compiles llama.cpp from source (~3–4 min); afterwards it's cached.

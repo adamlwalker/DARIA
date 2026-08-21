@@ -177,10 +177,11 @@ export function DeepResearchPanel({
       sup { font-size: 0.7em; }
       img { max-width: 100%; }
       @media print { .dr-print-hint { display: none; } }`;
+    const printKey = /mac/i.test(navigator.platform ?? "") ? "⌘P" : "Ctrl+P";
     const hint =
       lang === "zh"
-        ? '<div class="dr-print-hint" style="background:#fffae6;border:1px solid #f0e0a0;padding:8px 12px;border-radius:8px;margin-bottom:16px;font-size:13px;">如果未自动弹出打印窗口，请按 ⌘P，然后在「目标」中选择「存储为 PDF」。</div>'
-        : '<div class="dr-print-hint" style="background:#fffae6;border:1px solid #f0e0a0;padding:8px 12px;border-radius:8px;margin-bottom:16px;font-size:13px;">If the print dialog didn\'t open, press ⌘P and choose "Save as PDF".</div>';
+        ? `<div class="dr-print-hint" style="background:#fffae6;border:1px solid #f0e0a0;padding:8px 12px;border-radius:8px;margin-bottom:16px;font-size:13px;">如果未自动弹出打印窗口，请按 ${printKey}，然后在「目标」中选择「存储为 PDF」。</div>`
+        : `<div class="dr-print-hint" style="background:#fffae6;border:1px solid #f0e0a0;padding:8px 12px;border-radius:8px;margin-bottom:16px;font-size:13px;">If the print dialog didn't open, press ${printKey} and choose "Save as PDF".</div>`;
     const html = `<!doctype html><html lang="${lang}"><head><meta charset="utf-8"><title>${topic.trim() || (kb ? t("kbReportTitle") : "")}</title><style>${css}</style></head><body>${hint}${node.innerHTML}<script>window.addEventListener("load",function(){setTimeout(function(){window.print();},400);});<\/script></body></html>`;
     try {
       await openHtmlReport(html, "deep-research");
