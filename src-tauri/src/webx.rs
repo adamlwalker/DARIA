@@ -496,7 +496,9 @@ async fn fetch_youtube(video_id: &str) -> Result<PageEx, String> {
 
 // ---------------------------------------------------------------- bilibili
 
-const BILI_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15";
+/// Bilibili's open API answers a plainly-identified client and refuses a
+/// browser UA without cookies. Identify as DARIA rather than impersonating Safari.
+const BILI_UA: &str = concat!("DARIA/", env!("CARGO_PKG_VERSION"), " (+https://github.com/adamlwalker/DARIA)");
 
 /// Bilibili in-site video search via the public web-interface API (no key,
 /// no cookie — a Referer header is all it wants). Returns structured videos
@@ -516,9 +518,14 @@ async fn bilibili_search(query: &str) -> Result<Vec<SiteResult>, String> {
         .text()
         .await
         .map_err(|e| e.to_string())?;
-    let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    // Anti-crawl / rate limit → engine snapshot fallback. What that refusal
+    // actually looks like is an HTML page, not an error code in JSON, so
+    // failing to parse has to take the same road: reading it as an error left
+    // the fallback unreachable in the one case it exists for.
+    let Ok(v) = serde_json::from_str::<Value>(&body) else {
+        return engine_site_search("bilibili.com", query).await;
+    };
     if v["code"].as_i64() != Some(0) {
-        // Anti-crawl / rate limit → engine snapshot fallback.
         return engine_site_search("bilibili.com", query).await;
     }
     let mut out = Vec::new();
@@ -589,7 +596,14 @@ async fn fetch_bilibili(bvid: &str) -> Result<PageEx, String> {
         .text()
         .await
         .map_err(|e| e.to_string())?;
-    let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let v: Value = serde_json::from_str(&body).map_err(|_| {
+        // The refusal is an HTML page; a JSON parser's complaint about column 1
+        // told the reader nothing about what happened.
+        trf!(
+            "B站没有返回可解析的数据(多半是被限流了),稍后再试",
+            "Bilibili did not return readable data (most likely rate-limited) — try again shortly"
+        )
+    })?;
     if v["code"].as_i64() != Some(0) {
         return Err(crate::agent::localize_mixed(&format!(
             "B站视频不可用 (unavailable): {}",
@@ -1023,8 +1037,7 @@ pub async fn fetch_page_ex(url: String, raw: Option<bool>) -> Result<PageEx, Str
         if bytes.len() > PDF_CAP_BYTES {
             return Err(format!("PDF too large ({} MB)", bytes.len() / 1024 / 1024));
         }
-        let text = pdf_extract::extract_text_from_mem(&bytes)
-            .map_err(|e| crate::agent::localize_mixed(&format!("PDF 解析失败: {e}")))?;
+        let text = crate::rag::extract_pdf_bytes(&bytes)?;
         let (text, truncated) = cap(text.trim(), TEXT_CAP);
         return Ok(PageEx {
             url: final_url,

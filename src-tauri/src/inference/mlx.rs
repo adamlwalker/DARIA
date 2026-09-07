@@ -33,9 +33,9 @@ pub fn is_mlx_dir(path: &Path) -> bool {
     if !path.is_dir() || !path.join("config.json").is_file() {
         return false;
     }
-    std::fs::read_dir(path).map_or(false, |rd| {
+    std::fs::read_dir(path).is_ok_and(|rd| {
         rd.flatten().any(|e| {
-            e.path().extension().map_or(false, |x| x.eq_ignore_ascii_case("safetensors"))
+            e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("safetensors"))
         })
     })
 }
@@ -59,7 +59,7 @@ pub(crate) fn heal_wrapped_weight_prefix(dir: &Path) -> Result<()> {
     let shards: Vec<PathBuf> = std::fs::read_dir(dir)?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |x| x.eq_ignore_ascii_case("safetensors")))
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("safetensors")))
         .collect();
     if shards.is_empty() {
         return Ok(());
@@ -168,7 +168,7 @@ pub fn mlx_dir_has_vision(path: &Path) -> bool {
     std::fs::read_to_string(path.join("config.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .map_or(false, |v| v.get("vision_config").is_some())
+        .is_some_and(|v| v.get("vision_config").is_some())
 }
 
 /// Sum of the safetensors shards, in MiB — the honest weight footprint.
@@ -179,7 +179,7 @@ pub fn mlx_dir_size_mb(path: &Path) -> u64 {
                 .filter(|e| {
                     e.path()
                         .extension()
-                        .map_or(false, |x| x.eq_ignore_ascii_case("safetensors"))
+                        .is_some_and(|x| x.eq_ignore_ascii_case("safetensors"))
                 })
                 .filter_map(|e| e.metadata().ok())
                 .map(|m| m.len())
@@ -329,9 +329,15 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 impl MlxEngine {
     /// Load `dir` (an MLX model folder) with the auto-located sidecar.
+    /// `speculative` is the user's setting for decoding with the checkpoint's
+    /// own multi-token-prediction head. The returned `ModelInfo` reports
+    /// whether the checkpoint HAS one separately from whether it is running,
+    /// so the UI can offer the switch on exactly the models it does something
+    /// for.
     pub fn load(
         dir: &str,
         n_ctx: Option<u32>,
+        speculative: bool,
         progress: impl Fn(f32),
     ) -> Result<(Self, ModelInfo)> {
         let sidecar = find_sidecar().ok_or_else(|| {
@@ -340,13 +346,14 @@ impl MlxEngine {
                 "the chaty-mlx sidecar is missing; please reinstall",
             ))
         })?;
-        Self::load_with_sidecar(&sidecar, dir, n_ctx, progress)
+        Self::load_with_sidecar(&sidecar, dir, n_ctx, speculative, progress)
     }
 
     pub fn load_with_sidecar(
         sidecar: &Path,
         dir: &str,
         n_ctx: Option<u32>,
+        speculative: bool,
         progress: impl Fn(f32),
     ) -> Result<(Self, ModelInfo)> {
         let dir_path = PathBuf::from(dir);
@@ -449,7 +456,11 @@ impl MlxEngine {
                 )
             );
         }
-        writeln!(stdin_pipe, "{}", json!({ "cmd": "load", "path": dir, "nCtx": n_ctx }))?;
+        writeln!(
+            stdin_pipe,
+            "{}",
+            json!({ "cmd": "load", "path": dir, "nCtx": n_ctx, "speculative": speculative })
+        )?;
         stdin_pipe.flush()?;
 
         let loaded = {
@@ -513,6 +524,8 @@ impl MlxEngine {
             n_ctx_train: loaded["nCtxTrain"].as_u64().map(|v| v as u32),
             n_ctx: loaded["nCtx"].as_u64().map(|v| v as u32),
             n_layer,
+            speculative: loaded["speculative"].as_bool().unwrap_or(false),
+            speculative_on: loaded["speculativeOn"].as_bool().unwrap_or(false),
             // Unified memory: MLX always runs the whole model on the GPU.
             gpu_layers: n_layer.map(|v| v as i32).unwrap_or(-1),
             gpu_name: crate::gpu::detect_gpu().map(|g| g.name),
@@ -530,6 +543,8 @@ impl MlxEngine {
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
                 .unwrap_or_default(),
+            tool_role: loaded["toolRole"].as_bool().unwrap_or(false),
+            reasoning_field: loaded["reasoningField"].as_bool().unwrap_or(false),
             supports_tools: loaded["supportsTools"].as_bool().unwrap_or(false),
             multimodal: loaded["multimodal"].as_bool().unwrap_or(false),
             // MLX VLMs carry their vision tower in the same weights — loaded
@@ -537,6 +552,7 @@ impl MlxEngine {
             // (A folder missing its processor config loads text-only: the
             // sidecar reports multimodal=false plus a warning.)
             vision_ready: loaded["multimodal"].as_bool().unwrap_or(false),
+            multi_image: loaded["multiImage"].as_bool().unwrap_or(true),
             mmproj: None,
             warning: loaded["warning"].as_str().map(str::to_string),
         };
@@ -720,8 +736,10 @@ fn run_generation(
                     super::Role::System => "system",
                     super::Role::User => "user",
                     super::Role::Assistant => "assistant",
+                    super::Role::Tool => "tool",
                 },
                 "content": m.content,
+                "reasoningContent": m.reasoning_content,
                 // Vision cap, TIGHTER than the GGUF engine's 2 MP: raw 2x
                 // full-page screenshots (15+ MP) either blow past Metal
                 // limits inside the sidecar's mlx_eval (fatalError →
@@ -996,7 +1014,7 @@ mod tests {
         assert_eq!(picked, full.join("chaty-mlx"), "must skip the bundle-less copy");
 
         // With no complete copy anywhere, fall back rather than find nothing.
-        let only_bare = vec![bare.join("chaty-mlx")];
+        let only_bare = [bare.join("chaty-mlx")];
         let picked2 = only_bare
             .iter()
             .find(|p| p.with_file_name("mlx-swift_Cmlx.bundle").exists())
@@ -1115,6 +1133,7 @@ done
             &script,
             model.to_str().unwrap(),
             Some(2048),
+            true,
             move |f| p2.lock().unwrap().push(f),
         )
         .expect("mock load");
@@ -1134,7 +1153,8 @@ done
                 role: Role::User,
                 content: "hi".into(),
                 images: vec![],
-            }],
+                reasoning_content: None,
+}],
             params: GenParams { stop: vec!["STOP".into()], ..Default::default() },
         };
         let cancel = Arc::new(AtomicBool::new(false));
@@ -1164,7 +1184,7 @@ mod mlx_e2e {
 
     fn req(prompt: &str, params: GenParams) -> GenRequest {
         GenRequest {
-            messages: vec![ChatMessage { role: Role::User, content: prompt.into(), images: vec![] }],
+            messages: vec![ChatMessage { role: Role::User, content: prompt.into(), images: vec![], reasoning_content: None }],
             params,
         }
     }
@@ -1179,7 +1199,7 @@ mod mlx_e2e {
         let dir = model_dir();
         let t0 = std::time::Instant::now();
         let (engine, info) =
-            MlxEngine::load(&dir, Some(8192), |f| eprintln!("load {:.0}%", f * 100.0))
+            MlxEngine::load(&dir, Some(8192), true, |f| eprintln!("load {:.0}%", f * 100.0))
                 .expect("load MLX model");
         eprintln!("loaded {} in {:?}: {info:?}", info.name, t0.elapsed());
         assert_eq!(info.backend, "mlx");
@@ -1264,7 +1284,7 @@ mod mlx_e2e {
     #[ignore]
     fn mlx_e2e_no_cross_conversation_bleed() {
         let dir = model_dir();
-        let (engine, info) = MlxEngine::load(&dir, Some(8192), |_| {}).expect("load");
+        let (engine, info) = MlxEngine::load(&dir, Some(8192), true, |_| {}).expect("load");
         let hybrid = info.arch.as_deref().unwrap_or("").starts_with("qwen3_5");
         let rt = rt();
 
@@ -1282,7 +1302,8 @@ mod mlx_e2e {
                     role: Role::User,
                     content: content.into(),
                     images: vec![],
-                }],
+                    reasoning_content: None,
+}],
                 params: GenParams { max_tokens: 96, think: Some(false), temperature: 0.0, ..Default::default() },
             };
             rt.block_on(engine.generate(req, sink, Arc::new(AtomicBool::new(false))))
@@ -1327,7 +1348,7 @@ mod mlx_e2e {
     #[ignore]
     fn mlx_e2e_stream_events() {
         let dir = model_dir();
-        let (engine, _info) = MlxEngine::load(&dir, Some(8192), |_| {}).expect("load");
+        let (engine, _info) = MlxEngine::load(&dir, Some(8192), true, |_| {}).expect("load");
         let events = Arc::new(Mutex::new(Vec::<String>::new()));
         let ev2 = events.clone();
         let sink = Channel::new(move |body: tauri::ipc::InvokeResponseBody| {
@@ -1343,7 +1364,8 @@ mod mlx_e2e {
                 role: Role::User,
                 content: format!("{filler}\nSummarize the above in one short sentence."),
                 images: vec![],
-            }],
+                reasoning_content: None,
+}],
             params: GenParams { max_tokens: 64, think: Some(false), temperature: 0.0, ..Default::default() },
         };
         rt().block_on(engine.generate(req, sink, Arc::new(AtomicBool::new(false))))
@@ -1374,7 +1396,7 @@ mod mlx_vlm_e2e {
     #[ignore]
     fn mlx_vlm_e2e_sees_colors_then_chats() {
         let dir = std::env::var("CHATY_TEST_MLX_VLM").expect("set CHATY_TEST_MLX_VLM=<mlx vlm dir>");
-        let (engine, info) = MlxEngine::load(&dir, Some(8192), |_| {}).expect("load VLM");
+        let (engine, info) = MlxEngine::load(&dir, Some(8192), true, |_| {}).expect("load VLM");
         assert!(info.multimodal, "config has a vision tower");
         assert!(info.vision_ready, "MLX VLM must report vision_ready");
 
@@ -1390,7 +1412,8 @@ mod mlx_vlm_e2e {
                 content: "What is the dominant color of this image? Answer with one word."
                     .into(),
                 images: vec![img_path.to_string_lossy().to_string()],
-            }],
+                reasoning_content: None,
+}],
             params: GenParams { max_tokens: 160, think: Some(false), temperature: 0.0, ..Default::default() },
         };
         let text = rt
@@ -1406,7 +1429,8 @@ mod mlx_vlm_e2e {
                 role: Role::User,
                 content: "Name the capital of France. One word.".into(),
                 images: vec![],
-            }],
+                reasoning_content: None,
+}],
             params: GenParams { max_tokens: 64, think: Some(false), temperature: 0.0, ..Default::default() },
         };
         let text = rt
@@ -1442,7 +1466,7 @@ mod mlx_vlm_e2e {
         }
 
         let (engine, info) =
-            MlxEngine::load(clone.to_str().unwrap(), Some(8192), |_| {}).expect("healed load");
+            MlxEngine::load(clone.to_str().unwrap(), Some(8192), true, |_| {}).expect("healed load");
         assert!(info.vision_ready, "healed VLM must still be vision-ready");
         assert!(
             clone.join("preprocessor_config.json").is_file(),
@@ -1459,7 +1483,8 @@ mod mlx_vlm_e2e {
                 role: Role::User,
                 content: "What is the dominant color of this image? Answer with one word.".into(),
                 images: vec![img_path.to_string_lossy().to_string()],
-            }],
+                reasoning_content: None,
+}],
             params: GenParams { max_tokens: 160, think: Some(false), temperature: 0.0, ..Default::default() },
         };
         let text = rt
@@ -1480,7 +1505,7 @@ mod mlx_vlm_e2e {
     #[ignore]
     fn mlx_vlm_e2e_oversized_screenshot_survives() {
         let dir = std::env::var("CHATY_TEST_MLX_VLM").expect("set CHATY_TEST_MLX_VLM=<mlx vlm dir>");
-        let (engine, _info) = MlxEngine::load(&dir, Some(8192), |_| {}).expect("load VLM");
+        let (engine, _info) = MlxEngine::load(&dir, Some(8192), true, |_| {}).expect("load VLM");
 
         // Tall red "page" at 2x-screenshot proportions: 2200x7000 = 15.4 MP.
         let img = image::RgbImage::from_pixel(2200, 7000, image::Rgb([220, 20, 20]));
@@ -1494,7 +1519,8 @@ mod mlx_vlm_e2e {
                 content: "What is the dominant color of this image? Answer with one word."
                     .into(),
                 images: vec![img_path.to_string_lossy().to_string()],
-            }],
+                reasoning_content: None,
+}],
             params: GenParams { max_tokens: 160, think: Some(false), temperature: 0.0, ..Default::default() },
         };
         let text = rt
@@ -1509,7 +1535,8 @@ mod mlx_vlm_e2e {
                 role: Role::User,
                 content: "Name the capital of France. One word.".into(),
                 images: vec![],
-            }],
+                reasoning_content: None,
+}],
             params: GenParams { max_tokens: 64, think: Some(false), temperature: 0.0, ..Default::default() },
         };
         let text = rt
@@ -1520,16 +1547,16 @@ mod mlx_vlm_e2e {
     }
 
     /// Image-turn prefill progress + the GGUF media-cache analogue: a text
-    /// follow-up in the same conversation must not re-encode the image on
-    /// dense VLMs (qwen3_vl — trimmable cache resumes past the media prefix,
-    /// so its first prefill event starts beyond zero), while hybrid ones
-    /// (qwen3_5 — Mamba state can't rewind) re-prefill from zero, still with
-    /// progress events. Both variants must answer correctly.
+    /// follow-up in the same conversation must not re-encode the image on a
+    /// dense VLM — its trimmable cache resumes past the media prefix, so the
+    /// first prefill event starts beyond zero — while a hybrid one (qwen3_5 /
+    /// qwen3_6, whose Mamba state can't rewind) re-prefills from zero, still
+    /// with progress events. Both variants must answer correctly.
     #[test]
     #[ignore]
     fn mlx_vlm_e2e_prefill_progress_and_reuse() {
         let dir = std::env::var("CHATY_TEST_MLX_VLM").expect("set CHATY_TEST_MLX_VLM=<mlx vlm dir>");
-        let (engine, info) = MlxEngine::load(&dir, Some(8192), |_| {}).expect("load VLM");
+        let (engine, info) = MlxEngine::load(&dir, Some(8192), true, |_| {}).expect("load VLM");
         assert!(info.vision_ready, "MLX VLM must report vision_ready");
         let arch = info.arch.clone().unwrap_or_default();
 
@@ -1576,7 +1603,8 @@ mod mlx_vlm_e2e {
             role: Role::User,
             content: "What is the dominant color of this image? Answer with one word.".into(),
             images: vec![img_path.to_string_lossy().to_string()],
-        };
+            reasoning_content: None,
+};
         let (answer1, prefills1) = run(vec![img_msg.clone()]);
         eprintln!("turn1 answer: {answer1:?}, prefills: {prefills1:?}");
         assert!(answer1.to_lowercase().contains("red"), "expected 'red' in: {answer1}");
@@ -1588,28 +1616,28 @@ mod mlx_vlm_e2e {
         let filler = "Notes: the quick brown fox jumps over the lazy dog. ".repeat(60);
         let (answer2, prefills2) = run(vec![
             img_msg,
-            ChatMessage { role: Role::Assistant, content: answer1.clone(), images: vec![] },
+            ChatMessage { role: Role::Assistant, content: answer1.clone(), images: vec![], reasoning_content: None },
             ChatMessage {
                 role: Role::User,
                 content: format!("{filler}\nNow name the capital of France. One word."),
                 images: vec![],
-            },
+                reasoning_content: None,
+},
         ]);
         eprintln!("turn2 answer: {answer2:?}, prefills: {prefills2:?}");
         assert!(answer2.to_lowercase().contains("paris"), "expected 'Paris' in: {answer2}");
         assert!(!prefills2.is_empty(), "long follow-up must emit prefill progress");
-        if arch == "qwen3_vl" {
-            assert!(
-                prefills2[0].0 > 0,
-                "dense VLM must resume past the cached image prefix, got {:?}",
-                prefills2
-            );
-        } else {
-            assert_eq!(
-                prefills2[0].0, 0,
-                "hybrid VLM re-prefills from zero (Mamba state can't rewind)"
-            );
-        }
+        // This follow-up only ADDS to what turn 1 left cached, and growing a
+        // recurrent state forward is the one thing it can do — what a hybrid
+        // cannot do is rewind to a midpoint. So every arch must resume here,
+        // hybrid included; this used to assert the opposite for Qwen3.5/3.6,
+        // which described a loop that rewrote the turn it had just generated
+        // rather than anything the architecture imposes.
+        assert!(
+            prefills2[0].0 > 0,
+            "an appended turn must resume past the cached image prefix ({arch}), got {:?}",
+            prefills2
+        );
         engine.unload();
     }
 }
@@ -1631,7 +1659,7 @@ mod mlx_mem_e2e {
         std::process::Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "pid="])
             .output()
-            .map_or(false, |o| !o.stdout.is_empty())
+            .is_ok_and(|o| !o.stdout.is_empty())
     }
 
     #[test]
@@ -1648,7 +1676,7 @@ mod mlx_mem_e2e {
         let base = probe(&mut sys);
 
         for cycle in 0..5 {
-            let (engine, _info) = MlxEngine::load(&dir, Some(4096), |_| {}).expect("load");
+            let (engine, _info) = MlxEngine::load(&dir, Some(4096), true, |_| {}).expect("load");
             let pid = sidecar_pid(&engine).expect("sidecar pid");
             assert!(pid_alive(pid), "cycle {cycle}: sidecar not running after load");
 
@@ -1657,7 +1685,8 @@ mod mlx_mem_e2e {
                     role: Role::User,
                     content: "Say OK.".into(),
                     images: vec![],
-                }],
+                    reasoning_content: None,
+}],
                 params: GenParams { max_tokens: 8, think: Some(false), temperature: 0.0, ..Default::default() },
             };
             let text = rt

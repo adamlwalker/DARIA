@@ -12,7 +12,7 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::{Manager, State};
 
 use crate::inference::llama::LlamaEngine;
-use crate::inference::{GenRequest, InferenceBackend, ModelInfo, StreamEvent};
+use crate::inference::{GenRequest, InferenceBackend, ModelInfo, SaveTarget, StreamEvent};
 use crate::state::AppState;
 
 /// Phase + fraction streamed to the UI while a model loads.
@@ -53,6 +53,7 @@ pub async fn load_model(
     path: String,
     gpu_layers: Option<i32>,
     n_ctx: Option<u32>,
+    speculative: Option<bool>,
     on_progress: Channel<LoadProgress>,
 ) -> Result<ModelInfo, String> {
     // Stored paths from before the folder-layout migration point at
@@ -109,6 +110,11 @@ pub async fn load_model(
         ));
     }
 
+    // Decode with the model's own multi-token-prediction head when it has one.
+    // `None` means no, matching the setting's default: a caller that does not
+    // ask for it does not get it.
+    let speculative = speculative.unwrap_or(false);
+
     let _ = on_progress.send(LoadProgress { phase: "eject", frac: 0.0 });
 
     // Eject the old model SYNCHRONOUSLY before loading the new one. Merely
@@ -122,7 +128,7 @@ pub async fn load_model(
         let guard = state.model.read().await;
         (
             guard.as_ref().and_then(|m| m.size_mb).unwrap_or(0),
-            guard.as_ref().map_or(false, |m| m.backend == "mlx"),
+            guard.as_ref().is_some_and(|m| m.backend == "mlx"),
         )
     };
     let old = state.engine.write().await.take();
@@ -223,7 +229,7 @@ pub async fn load_model(
         let chan = on_progress.clone();
         let gate = gate.clone();
         tokio::task::spawn_blocking(move || {
-            crate::inference::mlx::MlxEngine::load(&path, n_ctx, move |frac| {
+            crate::inference::mlx::MlxEngine::load(&path, n_ctx, speculative, move |frac| {
                 if gate.permit(frac) {
                     let _ = chan.send(LoadProgress { phase: "weights", frac });
                 }
@@ -233,7 +239,7 @@ pub async fn load_model(
         .await
     } else {
         tokio::task::spawn_blocking(move || {
-            LlamaEngine::load(&path, gpu_layers, n_ctx)
+            LlamaEngine::load(&path, gpu_layers, n_ctx, speculative)
                 .map(|(engine, info)| (Arc::new(engine) as Arc<dyn InferenceBackend>, info))
         })
         .await
@@ -290,6 +296,97 @@ pub fn get_hardware_info() -> crate::gpu::HardwareInfo {
 #[tauri::command]
 pub fn get_gpu_usage() -> Option<crate::gpu::GpuUsage> {
     crate::gpu::gpu_usage()
+}
+
+/// How long a page must have been up for its replacement to mean something.
+///
+/// Startup is not one page load. The macOS setup above flips
+/// `mediaDevicesEnabled` and reloads so the page re-evaluates its bindings, and
+/// what arrives after that is a burst — the owner's log shows the extra loads
+/// landing in the SAME second as the process starting, every launch since the
+/// counter existed. A renderer that WebKit killed for growing too large is the
+/// opposite shape: the page it replaces has been up for as long as the session.
+/// Twenty seconds is far above the burst and far below any session worth
+/// interrupting.
+const RELOAD_MIN_UPTIME: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Was this page load a reload worth reporting, given how long the previous
+/// page had been up? `None` is the first load of the process.
+fn reload_is_notable(previous_page_uptime: Option<std::time::Duration>) -> bool {
+    previous_page_uptime.is_some_and(|d| d >= RELOAD_MIN_UPTIME)
+}
+
+/// The frontend reporting that it has just booted.
+///
+/// Called once per page load. A call that REPLACES a page which had been up a
+/// while means the webview reloaded underneath us, and whatever the interface
+/// was running died with the JS context, silently, because there is no JS left
+/// to notice. That is the only evidence such a thing happened, so it goes in
+/// the error log where a report can quote it.
+///
+/// What causes it is not settled. One occurrence was traced through the system
+/// log: the Mac was locked, the system was trying to suspend the web process,
+/// and a streaming reply — one JavaScript evaluation per token — took a
+/// foreground assertion each time and cancelled the suspension, around thirty
+/// times in the four seconds before the page was replaced. The replacement
+/// itself came from the native side (`WebPageProxy::reload`, a new web process
+/// launched for it) and NOT from the renderer dying: the old one exited
+/// eighteen milliseconds AFTER the reload, as its consequence. It was not the
+/// page's own JavaScript either — the reload this app issues at startup shows
+/// a different signature entirely, keeping the same process. Whatever issues
+/// it, the loss is real and worth recording; guessing at the cause in this
+/// message is not.
+///
+/// The reloads Chaty causes itself at startup are not that, and logging them
+/// buried the signal under two false entries per launch.
+#[tauri::command]
+pub fn note_frontend_ready() {
+    use std::sync::Mutex;
+    use std::time::Instant;
+    static LAST: Mutex<Option<(usize, Instant)>> = Mutex::new(None);
+    let now = Instant::now();
+    let (n, previous_uptime) = {
+        let mut g = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let (n, prev) = match *g {
+            Some((n, at)) => (n + 1, Some(now.duration_since(at))),
+            None => (1, None),
+        };
+        *g = Some((n, now));
+        (n, prev)
+    };
+    if reload_is_notable(previous_uptime) {
+        let up = previous_uptime.unwrap_or_default().as_secs();
+        crate::errlog::append_error(
+            "webview-reload",
+            &trf!(
+                "界面在 app 未重启的情况下自行重载(第 {} 次加载,上一个页面存活 {}s)。\
+                 聊天回复不受影响:生成由 app 持有,页面回来后会自动接上继续。\
+                 但 code 模式的运行跑在页面里,会随之中断。",
+                "the interface reloaded without the app restarting (page load #{}, \
+                 after {}s on the previous one). A chat reply is unaffected — the app \
+                 owns the generation and the page picks it back up — but a code-mode \
+                 run lives in the page and was interrupted",
+                n,
+                up
+            ),
+        );
+    }
+}
+
+/// How many GPU layers the engine is currently allowed after a crash, if any.
+/// `Some(0)` means CPU-only; `None` means no cap at all.
+#[tauri::command]
+pub fn get_gpu_layer_cap() -> Option<i32> {
+    crate::inference::llama::gpu_layer_cap()
+}
+
+/// Forget that cap. Offered in Settings because the machine that crashed is not
+/// necessarily the machine you have now — a driver update, a closed game, or a
+/// smaller model all make the GPU worth another try, and before this the only
+/// way back was deleting a file by hand.
+#[tauri::command]
+pub fn reset_gpu_layer_cap() {
+    crate::inference::llama::clear_gpu_cap();
 }
 
 /// Write `content` to `path` (used by conversation export after a save dialog).
@@ -357,11 +454,11 @@ fn main_gguf_in_dir(dir: &std::path::Path) -> Option<PathBuf> {
         .ok()?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |x| x.eq_ignore_ascii_case("gguf")))
+        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("gguf")))
         .filter(|p| {
             !p.file_name()
                 .and_then(|s| s.to_str())
-                .map_or(false, |n| n.to_lowercase().contains("mmproj"))
+                .is_some_and(|n| n.to_lowercase().contains("mmproj"))
         })
         .collect();
     candidates.sort_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0));
@@ -408,11 +505,11 @@ fn loose_main_ggufs(dir: &std::path::Path) -> Vec<PathBuf> {
         .map(|e| e.path())
         .filter(|p| {
             p.is_file()
-                && p.extension().map_or(false, |x| x.eq_ignore_ascii_case("gguf"))
+                && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
                 && !p
                     .file_name()
                     .and_then(|s| s.to_str())
-                    .map_or(false, |n| n.to_lowercase().contains("mmproj"))
+                    .is_some_and(|n| n.to_lowercase().contains("mmproj"))
         })
         .collect()
 }
@@ -438,7 +535,7 @@ pub fn migrate_or_prompt_models(app: &tauri::AppHandle) {
 
     // Already past the one-time gate (or no app-data dir) → keep the existing
     // silent behavior.
-    if marker.as_ref().map_or(true, |m| m.exists()) {
+    if marker.as_ref().is_none_or(|m| m.exists()) {
         migrate_models_layout(app);
         return;
     }
@@ -498,11 +595,11 @@ fn migrate_models_dir(dir: &std::path::Path) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     let entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
     let is_gguf =
-        |p: &PathBuf| p.extension().map_or(false, |x| x.eq_ignore_ascii_case("gguf"));
+        |p: &PathBuf| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("gguf"));
     let is_mmproj = |p: &PathBuf| {
         p.file_name()
             .and_then(|s| s.to_str())
-            .map_or(false, |n| n.to_lowercase().contains("mmproj"))
+            .is_some_and(|n| n.to_lowercase().contains("mmproj"))
     };
 
     // Pass 1: loose main GGUFs → their own folders.
@@ -675,7 +772,7 @@ fn dir_has_models(dir: &std::path::Path) -> bool {
             for e in sub.flatten() {
                 let p = e.path();
                 if p.is_file()
-                    && p.extension().map_or(false, |x| x.eq_ignore_ascii_case("gguf"))
+                    && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
                 {
                     return true;
                 }
@@ -753,12 +850,14 @@ pub fn open_html_report(
         .map_err(|e| e.to_string())?
         .join(subdir);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let path = dir.join(format!("{stem}-{ts}.html"));
-    std::fs::write(&path, html).map_err(|e| crate::agent::localize_mixed(&format!("写入文件失败 (failed to write file): {e}")))?;
+    // Name the file after its content, not the clock: opening the same canvas
+    // twice used to leave a second timestamped copy in the folder every time.
+    let path = dir.join(format!("{stem}-{}.html", content_name(html.as_bytes())));
+    if !path.exists() {
+        std::fs::write(&path, html)
+            .map_err(|e| crate::agent::localize_mixed(&format!("写入文件失败 (failed to write file): {e}")))?;
+        prune_exports(&dir, "html", 60);
+    }
     let p = path.to_string_lossy().to_string();
     open_default(&p)?;
     Ok(p)
@@ -779,11 +878,26 @@ fn canvas_sessions_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 /// Keep the newest `keep` session files; delete the rest. Sorted by mtime.
+/// Stable file name for a document's content, so the same page always maps to
+/// the same file. Not cryptographic and not stable across toolchains — the
+/// worst a changed hash can do is write one extra copy.
+fn content_name(bytes: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 fn prune_canvas_sessions(dir: &Path, keep: usize) {
+    prune_exports(dir, "json", keep)
+}
+
+/// Keep the newest `keep` files of one extension, delete the rest.
+fn prune_exports(dir: &Path, ext: &str, keep: usize) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
         .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter(|e| e.path().extension().is_some_and(|x| x == ext))
         .filter_map(|e| {
             let m = e.metadata().ok()?.modified().ok()?;
             Some((m, e.path()))
@@ -850,7 +964,7 @@ pub fn list_models(app: tauri::AppHandle) -> Result<Vec<ModelEntry>, String> {
     let is_mmproj = |p: &PathBuf| {
         p.file_name()
             .and_then(|s| s.to_str())
-            .map_or(false, |n| n.to_lowercase().contains("mmproj"))
+            .is_some_and(|n| n.to_lowercase().contains("mmproj"))
     };
     // Multi-part GGUFs: only the first shard is loadable (llama.cpp pulls in
     // the rest); later shards must not show up as their own models.
@@ -872,7 +986,7 @@ pub fn list_models(app: tauri::AppHandle) -> Result<Vec<ModelEntry>, String> {
     let push = |path: PathBuf, out: &mut Vec<ModelEntry>, seen: &mut HashSet<PathBuf>| {
         if !path
             .extension()
-            .map_or(false, |x| x.eq_ignore_ascii_case("gguf"))
+            .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
             || is_mmproj(&path)
         {
             return;
@@ -958,7 +1072,7 @@ pub fn list_models(app: tauri::AppHandle) -> Result<Vec<ModelEntry>, String> {
             }
         }
     }
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|a| a.name.to_lowercase());
     Ok(out)
 }
 
@@ -986,7 +1100,7 @@ pub async fn delete_model_file(
             .map_err(|e| crate::agent::localize_mixed(&format!("文件夹不存在 (folder not found): {e}")))?;
         let in_models = model_dirs(&app)
             .iter()
-            .any(|d| d.canonicalize().map_or(false, |dc| canon.starts_with(&dc)));
+            .any(|d| d.canonicalize().is_ok_and(|dc| canon.starts_with(&dc)));
         if !in_models {
             return Err(
                 "该文件夹不在模型文件夹内，已拒绝删除 (folder is outside the models folder; refusing to delete)"
@@ -1009,7 +1123,7 @@ pub async fn delete_model_file(
     }
     if !target
         .extension()
-        .map_or(false, |x| x.eq_ignore_ascii_case("gguf"))
+        .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
     {
         return Err(crate::agent::localize_mixed("只能删除 .gguf 模型文件 (only .gguf model files can be deleted)"));
     }
@@ -1018,7 +1132,7 @@ pub async fn delete_model_file(
         .map_err(|e| crate::agent::localize_mixed(&format!("文件不存在 (file not found): {e}")))?;
     let in_models = model_dirs(&app)
         .iter()
-        .any(|d| d.canonicalize().map_or(false, |dc| canon.starts_with(&dc)));
+        .any(|d| d.canonicalize().is_ok_and(|dc| canon.starts_with(&dc)));
     if !in_models {
         return Err(
             "该文件不在模型文件夹内，已拒绝删除 (file is outside the models folder; refusing to delete)"
@@ -1041,10 +1155,10 @@ pub async fn delete_model_file(
     // sitting directly in a models root is deleted alone (plus its paired
     // mmproj when nothing else would use it).
     let parent = canon.parent().map(PathBuf::from);
-    let parent_is_models_root = parent.as_ref().map_or(true, |p| {
+    let parent_is_models_root = parent.as_ref().is_none_or(|p| {
         model_dirs(&app)
             .iter()
-            .any(|d| d.canonicalize().map_or(false, |dc| dc == *p))
+            .any(|d| d.canonicalize().is_ok_and(|dc| dc == *p))
     });
     if parent_is_models_root {
         let mmproj = crate::inference::llama::find_mmproj(&canon.to_string_lossy());
@@ -1152,11 +1266,116 @@ pub fn set_tray_language(app: tauri::AppHandle, lang: String) -> Result<(), Stri
     Ok(())
 }
 
+/// Is the reply this request asks for already being generated?
+///
+/// The same turn can arrive twice: a page reload replays the request that was
+/// in flight when the page went away, so the interface issues one call and the
+/// command runs a second time for the same message.
+fn turn_already_running(state: &AppState, to: &SaveTarget) -> bool {
+    state.live.lock().ok().is_some_and(|l| {
+        l.as_ref()
+            .is_some_and(|t| t.conversation_id == to.conversation_id && t.message_id == to.message_id)
+    })
+}
+
+/// Hold a streaming reply in the app instead of in the page that asked for it.
+///
+/// A turn can outlive its window: the webview is replaced mid-generation and
+/// every send after that goes nowhere. Three things follow, and this handles
+/// all three. The send failure is dropped rather than returned, so generation
+/// is never stopped by the absence of a listener. The text is accumulated in
+/// the app, so the answer exists somewhere other than a page that may be gone.
+/// And the listener is a slot rather than a fixed channel, so a page that
+/// arrives later can take over and watch the rest of the reply arrive live.
+fn live_sink(
+    state: &AppState,
+    to: SaveTarget,
+    onward: Channel<StreamEvent>,
+) -> (Channel<StreamEvent>, std::sync::Arc<std::sync::Mutex<String>>, u64) {
+    static TURN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = TURN_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let text = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let listener = std::sync::Arc::new(std::sync::Mutex::new(Some(onward)));
+    if let Ok(mut live) = state.live.lock() {
+        *live = Some(crate::state::LiveTurn {
+            id,
+            conversation_id: to.conversation_id.clone(),
+            message_id: to.message_id.clone(),
+            text: text.clone(),
+            listener: listener.clone(),
+        });
+    }
+    let kept = text.clone();
+    let sink = Channel::new(move |body: tauri::ipc::InvokeResponseBody| {
+        let tauri::ipc::InvokeResponseBody::Json(raw) = &body else { return Ok(()) };
+        let Ok(ev) = serde_json::from_str::<StreamEvent>(raw) else { return Ok(()) };
+        if let StreamEvent::Token { text: piece } = &ev {
+            if let Ok(mut acc) = text.lock() {
+                acc.push_str(piece);
+            }
+        }
+        // Onward to whoever is listening now. Nobody may be, and that is not
+        // this function's problem.
+        if let Ok(l) = listener.lock() {
+            if let Some(ch) = l.as_ref() {
+                let _ = ch.send(ev);
+            }
+        }
+        Ok(())
+    });
+    (sink, kept, id)
+}
+
+/// What a page that has just loaded needs in order to rejoin a turn already
+/// in flight: where it belongs, and everything generated so far.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveTurnInfo {
+    pub conversation_id: String,
+    pub message_id: String,
+    /// The reply as it stands. The page renders this, then receives the rest.
+    pub text: String,
+}
+
+/// Take over receiving an in-flight turn.
+///
+/// Called by every page as it comes up. Normally there is nothing in flight
+/// and this answers `None`. After the webview was replaced mid-generation
+/// there is: the app kept generating, and the new page is handed the text so
+/// far and becomes the listener for the rest — so the answer keeps streaming
+/// into the conversation it belongs to instead of the user losing it.
+#[tauri::command]
+pub fn attach_generation(
+    state: State<'_, AppState>,
+    on_event: Channel<StreamEvent>,
+) -> Option<LiveTurnInfo> {
+    attach_to_live(&state, on_event)
+}
+
+/// The body of [`attach_generation`], reachable without a Tauri app.
+fn attach_to_live(state: &AppState, on_event: Channel<StreamEvent>) -> Option<LiveTurnInfo> {
+    let live = state.live.lock().ok()?;
+    let turn = live.as_ref()?;
+    let text = turn.text.lock().map(|t| t.clone()).unwrap_or_default();
+    if let Ok(mut l) = turn.listener.lock() {
+        *l = Some(on_event);
+    }
+    Some(LiveTurnInfo {
+        conversation_id: turn.conversation_id.clone(),
+        message_id: turn.message_id.clone(),
+        text,
+    })
+}
+
 /// Stream a completion. Tokens arrive on `on_event` as [`StreamEvent`]s.
 #[tauri::command]
 pub async fn generate(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     request: GenRequest,
+    // `save` says where the reply belongs. Given it, the app owns the turn: it
+    // survives the page, and a page that comes back picks the stream up again.
+    save: Option<SaveTarget>,
     on_event: Channel<StreamEvent>,
 ) -> Result<(), String> {
     let Some(backend) = state.backend().await else {
@@ -1172,9 +1391,56 @@ pub async fn generate(
     state.cancel.store(false, Ordering::SeqCst);
     let cancel = state.cancel.clone();
 
-    backend
-        .generate(request, on_event.clone(), cancel)
-        .await
+    // When the caller says where the reply belongs, the app holds on to it —
+    // so a turn that finishes after its page is gone is not lost with it.
+    // The same turn can arrive twice. A page reload replays the request that
+    // was in flight when the page went away — the interface issued ONE call and
+    // this command runs a second time for the same message — and starting a
+    // second generation for one reply is not a duplicate that cancels out: two
+    // generations run at once on one model, the newcomer takes the slot with
+    // nothing in it, and the answer the user was watching is replaced by one
+    // starting over from the beginning. The turn already running IS this turn.
+    if save.as_ref().is_some_and(|to| turn_already_running(&state, to)) {
+        return Ok(());
+    }
+
+    // `mine` is this turn's own copy of the text. Reading it back out of the
+    // shared slot would be wrong: turns overlap, and one that finishes after
+    // another has started would find the newcomer's empty text there.
+    let (sink, mine, turn_id) = match save.clone() {
+        Some(to) => {
+            let (s, t, id) = live_sink(&state, to, on_event.clone());
+            (s, Some(t), Some(id))
+        }
+        None => (on_event.clone(), None, None),
+    };
+
+    let outcome = backend.generate(request, sink, cancel).await;
+
+    // The turn is over, however it ended. Write the reply down and let go of
+    // it — a page that was replaced mid-generation finds it in the
+    // conversation, complete, instead of finding nothing.
+    if let (Some(to), Some(mine)) = (save, mine) {
+        let text = mine.lock().map(|t| t.clone()).unwrap_or_default();
+        if !text.trim().is_empty() {
+            let _ = crate::store::save_message(
+                app.state(),
+                to.message_id,
+                to.conversation_id,
+                "assistant".into(),
+                text,
+                None,
+            );
+        }
+        // Let go of the slot only if it is still this turn's.
+        if let Ok(mut l) = state.live.lock() {
+            if l.as_ref().is_some_and(|t| Some(t.id) == turn_id) {
+                *l = None;
+            }
+        }
+    }
+
+    outcome
         .map_err(|e| {
             let msg = crate::agent::localize_mixed(&format!("{e:#}"));
             let _ = on_event.send(StreamEvent::Error {
@@ -1227,6 +1493,7 @@ pub async fn vision_query(
         messages: vec![crate::inference::ChatMessage {
             role: crate::inference::Role::User,
             content: prompt,
+            reasoning_content: None,
             images,
         }],
         params: crate::inference::GenParams {
@@ -1286,7 +1553,9 @@ pub async fn transcribe(
     app: tauri::AppHandle,
     audio: String,
     sample_rate: u32,
+    multilingual: Option<bool>,
 ) -> Result<String, String> {
+    let _ = multilingual; // Chinese multilingual Whisper is not wired in this fork.
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(audio.as_bytes())
         .map_err(|e| e.to_string())?;
@@ -1318,7 +1587,10 @@ pub async fn synthesize(
     text: String,
     speed: Option<f32>,
     sid: Option<i32>,
+    sid_zh: Option<i32>,
+    chinese_enabled: Option<bool>,
 ) -> Result<SynthAudio, String> {
+    let _ = (sid_zh, chinese_enabled);
     let dir = voice_models_dir(&app)?;
     let (samples, sample_rate) =
         crate::voice::synthesize(dir, text, speed.unwrap_or(1.0), sid.unwrap_or(0))
@@ -1358,6 +1630,178 @@ pub async fn synthesize_edge(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    /// The startup reload the macOS setup issues (and the burst around it)
+    /// must not be reported: it lands in the same second the process starts,
+    /// and reporting it put two false entries in the log on every launch —
+    /// which is exactly the noise that makes a real one unreadable.
+    /// Nobody listening is not a reason to stop generating.
+    ///
+    /// The llama.cpp sink returned the send failure, so the first token after
+    /// the page went away ended the turn. A reply the user was waiting for
+    /// died because the window it was headed for had been replaced.
+    #[test]
+    fn a_dead_listener_does_not_stop_generation() {
+        use crate::inference::llama::EventSink;
+        use super::{Channel, StreamEvent};
+        let dead: Channel<StreamEvent> = Channel::new(|_| Err(tauri::Error::WebviewNotFound));
+        dead.emit(StreamEvent::Token { text: "x".into() })
+            .expect("a send to a page that is gone must not end the turn");
+    }
+
+    /// One reply, one generation — however many times the request arrives.
+    ///
+    /// The regression, caught on a live run: a page reload replays the request
+    /// that was in flight when the page went away. The interface had issued a
+    /// single call; the command ran twice for the same message. Two
+    /// generations then ran at once on one model, and the second — with
+    /// nothing in it yet — took the slot, so the page that came back attached
+    /// to the empty one and watched a reply start over from the beginning
+    /// while the real one carried on unseen.
+    #[test]
+    fn the_same_turn_arriving_twice_starts_one_generation() {
+        use super::{AppState, Channel, SaveTarget, StreamEvent};
+        let state = AppState::default();
+        let to = SaveTarget {
+            conversation_id: "c1".into(),
+            message_id: "m1".into(),
+        };
+        assert!(!super::turn_already_running(&state, &to), "nothing is running yet");
+
+        let dead: Channel<StreamEvent> = Channel::new(|_| Ok(()));
+        let (sink, _text, _id) = super::live_sink(&state, to.clone(), dead);
+        sink.send(StreamEvent::Token { text: "1\n2\n".into() }).unwrap();
+
+        // The replay: same conversation, same message.
+        assert!(
+            super::turn_already_running(&state, &to),
+            "a second call for the same reply must not start a second generation"
+        );
+        // A different reply in the same conversation is a real turn of its own.
+        assert!(
+            !super::turn_already_running(
+                &state,
+                &SaveTarget { conversation_id: "c1".into(), message_id: "m2".into() }
+            ),
+            "a different message is a different turn"
+        );
+    }
+
+    /// A turn belongs to the app, not to the page that asked for it.
+    ///
+    /// The regression: the webview can be replaced mid-generation. Every send
+    /// after that fails; the first failure used to abort the turn, and the
+    /// answer — minutes of it — existed nowhere but the page that had just
+    /// been thrown away. Now generation carries on with nobody listening, and
+    /// the page that comes up next is handed what it missed and receives the
+    /// rest live.
+    #[test]
+    fn a_turn_survives_its_page_and_is_handed_to_the_next_one() {
+        use super::{AppState, Channel, SaveTarget, StreamEvent};
+        use std::sync::{Arc, Mutex};
+        let state = AppState::default();
+
+        // The page that asked is already gone: every forward fails.
+        let dead: Channel<StreamEvent> = Channel::new(|_| Err(tauri::Error::WebviewNotFound));
+        let (sink, _text, _id) = super::live_sink(
+            &state,
+            SaveTarget {
+                conversation_id: "c1".into(),
+                message_id: "m1".into(),
+            },
+            dead,
+        );
+
+        for piece in ["海边", "的"] {
+            sink.send(StreamEvent::Token { text: piece.into() })
+                .expect("a listener that has gone away must not fail the send");
+        }
+
+        // A new page comes up and takes over.
+        let heard: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let ear = heard.clone();
+        let fresh: Channel<StreamEvent> = Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(raw) = body {
+                if let Ok(StreamEvent::Token { text }) = serde_json::from_str::<StreamEvent>(&raw) {
+                    ear.lock().unwrap().push_str(&text);
+                }
+            }
+            Ok(())
+        });
+        let info = super::attach_to_live(&state, fresh).expect("a turn was in flight");
+        assert_eq!(info.conversation_id, "c1");
+        assert_eq!(info.message_id, "m1");
+        assert_eq!(info.text, "海边的", "handed everything generated before it arrived");
+
+        // ...and receives the rest as it is produced.
+        sink.send(StreamEvent::Token { text: "清晨".into() }).unwrap();
+        assert_eq!(&*heard.lock().unwrap(), "清晨", "the rest streams to the new page");
+
+        // The whole reply is there to be written down when the turn ends.
+        let all = state
+            .live
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|t| t.text.lock().unwrap().clone())
+            .unwrap_or_default();
+        assert_eq!(all, "海边的清晨");
+    }
+
+    #[test]
+    fn a_reload_is_reported_only_when_it_replaced_a_live_page() {
+        // First load of the process — nothing was replaced.
+        assert!(!super::reload_is_notable(None));
+        // The startup burst: the owner's log shows these in the same second.
+        assert!(!super::reload_is_notable(Some(Duration::from_millis(0))));
+        assert!(!super::reload_is_notable(Some(Duration::from_secs(1))));
+        assert!(!super::reload_is_notable(Some(Duration::from_secs(19))));
+        // A renderer killed under a running session: the page it replaced had
+        // been up for as long as the work was.
+        assert!(super::reload_is_notable(Some(Duration::from_secs(20))));
+        assert!(super::reload_is_notable(Some(Duration::from_secs(45 * 60))));
+    }
+
+    /// The same document always names the same file, a different one does not:
+    /// this is what stops "open in browser" from dropping another copy in the
+    /// folder on every click.
+    #[test]
+    fn export_name_follows_content_not_the_clock() {
+        let a = super::content_name(b"<html>one</html>");
+        let b = super::content_name(b"<html>one</html>");
+        let c = super::content_name(b"<html>two</html>");
+        assert_eq!(a, b, "same content must reuse the same file name");
+        assert_ne!(a, c, "a different variant needs its own file");
+        assert_eq!(a.len(), 16, "name is a fixed-width hex digest");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "name must be path-safe: {a}");
+    }
+
+    /// Session pruning keeps the NEWEST files and never deletes below the cap.
+    #[test]
+    fn canvas_session_prune_keeps_newest() {
+        let tmp = std::env::temp_dir().join(format!("chaty-cv-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        for i in 0..5 {
+            std::fs::write(tmp.join(format!("{i:02x}.json")), "{}").unwrap();
+            // Distinct mtimes, oldest first (APFS keeps sub-second precision).
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        super::prune_canvas_sessions(&tmp, 3);
+        let mut left: Vec<String> = std::fs::read_dir(&tmp)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["02.json", "03.json", "04.json"], "newest three survive");
+        // Below the cap: untouched.
+        super::prune_canvas_sessions(&tmp, 10);
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 3);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn folder_resolves_to_main_gguf() {
         let tmp = std::env::temp_dir().join(format!("chaty-folder-load-{}", std::process::id()));
@@ -1394,30 +1838,6 @@ mod tests {
         let g2 = super::MonotonicProgress::new();
         assert!(g2.permit(7.0));
         assert!(!g2.permit(0.99));
-    }
-
-    /// Session pruning keeps the NEWEST files and never deletes below the cap.
-    #[test]
-    fn canvas_session_prune_keeps_newest() {
-        let tmp = std::env::temp_dir().join(format!("chaty-cv-prune-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        for i in 0..5 {
-            std::fs::write(tmp.join(format!("{i:02x}.json")), "{}").unwrap();
-            // Distinct mtimes, oldest first (APFS keeps sub-second precision).
-            std::thread::sleep(std::time::Duration::from_millis(15));
-        }
-        super::prune_canvas_sessions(&tmp, 3);
-        let mut left: Vec<String> = std::fs::read_dir(&tmp)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
-        left.sort();
-        assert_eq!(left, vec!["02.json", "03.json", "04.json"], "newest three survive");
-        super::prune_canvas_sessions(&tmp, 10);
-        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 3);
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     use super::{loose_main_ggufs, migrate_models_dir};

@@ -1,6 +1,6 @@
 [package]
 name = "chaty"
-version = "2.2.0"
+version = "2.3.0"
 # Two binaries live here (the app + the bench/headless tool server) — `cargo
 # run`, which `tauri dev` invokes, needs to know the app is the default.
 autobins = false
@@ -55,7 +55,15 @@ anyhow = "1"
 chrono = "0.4"
 # Base llama.cpp binding (CPU). The GPU backend feature (vulkan/metal) is added
 # per-target by the `gpu-backend` shim when the `gpu` feature is on.
-llama-cpp-2 = { version = "0.1.150", features = ["sampler", "mtmd"] }
+#
+# Pinned to a git revision rather than the crates.io release: 0.1.154 is the
+# latest published version and its vendored llama.cpp predates
+# `LLM_ARCH_MUSE_GLIMMER`, so Muse-Glimmer GGUFs cannot load at all. The
+# crate's own main branch already tracks a llama.cpp that has it.
+# Fork of utilityai/llama-cpp-rs at 3d5f424 plus one commit: `load_mtp` and
+# `n_layer_nextn` were not reachable from the safe API, so the MTP draft
+# context the crate can already drive could never actually be built.
+llama-cpp-2 = { git = "https://github.com/Fangyuan025/llama-cpp-rs", rev = "6c00dd9f7b1de19420c392cd7eb092b365177fa4", features = ["sampler", "mtmd"] }
 chaty-gpu-backend = { path = "gpu-backend", optional = true }
 sysinfo = "0.32"
 encoding_rs = "0.8"

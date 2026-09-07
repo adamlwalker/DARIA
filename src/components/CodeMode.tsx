@@ -1,7 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { open } from "@tauri-apps/plugin-dialog";
 import { agentLang, useI18n } from "../lib/i18n";
+import { watchContentHeight } from "../lib/autoGrow";
+/** Matches `.cm-input` max-height. */
+const CM_COMPOSER_MAX_H = 200;
+import { effortLabel, intensityOf, thinkTabActive } from "../lib/effort";
 import { diffLines } from "../lib/diff";
 import { useConfirm } from "./ConfirmModal";
 import { BUILTIN_SKILLS } from "../lib/skills";
@@ -52,9 +56,11 @@ import {
   runAgentTurn,
   IS_WINDOWS,
   type PlanItem,
+  type StuckState,
   type ThinkMode,
   type ToolCall,
   type ToolStep,
+  replayableTail,
 } from "../lib/agentLoop";
 import { isReadOnlyCommand } from "../lib/readOnlyCmd";
 import { syncMcpServers } from "../lib/mcp";
@@ -71,6 +77,10 @@ interface CodeMsg {
   images?: string[];
   /** All attachments (docs + images) shown as chips in the user bubble. */
   attachments?: { name: string; kind: string; path?: string }[];
+  /** The exact message tail the turn ended with, as the model saw it — kept so
+   *  the NEXT turn continues from it verbatim. Only the newest assistant turn
+   *  holds one; older turns drop it, since only the tail is ever replayed. */
+  prompt?: ChatMessage[];
   /** Reasoning shown before the final answer (collapsible). */
   thinking?: string;
   /** Live reasoning streaming for the in-flight step. */
@@ -87,11 +97,9 @@ interface CodeMsg {
 }
 
 const THINK_MODES: ThinkMode[] = ["off", "normal", "deep"];
-/** Models with a native effort ladder (Qwen3.8) show the model's own rungs
- *  instead of Chaty's generic intensities — off still means enable_thinking
- *  false, which the ladder itself has no rung for. */
-const NATIVE_THINK_MODES: ThinkMode[] = ["off", "low", "normal", "deep"];
-/** thinkMode → the native rung it requests. */
+/** thinkMode → the native rung it maps onto, for a model whose ladder happens
+ *  to carry those names. Only a starting point now: a model with its own
+ *  ladder shows that ladder, however many rungs it has. */
 const EFFORT_OF: Partial<Record<ThinkMode, string>> = {
   low: "low",
   normal: "medium",
@@ -253,6 +261,10 @@ function StepCard({ step, onPreview }: { step: ToolStep; onPreview?: (path: stri
   // Compute the diff once; the +N/−M badge uses the EXACT totals, never the
   // render-capped rows, so big edits are counted correctly.
   const d = useMemo(() => (diff ? diffLines(diff.before, diff.after) : null), [diff]);
+  // Exact totals when the contents were capped for the card; otherwise the
+  // ones just computed, which are exact anyway.
+  const added = step.diffCounts?.added ?? d?.added ?? 0;
+  const removed = step.diffCounts?.removed ?? d?.removed ?? 0;
   // Clicking an image step opens the preview directly; otherwise toggle the body.
   const onHead = () => {
     if (hasImage && step.image) onPreview?.(step.image);
@@ -267,8 +279,8 @@ function StepCard({ step, onPreview }: { step: ToolStep; onPreview?: (path: stri
         <span className="cm-step-sum">{toolSummary(step.call)}</span>
         {d && step.status === "done" && (
           <span className="cm-step-diffstat">
-            <em className="plus">+{d.added}</em>
-            <em className="minus">-{d.removed}</em>
+            <em className="plus">+{added}</em>
+            <em className="minus">-{removed}</em>
           </span>
         )}
         {hasImage && <span className="cm-step-meta muted">{t("cmClickPreview")}</span>}
@@ -294,7 +306,7 @@ function StepCard({ step, onPreview }: { step: ToolStep; onPreview?: (path: stri
               ))}
               {d.truncated && (
                 <div className="cm-dl ctx cm-dl-more">
-                  {t("cmDiffMore").replace("{n}", String(d.added + d.removed))}
+                  {t("cmDiffMore").replace("{n}", String(added + removed))}
                 </div>
               )}
             </pre>
@@ -308,8 +320,21 @@ function StepCard({ step, onPreview }: { step: ToolStep; onPreview?: (path: stri
 }
 
 /** Collapsible reasoning panel. Streams open while `live`; collapsed once done. */
+/** Marks a code run as in flight so an interrupted one can be reported. */
+const RUN_INFLIGHT_KEY = "chaty.code.runInflight";
+
 function ThinkPanel({ text, live, label }: { text: string; live?: boolean; label: string }) {
   const [open, setOpen] = useState(false);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  // Focus-follows-generation, as chat mode has had: while reasoning streams,
+  // hold a short window pinned to the newest line and fade what is above it.
+  // Code mode let the whole trace grow instead, so a long think pushed the
+  // steps below it off the screen and the newest words were wherever the page
+  // happened to be scrolled. Opening it by hand releases the window.
+  const focus = !!live && !open;
+  useEffect(() => {
+    if (focus && bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
+  }, [text, focus]);
   if (!text) return null;
   return (
     <div className={`cm-think ${live ? "live" : ""}`}>
@@ -320,7 +345,11 @@ function ThinkPanel({ text, live, label }: { text: string; live?: boolean; label
           <Icon name="chevron-right" size={11} strokeWidth={2} />
         </span>
       </button>
-      {(open || live) && <div className="cm-think-body">{text}</div>}
+      {(open || live) && (
+        <div ref={bodyRef} className={`cm-think-body ${focus ? "focus" : ""}`}>
+          {text}
+        </div>
+      )}
     </div>
   );
 }
@@ -489,6 +518,7 @@ export function CodeMode({
   active,
   maxSteps,
   bashTimeout,
+  ragTopK,
   temperature,
   thinkBudget = 0,
   maxGenTokens = 0,
@@ -507,6 +537,8 @@ export function CodeMode({
   autoTitle?: boolean;
   /** Max agent steps per turn (Settings → Code). */
   maxSteps?: number;
+  /** Knowledge-base excerpts `search_docs` may return. */
+  ragTopK?: number;
   /** Default bash timeout in seconds (Settings → Code). */
   bashTimeout?: number;
   /** Sampling temperature for agent steps (Settings → Code). */
@@ -539,6 +571,16 @@ export function CodeMode({
   const [workspace, setWorkspace] = useState<string | null>(null);
   const [msgs, setMsgs] = useState<CodeMsg[]>([]);
   const [input, setInput] = useState("");
+  /** The composer follows its content — see `watchContentHeight`. Without it a
+   *  one-row textarea keeps a single line's height and scrolls the rest, which
+   *  at a larger UI scale is the placeholder itself. */
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  useLayoutEffect(() => {
+    const el = inputRef.current;
+    const row = el?.parentElement;
+    if (!el || !row) return;
+    return watchContentHeight(el, row, CM_COMPOSER_MAX_H);
+  }, [input]);
   // Files the user attached to the next Code turn — same as chat: documents
   // (PDF/Word/Excel/text/code, extracted to text), and images (vision models
   // see the pixels; text-only models get OCR text).
@@ -550,11 +592,34 @@ export function CodeMode({
   const [bypass, setBypass] = useState(false);
   /** The model exposes a native reasoning-effort ladder (Qwen3.8) — the think
    *  switch then shows the model's own rungs instead of Chaty's intensities. */
-  const nativeEffort = (model?.effortLevels?.length ?? 0) > 0;
+  const effortLevels = useMemo(() => model?.effortLevels ?? [], [model?.effortLevels]);
+  const nativeEffort = effortLevels.length > 0;
+  /** Set when a turn pauses on a loop the model could not get out of; consumed
+   *  by the next turn so "Continue" picks the escape up where it stopped. */
+  const stuckRef = useRef<StuckState | null>(null);
   const [thinkMode, setThinkMode] = useState<ThinkMode>(() => {
     const v = localStorage.getItem("chaty.code.think");
     return v === "off" || v === "low" || v === "normal" || v === "deep" ? v : "normal";
   });
+  /** The rung chosen on the model's own ladder. Kept apart from `thinkMode`
+   *  because that is Chaty's intensity, which also survives models with no
+   *  ladder at all. */
+  const [codeEffort, setCodeEffort] = useState<string>(() => {
+    try {
+      return localStorage.getItem("chaty.code.effort") || "";
+    } catch {
+      return "";
+    }
+  });
+  /** The rung to show as chosen: the stored one while this model still offers
+   *  it, otherwise whatever Chaty's current intensity maps onto, otherwise the
+   *  ladder's second rung — which is where the old three-rung default sat. */
+  const rung = useMemo(() => {
+    if (effortLevels.includes(codeEffort)) return codeEffort;
+    const mapped = EFFORT_OF[thinkMode];
+    if (mapped && effortLevels.includes(mapped)) return mapped;
+    return effortLevels[Math.min(1, effortLevels.length - 1)] ?? "";
+  }, [effortLevels, codeEffort, thinkMode]);
   const [approval, setApproval] = useState<{ call: ToolCall; resolve: (ok: boolean) => void } | null>(null);
   /** Out-of-workspace access request from the agent (grant persists this session). */
   const [dirAsk, setDirAsk] = useState<{ dir: string; resolve: (ok: boolean) => void } | null>(null);
@@ -591,6 +656,18 @@ export function CodeMode({
   const [downloads, setDownloads] = useState<AgentDlInfo[]>([]);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const signalRef = useRef<AgentSignal | null>(null);
+  // Left behind when a run does not reach its own cleanup — i.e. the page went
+  // away underneath it. Reported once on the next mount, then cleared.
+  useEffect(() => {
+    if (!localStorage.getItem(RUN_INFLIGHT_KEY)) return;
+    localStorage.removeItem(RUN_INFLIGHT_KEY);
+    setMsgs((cur) =>
+      cur.length
+        ? [...cur, { id: uid(), role: "assistant" as const, text: t("cmRunInterrupted"), steps: [] }]
+        : cur,
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const bodyRef = useRef({ msgs, workspace, sid });
   bodyRef.current = { msgs, workspace, sid };
@@ -1210,22 +1287,45 @@ export function CodeMode({
         : undefined,
     };
     const asst: CodeMsg = { id: uid(), role: "assistant", text: "", steps: [] };
-    // Cross-turn history keeps only the text, but assistant turns carry a
-    // compact record of the tools they ran — so "continue" resumes from the
-    // actual progress instead of re-exploring the workspace from scratch.
-    const history: ChatMessage[] = msgs.map((m) => {
-      if (m.role !== "assistant" || m.steps.length === 0) return { role: m.role, content: m.text };
-      const done = m.steps
-        .filter((s) => s.status === "done")
-        .map((s) => toolSummary(s.call))
-        .join("; ");
-      const prefix = done ? (lang === "zh" ? `(已执行:${done})\n` : `(tools run: ${done})\n`) : "";
-      return { role: m.role, content: prefix + m.text };
-    });
+    // The previous turn hands back exactly what it sent, so this one continues
+    // from it instead of from a summary. Replaying that tail is what keeps the
+    // model's own work in front of it — a follow-up used to arrive with the
+    // tool results gone and only "(tools run: read_file, bash)" in their place,
+    // so the model re-read files it had just read, and the prompt could not
+    // extend the previous one either. The tail is only the truth while it is
+    // still the end of the conversation: anything edited or deleted after it
+    // falls back to the text record.
+    // The newest turn that recorded a tail. Locally-injected assistant text
+    // (/help) can sit after it without invalidating anything; a USER message
+    // after it cannot, because a turn that answered one would have recorded a
+    // tail of its own — so seeing one means this record is not the truth.
+    const replay = replayableTail(msgs);
+    const history: ChatMessage[] =
+      replay ??
+      msgs.map((m) => {
+        if (m.role !== "assistant" || m.steps.length === 0)
+          return { role: m.role, content: m.text };
+        const done = m.steps
+          .filter((s) => s.status === "done")
+          .map((s) => toolSummary(s.call))
+          .join("; ");
+        const prefix = done
+          ? lang === "zh"
+            ? `(已执行:${done})\n`
+            : `(tools run: ${done})\n`
+          : "";
+        return { role: m.role, content: prefix + m.text };
+      });
     const base = [...msgs, userMsg, asst];
     const isFirstTurn = msgs.length === 0;
     setMsgs(base);
     setRunning(true);
+    // A run in flight, recorded outside React state. The webview reloads on its
+    // own sometimes and takes the turn with it; without this the session simply
+    // reappeared idle and there was nothing to say what had happened.
+    localStorage.setItem(RUN_INFLIGHT_KEY, String(Date.now()));
+    const resumeFrom = stuckRef.current;
+    stuckRef.current = null;
     setStats(null);
     // The session this turn belongs to — if the user deletes it mid-run the
     // live sid moves on, and the turn's results must not be written anywhere.
@@ -1247,9 +1347,11 @@ export function CodeMode({
     const modelInput = attachCtx ? `${attachCtx}\n\n${text}` : text;
     await runAgentTurn(modelInput, history, workspace, agentLang(lang), {
       thinkMode,
+      // Consumed once: this turn resumes the escape, the one after it starts clean.
+      resume: resumeFrom ?? undefined,
       supportsThinking: model.supportsThinking,
       thinkSwitch: model.thinkSwitch,
-      effort: nativeEffort ? EFFORT_OF[thinkMode] : undefined,
+      effort: nativeEffort && thinkMode !== "off" ? rung : undefined,
       nCtx: model.nCtx ?? undefined,
       maxSteps,
       temperature,
@@ -1260,6 +1362,17 @@ export function CodeMode({
       skills,
       memoryIndex,
       visionReady: model.visionReady,
+      // Both engines keep an already-encoded image whose identity still
+      // prefixes the new prompt, so dropping a stale screenshot only costs.
+      // They differ in HOW pixels are fed: llama.cpp takes one chunk per tile,
+      // MLX takes each picture's span in a single pass, and that is what
+      // decides how many tiles a tall page may send.
+      mediaPrefixReuse: true,
+      mediaChunked: model.backend === "llama.cpp",
+      multiImage: model.multiImage !== false,
+      ragTopK,
+      toolRole: model.toolRole ?? false,
+      reasoningField: model.reasoningField ?? false,
       // No vision encoder → still expose the browser suite, minus the two
       // screenshot tools: browser_read's digest is the model's eyes.
       // (ChatyWeb-Bench: 22/23 web tasks on a text-only 35B-A3B in this mode.)
@@ -1337,18 +1450,36 @@ export function CodeMode({
         // not the whole transcript.
         persistSoon(turnSid);
       },
-      onFinal: (final, thinking, reason) =>
+      onFinal: (final, thinking, reason, stuck) => {
+        // What the turn was stuck on, so "Continue" resumes the escape instead
+        // of restarting it — see AgentOptions.resume.
+        stuckRef.current = reason === "steps" ? (stuck ?? null) : null;
         update((m) => ({
           ...m,
           text: final,
           thinking: thinking || m.thinking,
           liveThinking: "",
           paused: reason === "steps",
-        })),
+        }));
+      },
       onError: (msg) => update((m) => ({ ...m, text: (m.text ? m.text + "\n\n" : "") + `**${msg}**` })),
+      // Keep the tail on the newest assistant turn only — it is the only one
+      // ever replayed, and every earlier copy would be dead weight in the
+      // session file, which stores the whole transcript verbatim.
+      onTranscript: (tail) =>
+        setMsgs((cur) =>
+          cur.map((m) =>
+            m.id === asst.id
+              ? { ...m, prompt: tail }
+              : m.prompt
+                ? { ...m, prompt: undefined }
+                : m,
+          ),
+        ),
     });
 
     setRunning(false);
+    localStorage.removeItem(RUN_INFLIGHT_KEY);
     setApproval(null);
     setPrefill(null);
     // Persist only while this turn's session is still the active one — after
@@ -1493,31 +1624,42 @@ export function CodeMode({
             );
           })()}
           <div className="cm-think-switch" title={t(nativeEffort ? "effortHint" : "cmThinkHint")}>
-            {(nativeEffort ? NATIVE_THINK_MODES : THINK_MODES).map((mode) => (
-              <button
-                key={mode}
-                className={`cm-think-tab ${thinkMode === mode ? "active" : ""}`}
-                onClick={() => {
-                  setThinkMode(mode);
-                  localStorage.setItem("chaty.code.think", mode);
-                }}
-                disabled={running}
-              >
-                {t(
-                  mode === "off"
-                    ? "cmThinkOff"
+            {/* A model with its own ladder shows that ladder, whatever its
+                length; `off` is Chaty's, because a ladder has no rung for
+                not thinking at all. */}
+            {(nativeEffort ? ["off", ...effortLevels] : THINK_MODES).map((tab) => {
+              const active = thinkTabActive(tab, { nativeEffort, thinkMode, rung });
+              return (
+                <button
+                  key={tab}
+                  className={`cm-think-tab ${active ? "active" : ""}`}
+                  onClick={() => {
+                    if (tab === "off") {
+                      setThinkMode("off");
+                      localStorage.setItem("chaty.code.think", "off");
+                      return;
+                    }
+                    if (!nativeEffort) {
+                      setThinkMode(tab as ThinkMode);
+                      localStorage.setItem("chaty.code.think", tab);
+                      return;
+                    }
+                    const mode = intensityOf(effortLevels, tab);
+                    setCodeEffort(tab);
+                    setThinkMode(mode);
+                    localStorage.setItem("chaty.code.effort", tab);
+                    localStorage.setItem("chaty.code.think", mode);
+                  }}
+                  disabled={running}
+                >
+                  {tab === "off"
+                    ? t("cmThinkOff")
                     : nativeEffort
-                      ? mode === "low"
-                        ? "effortLow"
-                        : mode === "normal"
-                          ? "effortMedium"
-                          : "effortXhigh"
-                      : mode === "normal"
-                        ? "cmThinkNormal"
-                        : "cmThinkDeep",
-                )}
-              </button>
-            ))}
+                      ? effortLabel(tab, t)
+                      : t(tab === "normal" ? "cmThinkNormal" : "cmThinkDeep")}
+                </button>
+              );
+            })}
           </div>
           <button
             className={`cm-bypass ${bypass ? "on" : ""}`}
@@ -1746,6 +1888,7 @@ export function CodeMode({
               </div>
             )}
             <textarea
+              ref={inputRef}
               className="cm-input"
               placeholder={
                 !model

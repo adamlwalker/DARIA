@@ -40,7 +40,7 @@ DARIA is originally based on [Chaty](https://chaty.ca/) by [Fangyuan Lin](https:
 - 🔒 **Truly private** — every model, document, and conversation stays on your device. No sign-up, no server, nothing phoned home.
 - ⚡ **Native and fast** — a Rust + llama.cpp core with **Vulkan / Metal** GPU offload that auto-tunes to your hardware and falls back gracefully to CPU.
 - 🧰 **More than a chat box** — a coding agent, a knowledge base (RAG), Deep Research, on-device image generation, hands-free voice, and a self-healing Design Canvas — all offline.
-- 🧠 **Runs almost anything** — Llama 3, Gemma 3 / 4, Qwen 3 / 3.5 / 3.6, *any* GGUF from Hugging Face — and **MLX models natively on Apple Silicon** — plus **DARIA's own fine-tuned model**.
+- 🧠 **Runs almost anything** — Llama 3, Gemma 3 / 4, Qwen 3 / 3.5 / 3.6 / **3.8**, *any* GGUF from Hugging Face — and **MLX models natively on Apple Silicon** — plus **DARIA's own fine-tuned model**.
 - 💻 **Friendly to modest hardware** — a first-launch *“Set up for me”* picks a model sized to your RAM and downloads it in one click.
 
 <br />
@@ -64,7 +64,8 @@ itself — every step shown live, every change behind an approval + diff.
 
 - Reads **PDF / Word / Excel / PowerPoint** (scanned PDFs get OCR'd); `search_files` finds by name or content; file outlines navigate big files; failed patches get “did-you-mean” hints.
 - Browser automation is verified end-to-end against real sites, and can run in your real Chrome — watch it work, logins and all.
-- Built for local models: an **Off / Normal / Deep** reasoning switch, a **prompt-processing progress ring**, a context-usage ring with automatic compaction, whole-file reads sized to your context window, ranked `search_code` + knowledge-base `search_docs`, and loop-breaking for repetitive small models.
+- Built for local models: an **Off / Normal / Deep** reasoning switch (Qwen 3.8 uses its **native effort ladder** instead), a **prompt-processing progress ring**, a context-usage ring with automatic compaction, whole-file reads sized to your context window, ranked `search_code` + knowledge-base `search_docs`, and loop-breaking for repetitive small models.
+- **Long runs stay on the cache.** Tool results use the tool role (not a fake user message), the model's last answer is kept in the transcript, and per-turn details like the date ride on the current message — so Qwen 3.8 and friends resume ~99% of the prompt instead of re-reading the whole conversation every step.
 - Persistent sessions, project memory (**AGENTS.md**), custom **/skills**, and slash commands.
 - Tune it under **Settings → Code**: step limit, command timeout, step temperature, an auto-approve-edits toggle, a headless-browser toggle, and a command allowlist.
 - File access never leaves the folder you pick; out-of-workspace access asks per folder; a `sudo` command asks first with a secure password prompt; downloads land in the workspace and are covered by checkpoints too.
@@ -162,6 +163,7 @@ Apple Silicon only. Needs Python 3.10+ on the Mac for the one-time engine instal
 - **Any `.gguf` — or MLX folder** — tokenizer and chat template come from the model itself; first-class handling for Llama 3, Gemma 3 / 4, and Qwen 3 / 3.5 / 3.6.
 - **Adjustable context** that auto-fits the model's trained length to your memory and summarizes older turns near the limit; **safe model switching**.
 - **Sampling presets** under Settings — intent starters (Thinking, Chat, Default, Fast Mode) plus family recipes for Gemma, Qwen3, and LLaMA 3. Picking one fills temperature, top-p, top-k, and repeat penalty; the sliders stay editable. Length is left alone unless you pick Fast Mode (64 tokens). Reload the model so the next reply uses the new values.
+- **Speculative decoding** (Settings → Model, off by default) on checkpoints that ship their own prediction head. Same reply, fewer passes when the continuation is obvious.
 
 > **Offline-first.** The network is used only for optional web search, one-time model / image-engine downloads, and **Edge TTS** if you choose it for read-aloud.
 

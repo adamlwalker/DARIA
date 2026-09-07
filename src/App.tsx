@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, useLayoutEffect } from "react";
 import { applyCodeTheme } from "./lib/codeTheme";
 import { platform } from "@tauri-apps/plugin-os";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -12,6 +12,10 @@ import { LiveMode } from "./components/LiveMode";
 import { ModelInfoPanel } from "./components/ModelInfoPanel";
 import { WindowControls } from "./components/WindowControls";
 import { useI18n, type Lang, type TKey } from "./lib/i18n";
+import { clampRung, effortLabel } from "./lib/effort";
+import { watchContentHeight } from "./lib/autoGrow";
+/** Ceiling for the chat composer, matching `.input-row textarea` max-height. */
+const COMPOSER_MAX_H = 200;
 import {
   decodeAudio,
   encodeAudio,
@@ -35,6 +39,10 @@ import { PodcastPanel } from "./components/PodcastPanel";
 import { DeepResearchPanel } from "./components/DeepResearchPanel";
 import { CodeMode } from "./components/CodeMode";
 import { answerOnly, cleanTitle, cutSentences, forSpeech, stripThink } from "./lib/voiceText";
+// The reasoning/answer split the agent loop uses. Its stripThink leaves source
+// markers alone, which matters here: the content has to rejoin with the
+// reasoning into exactly what the model generated, or the prefix breaks.
+import { thinkPart as turnReasoning, stripThink as turnAnswer } from "./lib/agentLoop";
 import { copyToClipboard } from "./lib/clipboard";
 import logoUrl from "../logo.png";
 import {
@@ -43,6 +51,7 @@ import {
   canvasSessionSave,
   canvasSessionLoad,
   cancelGeneration,
+  attachGeneration,
   deleteConversation,
   fetchUrl,
   generate,
@@ -97,6 +106,17 @@ import {
   type StreamEvent,
 } from "./lib/ipc";
 import "./App.css";
+import {
+  type Compacted,
+  calibrate,
+  contextLimit,
+  fitTranscript,
+  historyPrint,
+  messageTokens,
+  rawMessageTokens,
+  resetCalibration,
+  standingTail,
+} from "./lib/ctxBudget";
 import { fmtGbFromMb } from "./lib/fmt";
 import { clampImageGenQuant, clampImageGenSize, clampImageGenSteps, formatImageSeedContent, imageGenDiskHintGb, parseImageSeed } from "./lib/imageGen";
 
@@ -339,27 +359,15 @@ function formatDate(lang: Lang): string {
   });
 }
 
-/** Rough token estimate: CJK ≈ 1 token/char, other text ≈ 1 token per ~3.6 chars. */
-function estimateTokens(text: string): number {
-  let cjk = 0;
-  for (const ch of text) {
-    const c = ch.codePointAt(0) ?? 0;
-    if (
-      (c >= 0x3000 && c <= 0x9fff) ||
-      (c >= 0xac00 && c <= 0xd7a3) ||
-      (c >= 0xf900 && c <= 0xfaff) ||
-      (c >= 0xff00 && c <= 0xffef)
-    ) {
-      cjk++;
-    }
-  }
-  return Math.ceil(cjk + (text.length - cjk) / 3.6);
-}
 
 function loadSettings(): GenSettings {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    if (raw) return { ...defaultSettings, ...JSON.parse(raw) };
+    if (raw) {
+      const stored = JSON.parse(raw);
+      if (stored.codeMaxSteps === 32) delete stored.codeMaxSteps;
+      return { ...defaultSettings, ...stored };
+    }
   } catch {
     /* ignore */
   }
@@ -410,6 +418,70 @@ export default function App() {
       window.removeEventListener("unhandledrejection", onRej);
     };
   }, []);
+  // A turn that was still generating when this page loaded.
+  //
+  // The webview can be replaced under a running turn — it happens, and the
+  // page it takes with it holds the only copy of the answer. The app keeps
+  // generating regardless, so a page that comes up asks whether there is a
+  // turn in flight; if there is, it opens that conversation, shows everything
+  // generated before it arrived, and receives the rest as it is produced.
+  // Nothing to rejoin is the normal answer and costs one call.
+  useEffect(() => {
+    let live: { conversationId: string; messageId: string } | null = null;
+    let acc = "";
+    void attachGeneration((ev) => {
+      if (!live) return;
+      if (ev.type === "token") {
+        acc += ev.text;
+        setMessages((cur) =>
+          cur.map((m) => (m.id === live!.messageId ? { ...m, content: acc } : m)),
+        );
+      } else if (ev.type === "done" || ev.type === "error") {
+        if (ev.type === "error") acc += `\n\n**${ev.message}**`;
+        setMessages((cur) =>
+          cur.map((m) => (m.id === live!.messageId ? { ...m, content: acc } : m)),
+        );
+        setBusy(false);
+        setStreamingId(null);
+        void refreshConversations().catch(console.error);
+      }
+    })
+      .then(async (turn) => {
+        if (!turn) return;
+        live = { conversationId: turn.conversationId, messageId: turn.messageId };
+        acc = turn.text;
+        const stored = await getMessages(turn.conversationId).catch(() => []);
+        const rows = stored.map((m) => ({
+          id: m.id,
+          role: m.role,
+          content: m.content,
+          images: m.images,
+        }));
+        // The reply is still being written, so it is not in the conversation
+        // yet — put the bubble back where it was.
+        if (!rows.some((m) => m.id === turn.messageId)) {
+          rows.push({ id: turn.messageId, role: "assistant", content: turn.text, images: undefined });
+        }
+        setMessages(rows);
+        setConversationId(turn.conversationId);
+        setStreamingId(turn.messageId);
+        setBusy(true);
+      })
+      .catch(console.error);
+  }, []);
+
+  /** The composer follows its content: a one-row textarea would otherwise keep
+   *  a single line's height and scroll whatever does not fit — which at a
+   *  larger UI scale is the placeholder itself, wrapped, in a box too short
+   *  for it. Re-measured on width changes too, not only on typing. */
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  useLayoutEffect(() => {
+    const el = inputRef.current;
+    const row = el?.parentElement;
+    if (!el || !row) return;
+    return watchContentHeight(el, row, COMPOSER_MAX_H);
+  }, [input]);
+
   const [showSettings, setShowSettings] = useState(false);
   const [showCmdk, setShowCmdk] = useState(false);
   const [canvasOpen, setCanvasOpen] = useState(false);
@@ -419,6 +491,16 @@ export default function App() {
   // ORIGINAL html block, so reopening the same reply resumes its versions
   // while a different reply starts fresh. In-memory, app-session scoped.
   const canvasSessions = useRef(new Map<string, { versions: CanvasVersion[]; index: number }>());
+  /** What compaction already wrote for a conversation: the summary, how many
+   *  leading messages it stands in for, and a fingerprint of those messages so
+   *  editing one invalidates it. Kept because re-deriving the summary every
+   *  turn rewrites the system message every turn, and a system message that
+   *  changes moves every token after it — see composeContext. */
+  const compacted = useRef(new Map<string, Compacted>());
+  /** What the engine actually charged for each conversation's last prompt.
+   *  The summary above lets the tail keep growing while it stands, and it
+   *  decides that on an ESTIMATE of the tail's size — see composeContext. */
+  const lastPromptTokens = useRef(new Map<string, number>());
   const [canvasKey, setCanvasKey] = useState("");
   const [canvasBusy, setCanvasBusy] = useState(false);
   // Set by the canvas Stop button; the generation flow then discards the
@@ -468,7 +550,18 @@ export default function App() {
   const [showPodcast, setShowPodcast] = useState(false);
   const [showDeepResearch, setShowDeepResearch] = useState(false);
   const [showKbReport, setShowKbReport] = useState(false);
-  const [appMode, setAppMode] = useState<"chat" | "code">("chat");
+  // Persisted: the webview reloads on its own (a renderer crash, a devtools
+  // reload, an OOM) and the backend is written to survive it — see the model
+  // hand-back below. The mode was not, so a reload silently dropped you back
+  // into chat while whatever code mode was running vanished with the JS
+  // context. Landing back where you were is what makes that visible as "my run
+  // stopped" instead of "why am I in chat".
+  const [appMode, setAppMode] = useState<"chat" | "code">(() =>
+    localStorage.getItem("chaty.appMode") === "code" ? "code" : "chat",
+  );
+  useEffect(() => {
+    localStorage.setItem("chaty.appMode", appMode);
+  }, [appMode]);
   /** Native reasoning-effort rung for models with a ladder (Qwen3.8). Kept
    *  even while thinking is off, so toggling back restores the choice; models
    *  without a ladder never send it. */
@@ -479,6 +572,13 @@ export default function App() {
       return "xhigh";
     }
   });
+  /** The rung this model will actually use — the remembered one while it
+   *  offers it, clamped to its own ladder otherwise. Both the menu and the
+   *  request read this, so what is ticked is what the model is asked for. */
+  const effortRung = useMemo(
+    () => clampRung(model?.effortLevels ?? [], effort),
+    [model?.effortLevels, effort],
+  );
   const [thinkEnabled, setThinkEnabled] = useState(() => {
     try {
       return localStorage.getItem("chaty.think") !== "0";
@@ -486,6 +586,22 @@ export default function App() {
       return true;
     }
   });
+  // Thinking and web search are mutually exclusive: a searching turn is sent
+  // with reasoning suppressed (see wantNoThink), so leaving both switches on
+  // means the Tools menu shows a tick next to Thinking for turns the model does
+  // not think through. Every entry point went through the two setters and each
+  // was expected to remember the other — and the command palette's web toggle
+  // did not, so switching search on from ⌘K silently stopped the reasoning of
+  // every later turn while still claiming it was on. One rule, one place.
+  const setThinkingOn = (on: boolean) => {
+    setThinkEnabled(on);
+    if (on) setWebEnabled(false);
+  };
+  const setWebSearchOn = (on: boolean) => {
+    setWebEnabled(on);
+    if (on) setThinkEnabled(false);
+  };
+
   const [webDesign, setWebDesign] = useState(() => {
     try {
       return localStorage.getItem("chaty.webdesign") === "1";
@@ -612,7 +728,9 @@ export default function App() {
         if (!target) return;
         setLoadingModel(true);
         try {
-          const info = await loadModel(target, settings.gpuLayers, settings.contextLength || undefined, onLoadProgress);
+          const info = await loadModel(target, settings.gpuLayers, settings.contextLength || undefined, settings.speculative, onLoadProgress);
+          // A different tokenizer charges differently — start the ratio over.
+          resetCalibration();
           setModel(info);
           localStorage.setItem(LAST_MODEL_KEY, info.path);
           noticeForLoad(info);
@@ -712,8 +830,16 @@ export default function App() {
     return () => window.removeEventListener("mousedown", close);
   }, [showToolsMenu]);
 
-  function openLive() {
+  async function openLive() {
     if (!model) return;
+    // Live mode owns the microphone for its whole listen/respond loop. Stop a
+    // composer recording first and wait until the native slot is released.
+    const rec = recorderRef.current;
+    if (rec) {
+      recorderRef.current = null;
+      setRecorder(null);
+      await rec.cancel().catch(console.error);
+    }
     liveConvRef.current = conversationId; // continue current chat, or null → new
     setShowToolsMenu(false);
     setShowLive(true);
@@ -1318,6 +1444,8 @@ export default function App() {
       showNotice("warn", t("ctxClamped", { n: info.nCtx }));
     } else if (info.warning === "gpu-crash-cpu") {
       showNotice("warn", t("gpuCrashCpu"));
+    } else if (info.warning === "gpu-crash-capped") {
+      showNotice("warn", t("gpuCrashCapped", { a: info.gpuLayers, b: info.nLayer ?? "?" }));
     } else if (info.warning === "conversion-suspect") {
       showNotice("warn", t("conversionSuspect"));
     } else if (info.warning === "vision-config-missing") {
@@ -1349,7 +1477,9 @@ export default function App() {
     if (busy || model?.path === path) return;
     setLoadingModel(true);
     try {
-      const info = await loadModel(path, settings.gpuLayers, settings.contextLength || undefined, onLoadProgress);
+      const info = await loadModel(path, settings.gpuLayers, settings.contextLength || undefined, settings.speculative, onLoadProgress);
+      // A different tokenizer charges differently — start the ratio over.
+      resetCalibration();
       setModel(info);
       localStorage.setItem(LAST_MODEL_KEY, info.path);
       noticeForLoad(info);
@@ -1367,7 +1497,9 @@ export default function App() {
     if (!model || busy || loadingModel) return;
     setLoadingModel(true);
     try {
-      const info = await loadModel(model.path, settings.gpuLayers, settings.contextLength || undefined, onLoadProgress);
+      const info = await loadModel(model.path, settings.gpuLayers, settings.contextLength || undefined, settings.speculative, onLoadProgress);
+      // A different tokenizer charges differently — start the ratio over.
+      resetCalibration();
       setModel(info);
       noticeForLoad(info);
     } catch (e) {
@@ -1428,7 +1560,9 @@ export default function App() {
       const path = await pickModelFolder();
       if (!path) return;
       setLoadingModel(true);
-      const info = await loadModel(path, settings.gpuLayers, settings.contextLength || undefined, onLoadProgress);
+      const info = await loadModel(path, settings.gpuLayers, settings.contextLength || undefined, settings.speculative, onLoadProgress);
+      // A different tokenizer charges differently — start the ratio over.
+      resetCalibration();
       setModel(info);
       localStorage.setItem(LAST_MODEL_KEY, info.path);
       noticeForLoad(info);
@@ -1556,6 +1690,8 @@ export default function App() {
         }
       }
       await deleteConversation(id);
+      compacted.current.delete(id);
+      lastPromptTokens.current.delete(id);
       if (isCurrent) {
         setConversationId(null);
         setMessages([]);
@@ -1633,19 +1769,70 @@ export default function App() {
    *  stored/displayed messages are never touched — only the prompt we send. */
   async function composeContext<T extends { role: Role; content: string }>(
     msgs: T[],
+    convId: string,
   ): Promise<{ summary: string; tail: T[] } | null> {
     const nCtx = model?.nCtx ?? 0;
     if (!nCtx || msgs.length < 6) return null;
 
-    // Room for the answer + chat markup. With no reply cap, reserve a sane slice.
-    const reserve = (settings.limitTokens ? settings.maxTokens : 2048) + 700;
-    const budget = Math.max(1024, nCtx - reserve);
-    const cost = (m: { content: string }) => estimateTokens(m.content) + 8;
-    const total = msgs.reduce((s, m) => s + cost(m), 0);
+    // Room for the answer + chat markup — the same rule code mode compacts by,
+    // so a conversation does not compact at two different places depending on
+    // which screen it is on.
+    const budget = Math.max(
+      1024,
+      contextLimit(nCtx, settings.limitTokens ? settings.maxTokens : undefined),
+    );
+    // Attached pictures are context too — see IMAGE_TOKENS. Counting only the
+    // text let a conversation carrying screenshots call itself comfortable while
+    // it was already past the window.
+    const total = messageTokens(msgs);
+    const cost = (m: { content: string; images?: string[] }) =>
+      messageTokens([m]);
+
+    // A summary already written for this conversation stands until the tail
+    // outgrows the room it left. Re-deriving it every turn produced a DIFFERENT
+    // wording every turn, and since the summary rides in the system message —
+    // the very first tokens of the prompt — the engine could not match a single
+    // token of what it had already computed. Measured on Gemma-4 26B: 99% of
+    // the window reused before compaction started, 0% on every turn after,
+    // plus a whole extra generation per turn to write the summary again. Code
+    // mode learned this one already (compactMessages compacts in place, down
+    // to a target well under the limit); this is chat mode's half of it.
+    // Ground truth outranks the estimate. While the summary stands the tail
+    // grows, and whether it still fits is judged by a token estimate — which
+    // reads 1:1 until the first reply calibrates it, and can read a
+    // reasoning-heavy conversation at a fraction of its real cost. When that
+    // estimate is wrong in the optimistic direction the conversation walks off
+    // the end of the window: measured on Qwen3.8 27B with the estimator
+    // uncalibrated, the tail was judged to fit for six turns running while the
+    // engine answered every one of them with "context" and generated nothing.
+    // What the engine charged last turn is not a guess, so a prompt that was
+    // already over the budget retires the summary and forces a fresh, smaller
+    // one — whatever the estimate thinks.
+    const charged = lastPromptTokens.current.get(convId) ?? 0;
+    if (charged > budget) compacted.current.delete(convId);
+    const memo = compacted.current.get(convId);
+    if (memo) {
+      const summary = t("contextSummary") + memo.summary;
+      const standing = standingTail(memo, msgs, budget, summary);
+      if (standing) return { summary, tail: standing };
+      if (memo.covered > msgs.length || historyPrint(msgs, memo.covered) !== memo.print) {
+        // The stretch it summarised is no longer what it summarised — an edit
+        // or a regenerate rewrote history behind it.
+        compacted.current.delete(convId);
+      }
+    }
     if (total <= budget * 0.85) return null; // still comfortable
 
-    // Keep the most recent turns within ~half the budget; summarise the rest.
-    const tailCap = budget * 0.5;
+    // Keep the most recent turns within ~40% of the budget; summarise the rest.
+    // What is NOT kept is the runway: the turns that land on the memo above
+    // instead of writing a new summary — and every one of those is a prompt
+    // the engine can still recognise. Half a budget of verbatim tail against a
+    // trigger at 85% left barely one turn of runway on a small window, so a
+    // conversation went right back to re-summarising (and re-prefilling) every
+    // turn — compaction that leaves you hovering at the ceiling has not really
+    // compacted. The turns this no longer keeps verbatim are not lost: they go
+    // into the summary, which now carries forward instead of being re-derived.
+    const tailCap = budget * 0.4;
     let acc = 0;
     let keep = 0;
     for (let i = msgs.length - 1; i >= 0; i--) {
@@ -1658,10 +1845,21 @@ export default function App() {
     const tail = msgs.slice(splitAt);
     if (head.length === 0) return null;
 
-    let transcript = head
-      .map((m) => `${m.role === "user" ? "用户" : "助手"}: ${m.content}`)
-      .join("\n");
-    if (transcript.length > 7000) transcript = transcript.slice(-7000);
+    // Budget the summariser's own prompt against the real window rather than a
+    // flat character cap, and keep the opening when it will not all fit. When a
+    // previous summary covers part of this head, summarise FROM it rather than
+    // from the raw turns again: the earliest turns have then been condensed
+    // once, not re-condensed from an increasingly elided transcript each time.
+    const carried = memo && memo.covered < splitAt ? memo.summary : "";
+    const fresh = carried ? head.slice(memo!.covered) : head;
+    const transcript = fitTranscript(
+      [
+        ...(carried ? [`${lang === "zh" ? "更早的摘要" : "earlier summary"}: ${carried}`] : []),
+        ...fresh.map((m) => `${m.role === "user" ? "用户" : "助手"}: ${m.content}`),
+      ],
+      Math.max(1500, Math.floor(budget * 0.6)),
+      lang === "zh" ? "zh" : "en",
+    );
 
     setComposing(true);
     let out = "";
@@ -1693,6 +1891,7 @@ export default function App() {
 
     const summary = stripThink(out).trim();
     if (!summary) return null;
+    compacted.current.set(convId, { summary, covered: splitAt, print: historyPrint(msgs, splitAt) });
     return { summary: t("contextSummary") + summary, tail };
   }
 
@@ -1734,7 +1933,7 @@ export default function App() {
         if (ragEnabled) {
           try {
             const query = prior.length > 0 ? await rewriteQuery(prior, text) : text;
-            const hits = await ragSearch(query, 6);
+            const hits = await ragSearch(query, settings.ragTopK);
             // Group retrieved chunks by their source file so the user sees one
             // citation per document, not one per chunk. First-seen order keeps
             // the best-scoring file first; chunks within a file go in document
@@ -1802,16 +2001,25 @@ export default function App() {
       }
     }
 
-    // Never feed a prior turn's reasoning back to the model: Qwen's own guidance
-    // is that history should carry only the final answer, and stale <think> blocks
-    // just waste context and confuse newer (3.5+) reasoning parsers.
-    const historyForModel = history.map(({ role, content, images }) => ({
-      role,
-      content: role === "assistant" ? stripThink(content) : content,
-      // Only vision-ready models get pixels; otherwise images were already
-      // OCR'd into text at attach time (or never attached).
-      ...(role === "user" && images?.length && model?.visionReady ? { images } : {}),
-    }));
+    // An assistant turn travels the way the model wrote it. Stripping the
+    // reasoning here left the next prompt unable to reproduce what had just been
+    // generated, so the KV prefix died at the first assistant turn and every
+    // reply re-read the whole conversation — 0% cache reuse against 100% when
+    // the turn is kept whole, measured on Qwen3.5 with thinking on. Nothing is
+    // gained by stripping it either: the templates that should not see stale
+    // reasoning already split it out themselves and re-emit it only for the
+    // turn still being answered. Where a template reads thinking from its own
+    // field instead, the split has to happen — leaving it inline reaches such a
+    // template as an empty thought followed by the turn's own markup.
+    const historyForModel = history.map(({ role, content, images }) => {
+      const pixels =
+        role === "user" && images?.length && model?.visionReady ? { images } : {};
+      if (role !== "assistant") return { role, content, ...pixels };
+      const reasoning = model?.reasoningField ? turnReasoning(content).trim() : "";
+      return reasoning
+        ? { role, content: turnAnswer(content).trim(), reasoning_content: reasoning }
+        : { role, content };
+    });
 
     // Near the context limit: summarise the older turns so the user can keep the
     // conversation going. This is non-destructive — the UI still shows every
@@ -1819,7 +2027,7 @@ export default function App() {
     let summaryNote = "";
     let modelHistory = historyForModel;
     try {
-      const comp = await composeContext(historyForModel);
+      const comp = await composeContext(historyForModel, convId);
       if (comp) {
         summaryNote = comp.summary;
         modelHistory = comp.tail;
@@ -1845,7 +2053,7 @@ export default function App() {
     // and only when they are actually reasoning.
     const levels = model?.effortLevels ?? [];
     const effortParam =
-      levels.length > 0 && !wantNoThink && levels.includes(effort) ? effort : undefined;
+      levels.length > 0 && !wantNoThink && levels.includes(effortRung) ? effortRung : undefined;
 
     // Only tell the model today's date when the question is actually time-related,
     // otherwise short prompts can trigger the model to recite the date.
@@ -1859,25 +2067,44 @@ export default function App() {
     // ONE system message, always. Qwen3.5/3.6 chat templates assert the
     // system turn is single and first — stacking fragments as separate
     // system messages threw TemplateException("System message must be at
-    // the beginning.") the moment two were active at once.
+    // the beginning.") the moment two were active at once (owner repro:
+    // attachment + web-design mode). Merge every fragment instead.
+    // Per-turn fragments (today's date, search results) ride on the user
+    // message so the system prompt stays identical across turns and the
+    // engine can resume from cache.
     const sysParts = [
-      ...(needsDate ? [t("todayNote", { date: formatDate(lang) })] : []),
       ...(webDesign ? [WEBDESIGN_PROMPT] : []),
       ...(sys ? [sys] : []),
       ...(attachment && attachment.kind !== "vision"
         ? [t("attachInstruction", { name: attachment.name }) + attachment.text.slice(0, 9000)]
         : []),
-      ...(webContext ? [webContext] : []),
       ...(summaryNote ? [summaryNote] : []),
     ];
+    const turnParts = [
+      ...(needsDate ? [t("todayNote", { date: formatDate(lang) })] : []),
+      ...(webContext ? [webContext] : []),
+    ];
+    const last = modelHistory[modelHistory.length - 1];
+    if (turnParts.length > 0 && last?.role === "user") {
+      modelHistory = modelHistory.map((m, i) =>
+        i === modelHistory.length - 1
+          ? { ...m, content: `${turnParts.join("\n\n")}\n\n${m.content}` }
+          : m,
+      );
+    }
     const sent: ChatMessage[] = [
       ...(sysParts.length ? [{ role: "system" as const, content: sysParts.join("\n\n") }] : []),
       ...modelHistory,
     ];
+    // Predicted (uncalibrated) cost of exactly this prompt — the left-hand side
+    // of the calibration the reply completes, so the next turn's summarise-or-not
+    // decision rests on what the engine actually charges rather than a guess.
+    const sentRaw = rawMessageTokens(sent as { content: string; images?: string[] }[]);
 
     // Streaming text-to-speech: synthesize & play sentence-by-sentence as the
     // answer arrives, so audio starts long before generation finishes.
-    const useTTS = speakReplies && lang === "en";
+    const useTTS = speakReplies;
+    const final: { stats: GenStats | null } = { stats: null };
     let speech: SpeechQueue | null = null;
     let synthChain: Promise<void> = Promise.resolve();
     let spokenLen = 0;
@@ -1957,7 +2184,10 @@ export default function App() {
               rafId = null;
             }
             renderMsg();
+            final.stats = ev.stats;
             setStats(ev.stats);
+            lastPromptTokens.current.set(convId, ev.stats.promptTokens);
+            calibrate(sentRaw, ev.stats.promptTokens);
           } else if (ev.type === "error") {
             acc.text += `\n\n**${preferEnglishBackendMsg(ev.message, lang)}**`;
             if (rafId != null) {
@@ -1967,6 +2197,9 @@ export default function App() {
             renderMsg();
           }
         },
+        // The app owns this turn: it keeps generating if this page goes away,
+        // and hands the rest to whichever page comes back.
+        { conversationId: convId, messageId: asstId },
       );
     } catch (e) {
       console.error(e);
@@ -1978,6 +2211,28 @@ export default function App() {
         rafId = null;
       }
       renderMsg();
+      // A finished turn with no answer in it must say so. It happens two ways:
+      // the prompt outgrew the window, so the engine generated nothing at all
+      // and the message was never even saved (the turn vanished on reload); or
+      // the model reasoned to EOS and stopped without writing the answer, which
+      // saved a bubble holding only a thought. Both read as the app dropping
+      // the reply. A cancel is not one of these — the user knows why that one
+      // is short.
+      if (final.stats && final.stats.stopReason !== "cancelled" && !answerOnly(acc.text).trim()) {
+        const noRoom =
+          final.stats.stopReason === "context" ||
+          (!!model?.nCtx && final.stats.promptTokens >= model.nCtx);
+        // Reasoning cut off by the length budget is not the same as reasoning
+        // that finished and then said nothing — the first wants a bigger
+        // budget, the second wants another go.
+        const key = noRoom
+          ? "emptyNoRoom"
+          : final.stats.stopReason === "length"
+            ? "emptyOutOfBudget"
+            : "emptyThoughtOnly";
+        acc.text += (acc.text ? "\n\n" : "") + t(key);
+        renderMsg();
+      }
       setBusy(false);
       setStreamingId(null);
       try {
@@ -2268,6 +2523,11 @@ export default function App() {
       }
     } catch (e) {
       console.error(e);
+      setAttachError(
+        typeof e === "string"
+          ? e
+          : ((e as Error)?.message ?? "语音识别失败 / Speech recognition failed"),
+      );
     } finally {
       setTranscribing(false);
     }
@@ -2363,7 +2623,7 @@ export default function App() {
       keywords: "download model 下载 模型",
       run: () => setShowDownload(true),
     },
-    { id: "live", label: t("cmdkLive"), keywords: "voice live 语音", run: () => setShowLive(true) },
+    { id: "live", label: t("cmdkLive"), keywords: "voice live 语音", run: () => void openLive() },
     {
       id: "kb",
       label: ragEnabled ? t("cmdkKbOff") : t("cmdkKbOn"),
@@ -2374,7 +2634,7 @@ export default function App() {
       id: "web",
       label: webEnabled ? t("cmdkWebOff") : t("cmdkWebOn"),
       keywords: "web search 联网 搜索",
-      run: () => setWebEnabled((v) => !v),
+      run: () => setWebSearchOn(!webEnabled),
     },
     {
       id: "imagegen",
@@ -2719,6 +2979,8 @@ export default function App() {
             onClose={() => setShowSettings(false)}
             maxTokensLimit={Math.max(1024, model?.nCtx ?? 4096)}
             ctxTrainLimit={model?.nCtxTrain}
+            layersLimit={model?.nLayer}
+            specSupported={model?.speculative}
             onReloadModel={model ? () => void reloadModel() : undefined}
             reloading={loadingModel}
             onDataCleared={() => {
@@ -2750,6 +3012,7 @@ export default function App() {
         active={appMode === "code"}
         maxSteps={settings.codeMaxSteps}
         bashTimeout={settings.codeBashTimeout}
+        ragTopK={settings.ragTopK}
         temperature={settings.codeTemperature}
         thinkBudget={settings.codeThinkBudget}
         maxGenTokens={settings.codeMaxTokens}
@@ -3017,15 +3280,13 @@ export default function App() {
                         >
                           {t("fork")}
                         </button>
-                        {lang === "en" && (
-                          <button
-                            className="msg-action"
-                            title={t("rereadTitle")}
-                            onClick={() => (speaking ? stopSpeaking() : speakText(m.content))}
-                          >
-                            {speaking ? t("rereadStop") : t("reread")}
-                          </button>
-                        )}
+                        <button
+                          className="msg-action"
+                          title={t("rereadTitle")}
+                          onClick={() => (speaking ? stopSpeaking() : speakText(m.content))}
+                        >
+                          {speaking ? t("rereadStop") : t("reread")}
+                        </button>
                       </div>
                     )}
                   </div>
@@ -3354,9 +3615,7 @@ export default function App() {
                         <button
                           className={`tool-item ${webEnabled ? "on" : ""}`}
                           onClick={() => {
-                            const next = !webEnabled;
-                            setWebEnabled(next);
-                            if (next) setThinkEnabled(false); // web search ⇄ thinking are exclusive
+                            setWebSearchOn(!webEnabled);
                           }}
                         >
                           <span className="ti-label">{t("toolWeb")}</span>
@@ -3372,9 +3631,7 @@ export default function App() {
                         <button
                           className={`tool-item tool-parent ${thinkEnabled ? "on" : ""}`}
                           onClick={() => {
-                            const next = !thinkEnabled;
-                            setThinkEnabled(next);
-                            if (next) setWebEnabled(false);
+                            setThinkingOn(!thinkEnabled);
                           }}
                           title={t("effortHint")}
                         >
@@ -3392,18 +3649,15 @@ export default function App() {
                           {(model?.effortLevels ?? []).map((lvl) => (
                             <button
                               key={lvl}
-                              className={`tool-item ${thinkEnabled && effort === lvl ? "on" : ""}`}
+                              className={`tool-item ${thinkEnabled && effortRung === lvl ? "on" : ""}`}
                               onClick={() => {
                                 setEffort(lvl);
-                                setThinkEnabled(true);
-                                setWebEnabled(false);
+                                setThinkingOn(true);
                               }}
                             >
-                              <span className="ti-label">
-                                {t(lvl === "low" ? "effortLow" : lvl === "medium" ? "effortMedium" : "effortXhigh")}
-                              </span>
+                              <span className="ti-label">{effortLabel(lvl, t)}</span>
                               <span className="ti-check">
-                                {thinkEnabled && effort === lvl ? <Icon name="check" size={12} strokeWidth={2.4} /> : ""}
+                                {thinkEnabled && effortRung === lvl ? <Icon name="check" size={12} strokeWidth={2.4} /> : ""}
                               </span>
                             </button>
                           ))}
@@ -3413,9 +3667,7 @@ export default function App() {
                     <button
                       className={`tool-item ${thinkEnabled && model?.supportsThinking ? "on" : ""}`}
                       onClick={() => {
-                        const next = !thinkEnabled;
-                        setThinkEnabled(next);
-                        if (next) setWebEnabled(false); // thinking ⇄ web search are exclusive
+                        setThinkingOn(!thinkEnabled);
                       }}
                       disabled={!model?.supportsThinking}
                       title={model && !model.supportsThinking ? t("thinkUnsupported") : undefined}
@@ -3457,41 +3709,51 @@ export default function App() {
                       <span className="ti-label">{t("toolDesign")}</span>
                       <span className="ti-check">{webDesign ? <Icon name="check" size={12} strokeWidth={2.4} /> : ""}</span>
                     </button>
-                    {lang === "en" && (
-                      <>
-                        <div className="tools-sep" />
-                        <button
-                          className={`tool-item ${speakReplies ? "on" : ""}`}
-                          onClick={() => {
-                            if (speaking) stopSpeaking();
-                            else if (speakReplies) stopSpeaking();
-                            setSpeakReplies((v) => !v);
-                          }}
-                        >
+                    <>
+                      <div className="tools-sep" />
+                      {/* Voice group — the two ways a reply reaches your ears
+                          are one idea with two settings, not two tools. */}
+                      <div className="tool-group">
+                        <div className={`tool-item tool-parent ${speakReplies ? "on" : ""}`}>
                           <svg className="ti-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
                             <path d="M4 9.5v5h3.5L12 18.5v-13L7.5 9.5H4z" strokeLinejoin="round" />
                             <path d="M15.5 8.5a4.2 4.2 0 0 1 0 7" strokeLinecap="round" />
                           </svg>
-                          <span className="ti-label">{t("speakAloud")}</span>
+                          <span className="ti-label">{t("toolVoiceGroup")}</span>
                           <span className="ti-check">{speakReplies ? <Icon name="check" size={12} strokeWidth={2.4} /> : ""}</span>
-                        </button>
-                        <button
-                          className="tool-item"
-                          onClick={openLive}
-                          disabled={!model}
-                        >
-                          <svg className="ti-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
-                            <circle cx="12" cy="12" r="3" fill="currentColor" stroke="none" />
-                            <path d="M7.5 7.5a6 6 0 0 0 0 9M16.5 7.5a6 6 0 0 1 0 9" strokeLinecap="round" />
-                          </svg>
-                          <span className="ti-label">{t("liveStart")}</span>
-                        </button>
-                      </>
-                    )}
+                          <span className="ti-caret">›</span>
+                        </div>
+                        <div className="tool-submenu">
+                          <button
+                            className={`tool-item ${speakReplies ? "on" : ""}`}
+                            onClick={() => {
+                              if (speaking) stopSpeaking();
+                              else if (speakReplies) stopSpeaking();
+                              setSpeakReplies((v) => !v);
+                            }}
+                          >
+                            <svg className="ti-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
+                              <path d="M4 9.5v5h3.5L12 18.5v-13L7.5 9.5H4z" strokeLinejoin="round" />
+                              <path d="M15.5 8.5a4.2 4.2 0 0 1 0 7" strokeLinecap="round" />
+                            </svg>
+                            <span className="ti-label">{t("speakAloud")}</span>
+                            <span className="ti-check">{speakReplies ? <Icon name="check" size={12} strokeWidth={2.4} /> : ""}</span>
+                          </button>
+                          <button className="tool-item" onClick={openLive} disabled={!model}>
+                            <svg className="ti-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
+                              <circle cx="12" cy="12" r="3" fill="currentColor" stroke="none" />
+                              <path d="M7.5 7.5a6 6 0 0 0 0 9M16.5 7.5a6 6 0 0 1 0 9" strokeLinecap="round" />
+                            </svg>
+                            <span className="ti-label">{t("liveStart")}</span>
+                          </button>
+                        </div>
+                      </div>
+                    </>
                   </div>
                 )}
               </div>
               <textarea
+                ref={inputRef}
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={onKeyDown}
@@ -3510,13 +3772,12 @@ export default function App() {
                 }
                 rows={1}
               />
-              {lang === "en" && (
-                <button
-                  className={`mic-btn ${recorder ? "recording" : ""}`}
-                  title={recorder ? t("micStop") : t("micStart")}
-                  onClick={handleMic}
-                  disabled={transcribing}
-                >
+              <button
+                className={`mic-btn ${recorder ? "recording" : ""}`}
+                title={recorder ? t("micStop") : t("micStart")}
+                onClick={handleMic}
+                disabled={transcribing}
+              >
                   {transcribing ? (
                     <span className="mini-spinner" />
                   ) : recorder ? (
@@ -3537,8 +3798,7 @@ export default function App() {
                       <path d="M5 11a7 7 0 0 0 14 0M12 18v3" strokeLinecap="round" />
                     </svg>
                   )}
-                </button>
-              )}
+              </button>
               {busy ? (
                 <button className="send-btn stop" onClick={handleStop} title={t("stopTitle")}>
                   <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true">

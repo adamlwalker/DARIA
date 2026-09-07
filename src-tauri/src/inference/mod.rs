@@ -23,12 +23,27 @@ pub enum Role {
     System,
     User,
     Assistant,
+    /// A tool's result, delivered under its own role rather than folded into a
+    /// user turn. Chat templates key "is this turn still part of the current
+    /// request" off the last *user* message, so a tool result posing as one
+    /// makes the template discard the assistant reasoning that preceded it —
+    /// costing the model the thread of its own work and voiding the KV prefix
+    /// every step. Used only where the model's template actually renders it
+    /// (probed at load, never assumed).
+    Tool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
+    /// The turn's thinking, kept out of `content`. Some templates read
+    /// reasoning only from a structured field and never split it back out of
+    /// the content — a turn stored inline reaches them as an empty thought
+    /// followed by its own markup. Sent only where the template is probed to
+    /// use it; `None` everywhere else keeps the wire shape unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     /// Image attachments (absolute file paths) for vision models. Ignored —
     /// and expected empty — when the loaded model has no mmproj.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -87,8 +102,16 @@ pub struct GenRequest {
     pub params: GenParams,
 }
 
+/// The conversation and message a streaming reply belongs to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveTarget {
+    pub conversation_id: String,
+    pub message_id: String,
+}
+
 /// Streaming protocol pushed to the frontend over a Tauri `Channel`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum StreamEvent {
     /// Generation accepted; prompt is being processed.
@@ -105,7 +128,7 @@ pub enum StreamEvent {
     Error { message: String },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenStats {
     pub prompt_tokens: u32,
@@ -160,6 +183,16 @@ pub struct ModelInfo {
     /// no effort control and the UI keeps its plain thinking toggle.
     #[serde(default)]
     pub effort_levels: Vec<String>,
+    /// The chat template renders a tool result under its own role AND keeps
+    /// the assistant reasoning that preceded it — which a result posing as a
+    /// user turn discards. Probed at load; false ⇒ results stay user turns and
+    /// the rendered prompt is byte-identical to what earlier builds produced.
+    #[serde(default)]
+    pub tool_role: bool,
+    /// The template reads a turn's thinking from a structured
+    /// `reasoning_content` field rather than splitting it out of the content.
+    #[serde(default)]
+    pub reasoning_field: bool,
     /// Best-effort: the chat template supports tool / function calling.
     pub supports_tools: bool,
     /// Best-effort: the model appears to be multimodal (vision).
@@ -168,8 +201,24 @@ pub struct ModelInfo {
     /// images this session. `multimodal && !vision_ready` means "the model
     /// could do vision, but its mmproj GGUF is missing next to the weights".
     pub vision_ready: bool,
+    /// Whether ONE prompt may carry several pictures. Gemma-4 through MLX
+    /// cannot: it encodes the first and then rejects the token-count mismatch,
+    /// failing the whole round — which is what a tall page's tiled screenshot
+    /// hands it. Everything else here says true.
+    pub multi_image: bool,
     /// Path of the paired mmproj GGUF, when one was found.
     pub mmproj: Option<String>,
+    /// The model file carries a multi-token-prediction head — the extra block
+    /// speculative decoding guesses with. A capability of the FILE, so it stays
+    /// true when the user has the feature switched off; the settings toggle is
+    /// enabled on this and greyed out on everything else.
+    #[serde(default)]
+    pub speculative: bool,
+    /// Speculative decoding is actually running for this load: the model has a
+    /// head, the setting allows it, and the head loaded. Never true when
+    /// `speculative` is false.
+    #[serde(default)]
+    pub speculative_on: bool,
     /// Non-fatal load warning code for the UI (e.g. "gpu-oom" when the GPU
     /// offload had to be reduced to fit memory). `None` on a clean load.
     pub warning: Option<String>,

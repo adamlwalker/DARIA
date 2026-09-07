@@ -330,7 +330,7 @@ pub async fn list_hf_ggufs(repo: String, endpoint: Option<String>) -> Result<Vec
     if out.is_empty() {
         return Err(format!("该仓库没有 .gguf 文件: {repo}"));
     }
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|a| a.name.to_lowercase());
     Ok(out)
 }
 
@@ -403,7 +403,7 @@ fn params_from_name(name: &str) -> Option<f64> {
             if i < bytes.len() && (bytes[i] == b'b' || bytes[i] == b'B') {
                 // must be a token edge, not e.g. "…4Bit"
                 let next = bytes.get(i + 1);
-                let edge = next.map_or(true, |c| !c.is_ascii_alphanumeric());
+                let edge = next.is_none_or(|c| !c.is_ascii_alphanumeric());
                 // and not preceded by a letter ("IQ4B"?) — digit start is enough
                 let prev_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
                 if edge && prev_ok {
@@ -464,7 +464,7 @@ fn quant_label_of(stem: &str) -> String {
             || t.starts_with("MXFP")
             || ((t.starts_with('Q') || t.starts_with("IQ"))
                 && t.chars().nth(if t.starts_with("IQ") { 2 } else { 1 })
-                    .map_or(false, |c| c.is_ascii_digit()))
+                    .is_some_and(|c| c.is_ascii_digit()))
     };
     // scan '-'/'.'/'_'-separated tokens from the END; join trailing qualifier
     // parts split by '_' ("Q4_K_M" survives because we split on '-'/'.' only)
@@ -729,20 +729,14 @@ pub async fn hf_model_detail(
 // ---------------------------------------------------------------------------
 
 /// Non-shard files worth pulling from an MLX repo.
+///
+/// Every top-level `.json`, rather than a list of the ones seen so far: the
+/// list silently dropped `processor_config.json`, and a multimodal model whose
+/// processor configuration never arrived loads with its vision half disabled.
+/// A model folder's top-level JSON is configuration — small, and all of it is
+/// something a loader may ask for — so the safe default is to take it.
 fn mlx_aux_file(name: &str) -> bool {
-    matches!(
-        name,
-        "config.json"
-            | "generation_config.json"
-            | "tokenizer.json"
-            | "tokenizer_config.json"
-            | "special_tokens_map.json"
-            | "chat_template.jinja"
-            | "merges.txt"
-            | "vocab.json"
-            | "added_tokens.json"
-            | "model.safetensors.index.json"
-    )
+    name.ends_with(".json") || matches!(name, "chat_template.jinja" | "merges.txt")
 }
 
 /// The subset of a repo tree that makes up an MLX folder model (all
@@ -1053,6 +1047,11 @@ mod tests {
             ("model.safetensors.index.json", 40_000),
             ("tokenizer.json", 5_000_000),
             ("tokenizer_config.json", 9_000),
+            // A multimodal repo's processor configuration. The name list this
+            // selection used to be dropped it, and the model then loaded with
+            // its vision half disabled.
+            ("processor_config.json", 400),
+            ("preprocessor_config.json", 500),
             ("README.md", 3_000),          // skipped
             (".gitattributes", 100),       // skipped
             ("images/banner.png", 50_000), // skipped (nested)
@@ -1061,7 +1060,12 @@ mod tests {
         .map(|(p, s)| (p.to_string(), *s))
         .collect();
         let files = mlx_files(&tree);
-        assert_eq!(files.len(), 6);
+        let names: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(names.contains(&"processor_config.json"), "{names:?}");
+        assert!(names.contains(&"preprocessor_config.json"), "{names:?}");
+        assert!(!names.contains(&"README.md"), "{names:?}");
+        assert!(!names.contains(&"images/banner.png"), "{names:?}");
+        assert_eq!(files.len(), 8);
         assert!(mlx_repo_check(&files).is_ok());
         // GGUF-style repo (no safetensors) must not pass as MLX.
         let gguf: Vec<(String, u64)> =

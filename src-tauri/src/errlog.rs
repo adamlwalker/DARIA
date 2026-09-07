@@ -127,10 +127,38 @@ pub fn sweep_native_crash_reports() {
     let _ = std::fs::write(&mark, "swept\n");
 }
 
+thread_local! {
+    /// Set while a panic is EXPECTED and will be caught — a parser that
+    /// asserts its way out of a file it cannot read. The log is for faults the
+    /// owner should act on; a document in an unsupported encoding is not one,
+    /// and a backtrace per page of a bad PDF would bury everything that is.
+    static HANDLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with any panic inside it kept out of the log and off stderr.
+///
+/// ONLY for a panic the caller catches and turns into an error — anything
+/// else must still be reported. The flag is restored even when `f` unwinds,
+/// which is the whole point of doing it with a guard.
+pub fn handled_panic<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HANDLED.with(|h| h.set(false));
+        }
+    }
+    HANDLED.with(|h| h.set(true));
+    let _restore = Restore;
+    f()
+}
+
 /// Route Rust panics into the log (the default hook still prints to stderr).
 pub fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if HANDLED.with(|h| h.get()) {
+            return;
+        }
         let bt = std::backtrace::Backtrace::force_capture();
         append_error("panic", &format!("{info}\n{bt}"));
         default(info);
@@ -152,6 +180,23 @@ pub fn open_error_log() -> Result<(), String> {
         append_error("info", "log created — no errors recorded yet");
     }
     crate::commands::open_default(&path.to_string_lossy())
+}
+
+/// Empty the log, keeping the file so the next write and the next open both
+/// still work. Offered next to "open" because the log is the one place a user
+/// is asked to look at and hand over: once a report has been sent, or once an
+/// old problem is fixed, everything before this point is noise that makes the
+/// next real entry harder to find.
+#[tauri::command]
+pub fn clear_error_log() -> Result<(), String> {
+    let path = error_log_path();
+    if !path.exists() {
+        return Ok(());
+    }
+    std::fs::write(&path, b"")
+        .map_err(|e| trf!("清空日志失败:{}", "could not clear the log: {}", e))?;
+    append_error("info", "log cleared");
+    Ok(())
 }
 
 #[cfg(test)]

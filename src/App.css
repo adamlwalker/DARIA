@@ -2034,6 +2034,21 @@ body.resizing-x {
 .field-row .data-btn {
   flex: none;
 }
+/* Error log: "open" and "clear" act on the same file, so they stack in one
+   row rather than taking a row each. The row grows to fit them. */
+.log-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+.log-actions .lang-switch,
+.log-actions .data-btn {
+  width: 100%;
+}
+.log-actions .data-btn {
+  justify-content: center;
+}
 /* Little palette swatch inside scheme segment buttons. */
 .scheme-dot {
   display: inline-block;
@@ -2061,6 +2076,12 @@ body.resizing-x {
   position: relative;
   cursor: pointer;
   transition: background var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease);
+}
+/* Unavailable, not merely off: a switch that looks exactly like "off" but
+   refuses the click reads as a bug. The row's own hint says why. */
+.set-switch:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 .set-switch.on,
 .skill-row.on .skill-row-toggle {
@@ -2492,6 +2513,12 @@ body.resizing-x {
   font-size: 12px;
   font-weight: 600;
   color: var(--text-dim);
+}
+/* Two actions on the right of a settings row — the voice preview offers one
+   sample per voice when both are in play. */
+.row-btns {
+  display: flex;
+  gap: 8px;
 }
 .data-btn {
   flex: 1;
@@ -3679,6 +3706,17 @@ a:focus-visible,
   font: inherit;
   font-size: 15px;
   line-height: 1.5;
+  /* A flex item will not shrink below its own content unless told to: the
+     default `min-width: auto` lets the placeholder's intrinsic width set a
+     floor, so the box refuses to narrow and pushes the buttons out of the row. */
+  min-width: 0;
+  /* A textarea wraps, so there is never anything to scroll sideways — but at a
+     UI scale that lands on a fractional device pixel ratio (110% and 120% here)
+     sub-pixel rounding leaves the content about a pixel wider than its box, and
+     the horizontal scrollbar that appears for it eats fifteen pixels of HEIGHT.
+     Measured in the app: at 100% the content box is the full 39px, at 110% it
+     is 24px — a line and a half of text, clipped, under a grey bar. */
+  overflow-x: hidden;
   color: var(--text);
   background: transparent;
   border: none;
@@ -4012,6 +4050,12 @@ a:focus-visible,
   box-sizing: border-box;
   background: radial-gradient(circle at 50% 38%, #1b1b1b, #0c0c0c 72%);
   animation: ctxin 0.18s ease-out;
+  /* This surface is dark in BOTH themes, so it cannot borrow the theme's
+     foreground: in the light theme `--text` is near-black, which is how the
+     exit button came to be black on black. Everything inside reads from
+     these instead. */
+  --live-fg: rgba(255, 255, 255, 0.92);
+  --live-fg-dim: rgba(255, 255, 255, 0.55);
 }
 .live-close {
   position: absolute;
@@ -4021,7 +4065,7 @@ a:focus-visible,
   height: 40px;
   font-size: 26px;
   line-height: 1;
-  color: var(--text-dim);
+  color: var(--live-fg-dim);
   background: transparent;
   border: none;
   border-radius: var(--r-md);
@@ -4029,7 +4073,7 @@ a:focus-visible,
 }
 .live-close:hover {
   background: rgba(255, 255, 255, 0.08);
-  color: var(--text);
+  color: var(--live-fg);
 }
 .live-stage {
   display: flex;
@@ -4043,7 +4087,7 @@ a:focus-visible,
 .live-status {
   font-size: 15px;
   letter-spacing: 0.04em;
-  color: var(--text-dim);
+  color: var(--live-fg-dim);
 }
 .live-caption {
   width: min(760px, 90vw);
@@ -4053,7 +4097,7 @@ a:focus-visible,
   text-align: center;
   font-size: 26px;
   line-height: 1.45;
-  color: var(--text);
+  color: var(--live-fg);
   font-family: var(--font-display);
   scrollbar-width: thin;
 }
@@ -4076,9 +4120,9 @@ a:focus-visible,
   bottom: 48px;
   padding: 10px 22px;
   font-size: 14px;
-  color: var(--text);
+  color: var(--live-fg);
   background: rgba(255, 255, 255, 0.06);
-  border: 1px solid var(--border-strong);
+  border: 1px solid rgba(255, 255, 255, 0.18);
   border-radius: var(--r-lg);
   cursor: pointer;
   transition: background 0.15s;
@@ -4103,6 +4147,11 @@ a:focus-visible,
   background: color-mix(in srgb, var(--warn) 12%, transparent);
   border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
   border-radius: var(--r-md);
+}
+/* A hint that is reporting a failure — the voice preview says why it could not
+   play. Same shape as the hint, in the colour every other error uses. */
+.settings-hint.settings-error {
+  color: var(--danger);
 }
 .hw-panel {
   width: 322px;
@@ -4276,33 +4325,39 @@ a:focus-visible,
 
 /* Hover tooltips for parameter labels in settings. */
 .has-tip {
-  position: relative;
   font-style: normal;
   border-bottom: 1px dotted var(--text-dim);
   cursor: help;
 }
-.has-tip::after {
-  content: attr(data-tip);
-  position: absolute;
-  bottom: calc(100% + 7px);
-  left: 0;
-  z-index: 90;
+/* The hover bubble. A real element portalled to <body>, not a pseudo-element
+   on the label: inside the settings panel a `position: fixed` box is positioned
+   against — and clipped by — the nearest transformed ancestor, and the panel's
+   open animation leaves a transform on an `overflow: hidden` modal. Placement
+   comes from SettingsPanel, which measures this box rather than guessing its
+   height from the text. */
+.settings-tip {
+  position: fixed;
+  /* Above the settings overlay (2600), which is what it explains. */
+  z-index: 2700;
   width: max-content;
-  max-width: 250px;
+  max-width: min(250px, calc(100vw - 24px));
   padding: 7px 10px;
   font-size: 11.5px;
+  font-style: normal;
   line-height: 1.45;
   color: var(--text);
   background: var(--surface-2);
   border: 1px solid var(--border-strong);
   border-radius: var(--r-md);
   box-shadow: var(--shadow-2);
-  opacity: 0;
   pointer-events: none;
-  transition: opacity 0.12s ease 0.15s;
+  /* An animation, not a transition. The bubble is measured and then placed in
+     the same frame, so a transition between the two has no earlier painted
+     state to run from and the fade simply did not happen. */
+  opacity: 0;
 }
-.has-tip:hover::after {
-  opacity: 1;
+.settings-tip.placed {
+  animation: ui-fade-in var(--t-fast) var(--ease) both;
 }
 
 /* First-launch setup: hero CTA + recommendation modal. */
@@ -4693,15 +4748,23 @@ a:focus-visible,
 
 /* Focus-follows-generation: while reasoning streams, pin a small window to
    the newest text and fade the older lines out above (mask gradient). */
-.think-body.focus {
-  max-height: 140px;
+/* Focus-follows-generation, shared by both modes: while reasoning streams, a
+   short window pinned to the newest line with what is above it faded out. The
+   two panels differ only in how tall that window is — their type sizes differ —
+   so only the height is stated twice. */
+.think-body.focus,
+.cm-think-body.focus {
   overflow-y: auto;
   scrollbar-width: none;
   -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 55%);
   mask-image: linear-gradient(to bottom, transparent 0, #000 55%);
 }
-.think-body.focus::-webkit-scrollbar {
+.think-body.focus::-webkit-scrollbar,
+.cm-think-body.focus::-webkit-scrollbar {
   display: none;
+}
+.think-body.focus {
+  max-height: 140px;
 }
 
 .ctx-ring {
@@ -5799,6 +5862,8 @@ a:focus-visible,
   font: inherit;
   font-size: 15px;
   line-height: 1.5;
+  min-width: 0; /* shrink with the row — see `.input-row textarea` */
+  overflow-x: hidden; /* no sideways scrollbar stealing height — same reason */
   color: var(--text);
   background: transparent;
   border: none;
@@ -5908,6 +5973,13 @@ a:focus-visible,
 }
 .cm-think.live .cm-think-body {
   color: var(--text);
+}
+/* The shared spotlight rule lives with chat's; only this panel's height is its
+   own. Without it a long reasoning trace grew until it pushed the steps under
+   it off screen, and the words being written were wherever the page happened
+   to be scrolled. */
+.cm-think-body.focus {
+  max-height: 132px;
 }
 
 /* ---- spinner ---- */

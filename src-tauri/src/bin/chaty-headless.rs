@@ -93,7 +93,7 @@ fn res<T: serde::Serialize>(r: Result<T, String>) -> Result<Value, String> {
     r.and_then(ok)
 }
 
-fn load_engine(path: &str, n_ctx: Option<u32>) -> Result<ModelInfo, String> {
+fn load_engine(path: &str, n_ctx: Option<u32>, speculative: bool) -> Result<ModelInfo, String> {
     let (engine, info): (Engine, ModelInfo) = if path == "mock" {
         let e = MockBackend::new("mock");
         let info = ModelInfo {
@@ -107,6 +107,8 @@ fn load_engine(path: &str, n_ctx: Option<u32>) -> Result<ModelInfo, String> {
             n_ctx_train: Some(16384),
             n_ctx,
             n_layer: None,
+            speculative: false,
+            speculative_on: false,
             gpu_layers: 0,
             gpu_name: None,
             model_name: Some("mock".into()),
@@ -116,18 +118,21 @@ fn load_engine(path: &str, n_ctx: Option<u32>) -> Result<ModelInfo, String> {
             supports_thinking: false,
             think_switch: false,
             effort_levels: Vec::new(),
+            tool_role: false,
+            reasoning_field: false,
             supports_tools: true,
             multimodal: false,
             vision_ready: false,
+            multi_image: true,
             mmproj: None,
             warning: None,
         };
         (Arc::new(e), info)
     } else if Path::new(path).join("config.json").is_file() {
-        let (e, info) = MlxEngine::load(path, n_ctx, |_| {}).map_err(|e| e.to_string())?;
+        let (e, info) = MlxEngine::load(path, n_ctx, speculative, |_| {}).map_err(|e| e.to_string())?;
         (Arc::new(e), info)
     } else {
-        let (e, info) = LlamaEngine::load(path, None, n_ctx).map_err(|e| e.to_string())?;
+        let (e, info) = LlamaEngine::load(path, None, n_ctx, speculative).map_err(|e| e.to_string())?;
         (Arc::new(e), info)
     };
     if let Some(old) = engine_slot().lock().unwrap().replace(engine) {
@@ -141,8 +146,11 @@ async fn dispatch(cmd: &str, args: Value, id: u64) {
         "load_model" => {
             let path = req_s(&args, "path");
             let n_ctx = u_arg(&args, "n_ctx").map(|v| v as u32);
+            // Mirrors the Tauri command: absent means the setting's default,
+            // which is off.
+            let speculative = b_arg(&args, "speculative").unwrap_or(false);
             match path {
-                Ok(p) => res(load_engine(&p, n_ctx)),
+                Ok(p) => res(load_engine(&p, n_ctx, speculative)),
                 Err(e) => Err(e),
             }
         }
@@ -194,6 +202,7 @@ async fn dispatch(cmd: &str, args: Value, id: u64) {
             Ok(Value::Null)
         }
         "agent_get_workspace" => ok(ag::agent_get_workspace()),
+        "skill_live_support" => Ok(Value::Null),
         "agent_grant_dir" => req_s(&args, "path").and_then(|p| res(ag::agent_grant_dir(p))),
         "agent_revoke_dir" => req_s(&args, "path").map(|p| {
             ag::agent_revoke_dir(p);
@@ -308,6 +317,14 @@ async fn dispatch(cmd: &str, args: Value, id: u64) {
             Ok(q) => res(search::web_search(q).await),
             Err(e) => Err(e),
         },
+        // The agent's `web_fetch` goes through this. Without it every web task
+        // in the bench failed on the tool rather than on the work, which is
+        // indistinguishable from a page being down and made the whole web side
+        // of code mode untestable.
+        "fetch_page_ex" => match req_s(&args, "url") {
+            Ok(u) => res(chaty_lib::webx::fetch_page_ex(u, b_arg(&args, "raw")).await),
+            Err(e) => Err(e),
+        },
         "fetch_url" => match req_s(&args, "url") {
             Ok(u) => res(search::fetch_url(u).await),
             Err(e) => Err(e),
@@ -376,6 +393,12 @@ fn main() {
     // Reap headless Chromes left by SIGKILLed bench runs before this one
     // launches its own (a live sibling's browser is skipped by pid check).
     chaty_lib::browser::sweep_orphan_browsers();
+    // Bench hook: point the automation browser at a real profile so a harness
+    // can drive a signed-in site the way the app does. The app sets this from
+    // its own data dir; headless otherwise runs on a throwaway profile.
+    if let Ok(dir) = std::env::var("CHATY_BROWSER_PROFILE") {
+        chaty_lib::browser::set_profile_dir(std::path::PathBuf::from(dir));
+    }
     // Bench A/B hook: flip hashline anchors on from the environment so the
     // whole session (read_file prefixes + edit_lines) runs in anchor mode.
     if std::env::var("CHATY_EDIT_ANCHORS").map(|v| v == "1").unwrap_or(false) {
@@ -402,5 +425,12 @@ fn main() {
         tauri::async_runtime::spawn(async move {
             dispatch(&cmd, args, id).await;
         });
+    }
+    // stdin closed — the run is over. Rust never drops a `static`, so without
+    // this the model's Metal buffers are still alive when llama.cpp's own
+    // static destructors run, and its residency-set collection aborts the
+    // process on an assertion instead of exiting.
+    if let Some(engine) = engine_slot().lock().unwrap().take() {
+        engine.unload();
     }
 }

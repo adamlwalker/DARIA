@@ -11,9 +11,28 @@ const END = "\x00END\x00";
 // last `<` that is still a prefix of a known marker (optionally a channel
 // opener awaiting its name) is held back; ordinary text tails (`a < b`,
 // `<div`) are left alone.
-const MARKER_WORDS = ["channel", "turn", "think", "message", "end", "return", "start"];
+const MARKER_WORDS = ["channel", "turn", "think", "message", "end", "return", "start", "eom", "eot"];
 const CHANNEL_NAMES = ["analysis", "thought", "thinking", "final"];
 function trimPartialMarker(s: string): string {
+  return trimPartialRecipient(trimPartialTag(s));
+}
+
+/// ATEM opens a span with `to=<recipient><|message|>`, and the recipient
+/// arrives BEFORE the tag that terminates it — outside the `<` the tag rule
+/// looks behind. Until the tag lands, that text is protocol rather than
+/// answer, and rendering it flashes ` to=self` at the head of every reply.
+/// Only where a span can actually open — the head of the stream, or straight
+/// after `<|start|>assistant` — so a reply that ends on a literal `to=…` (a
+/// URL parameter, say) keeps its text instead of losing it to this rule.
+function trimPartialRecipient(s: string): string {
+  const m = /(?:^|(<[|｜]start[|｜]>[ \t]*assistant))[ \t]*to=[\w.*-]*$/.exec(s);
+  if (!m) return s;
+  // Keep the `<|start|>assistant` that opened it — the tag rules below are
+  // what erase that — and cut only the recipient still being typed.
+  return s.slice(0, m.index + (m[1]?.length ?? 0));
+}
+
+function trimPartialTag(s: string): string {
   const lt = s.lastIndexOf("<");
   if (lt === -1) return s;
   const tail = s.slice(lt);
@@ -43,17 +62,42 @@ function trimPartialMarker(s: string): string {
  * unterminated span is left open for the streaming UI.
  */
 export function normalizeChannels(s: string): string {
-  const held = trimPartialMarker(s);
+  // LFM2 writes its tool calls as `<|tool_call_start|>[fn(arg='v')]<|tool_call_end|>`
+  // whatever format the system prompt asks for. The engine now streams those
+  // markers instead of deleting them — the recorded turn needs them verbatim or
+  // the next prompt cannot reproduce the tokens and the KV prefix breaks — so
+  // this is where they stop being shown to a person. The call itself is read
+  // out of the raw text by parseNativeToolCall; what is left here is display.
+  const held = trimPartialMarker(s).replace(
+    /<[|｜]tool_(?:call|list)_(?:start|end)[|｜]>/gi,
+    "",
+  );
   // Control-token words (think/message/end/return/start) require AT LEAST ONE
   // pipe — a plain `<think>` is the Qwen convention this function's OUTPUT
   // uses and must pass through untouched.
   if (
-    !/<[|｜]?(channel|turn)\b|\b(channel|turn)[|｜]>|<(?:[|｜](?:think|message|end|return|start)|(?:think|message|end|return|start)[|｜])/i.test(
+    !/<[|｜]?(channel|turn)\b|\b(channel|turn)[|｜]>|<(?:[|｜](?:think|message|end|return|start|eom|eot)|(?:think|message|end|return|start|eom|eot)[|｜])|\bto=[\w.*-]+[ \t]*<[|｜]message[|｜]>/i.test(
       held,
     )
   )
     return held;
   const t = held
+    // ATEM (Muse Glimmer) addresses each span to a recipient rather than
+    // naming a channel: `to=self` is the reasoning, anything else — `to=user`,
+    // `to=<tool>` — is the turn leaving that channel. The opening
+    // `<|start|>assistant` is optional because the generation prompt already
+    // emitted it, so a fresh stream begins bare at ` to=self<|message|>`.
+    // These run before the generic `<|start|>` rule below, which would
+    // otherwise strip the tag and orphan the recipient.
+    .replace(
+      /(?:<[|｜]start[|｜]>[ \t]*assistant)?[ \t]*to=self[ \t]*<[|｜]message[|｜]>/gi,
+      THINK,
+    )
+    .replace(
+      /(?:<[|｜]start[|｜]>[ \t]*assistant)?[ \t]*to=[\w.*-]+[ \t]*<[|｜]message[|｜]>/gi,
+      FINAL,
+    )
+    .replace(/<[|｜](?:eom|eot)[|｜]>/gi, END)
     // Gemma 4 control tokens that should never render: <|think|>, turn markers.
     .replace(/<(?:[|｜]think[|｜]?|think[|｜])>\n?/gi, "")
     .replace(/<[|｜]?turn[|｜]?>[ \t]*(model|assistant|user|system|tool)?[ \t]*\n?/gi, "")

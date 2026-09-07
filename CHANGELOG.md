@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.3.0 — Qwen 3.8 coding and a long run that stays on the cache
+
+Ported the coding-agent and Qwen 3.8 work from upstream Chaty v2.0.9–v2.1.7 (no TikTok skill, no extra UI languages).
+
+- **Qwen 3.8** uses its native reasoning-effort ladder in chat and code mode. Reasoning is stored in its own field so the next prompt is an append onto the cache, not a re-read of the whole conversation.
+- **Tool results use the tool role**, the last answer stays in the transcript, the tool-call closer the stop sequence trimmed is put back, and the date/search context rides on the current user message — so a long agent run resumes most of the prompt instead of starting over.
+- **llama.cpp** moves to a Muse-Glimmer-aware build with MTP speculative decoding (Settings → Model, off by default, only on models that actually ship a prediction head).
+- **Browser tools** click the control they named, recover a stray Chrome profile, and no longer die when one `browser_close` races the next window.
+- Generation outlives a webview reload; the error log can be cleared; GPU crashes lower the offload instead of ending the load.
+
 ## v2.2.0 — On-device image generation
 
 - **Image gen** chat mode (tools menu or `/imagegen`) returns a PNG from **Z-Image-Turbo** on Apple Silicon via a lazy MLX sidecar. Turning the mode off unloads the weights.

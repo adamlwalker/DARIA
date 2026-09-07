@@ -3,11 +3,15 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 
-export type Role = "system" | "user" | "assistant";
+export type Role = "system" | "user" | "assistant" | "tool";
 
 export interface ChatMessage {
   role: Role;
   content: string;
+  /** The turn's thinking, kept out of `content`. Some templates read reasoning
+   *  only from this field and never split it back out of the content — sent
+   *  only where the model is probed to use it (`ModelInfo.reasoningField`). */
+  reasoning_content?: string;
   /** Image attachment paths — only honoured by vision-ready models (mmproj loaded). */
   images?: string[];
 }
@@ -33,6 +37,10 @@ export interface GenParams {
 export interface GenRequest {
   messages: ChatMessage[];
   params?: Partial<GenParams>;
+  /** Where the finished reply belongs. Given this, the app keeps the reply
+   *  itself: a turn outlives the page that asked for it, and one that ends
+   *  after the webview was replaced is written down rather than lost. */
+  save?: { conversationId: string; messageId: string };
 }
 
 export interface ModelInfo {
@@ -46,6 +54,12 @@ export interface ModelInfo {
   nCtxTrain?: number | null;
   nCtx?: number | null;
   nLayer?: number | null;
+  /** The model file carries a multi-token-prediction head, so speculative
+   *  decoding is available for it. Stays true when the setting is off — it is
+   *  what the settings switch is enabled on. */
+  speculative: boolean;
+  /** Speculative decoding is actually running for this load. */
+  speculativeOn: boolean;
   gpuLayers: number;
   gpuName?: string | null;
   modelName?: string | null;
@@ -58,10 +72,19 @@ export interface ModelInfo {
   /** Native reasoning-effort ladder, weakest first (Qwen3.8:
    *  ["low","medium","xhigh"]). Empty ⇒ plain on/off thinking. */
   effortLevels?: string[];
+  /** The chat template renders a tool result under its own role AND keeps the
+   *  assistant reasoning before it — probed at load, never assumed. */
+  toolRole?: boolean;
+  /** The template reads a turn's thinking from a structured field rather than
+   *  splitting it out of the content (Qwen3.8). */
+  reasoningField?: boolean;
   supportsTools: boolean;
   multimodal: boolean;
   /** The vision encoder (mmproj) is loaded — images actually work this session. */
   visionReady: boolean;
+  /** Whether one prompt may carry several pictures. False for Gemma-4 on MLX,
+   *  which encodes the first and rejects the rest. */
+  multiImage?: boolean;
   /** Path of the paired mmproj GGUF, when one was found. */
   mmproj?: string | null;
   /** Non-fatal load warning code (e.g. "gpu-oom"), or null. */
@@ -185,6 +208,12 @@ export interface RagDocText {
  *  an overview report with one citation per file. */
 export async function ragCorpusDocs(maxChars?: number): Promise<RagDocText[]> {
   return invoke<RagDocText[]>("rag_corpus_docs", { maxChars });
+}
+
+/** Tell the backend the page has booted. A second call in one process lifetime
+ *  is the webview having reloaded — see `note_frontend_ready`. */
+export async function noteFrontendReady(): Promise<void> {
+  await invoke("note_frontend_ready");
 }
 
 export async function ragSearch(query: string, k?: number): Promise<RagHit[]> {
@@ -555,15 +584,27 @@ export interface LoadProgress {
   frac: number;
 }
 
+/// `speculative` is required rather than optional on purpose. It is a property
+/// of the loaded engine, which chat and code mode share — one of them cannot
+/// have the head and the other not — so the only way the two could ever
+/// disagree is a load path that forgot to pass the setting. Requiring it here
+/// makes that a compile error instead of something to notice later.
 export async function loadModel(
   path: string,
-  gpuLayers?: number,
-  nCtx?: number,
+  gpuLayers: number | undefined,
+  nCtx: number | undefined,
+  speculative: boolean,
   onProgress?: (p: LoadProgress) => void,
 ): Promise<ModelInfo> {
   const channel = new Channel<LoadProgress>();
   if (onProgress) channel.onmessage = onProgress;
-  return await invoke<ModelInfo>("load_model", { path, gpuLayers, nCtx, onProgress: channel });
+  return await invoke<ModelInfo>("load_model", {
+    path,
+    gpuLayers,
+    nCtx,
+    speculative,
+    onProgress: channel,
+  });
 }
 
 export async function getModel(): Promise<ModelInfo | null> {
@@ -787,10 +828,36 @@ export async function setTrayLanguage(lang: string): Promise<void> {
 export async function generate(
   request: GenRequest,
   onEvent: (event: StreamEvent) => void,
+  /** Where the reply belongs. With it, the app owns the turn: generation is
+   *  not stopped by this page going away, and a page that comes back can pick
+   *  the stream up where it left off. */
+  save?: { conversationId: string; messageId: string },
 ): Promise<void> {
   const channel = new Channel<StreamEvent>();
   channel.onmessage = onEvent;
-  await invoke("generate", { request, onEvent: channel });
+  await invoke("generate", { request, save: save ?? null, onEvent: channel });
+}
+
+/** A turn that was still generating when this page loaded. */
+export interface LiveTurnInfo {
+  conversationId: string;
+  messageId: string;
+  /** Everything generated before this page arrived. */
+  text: string;
+}
+
+/** Take over an in-flight turn, if there is one.
+ *
+ *  Called once as the interface comes up. Normally there is nothing and this
+ *  answers null. After the webview was replaced mid-generation there is: the
+ *  app kept generating, and this hands over the text so far and makes this
+ *  page the listener for the rest. */
+export async function attachGeneration(
+  onEvent: (event: StreamEvent) => void,
+): Promise<LiveTurnInfo | null> {
+  const channel = new Channel<StreamEvent>();
+  channel.onmessage = onEvent;
+  return (await invoke("attach_generation", { onEvent: channel })) as LiveTurnInfo | null;
 }
 
 /** Request the in-flight generation to stop early. */
@@ -1125,18 +1192,26 @@ export interface SynthAudio {
   sampleRate: number;
 }
 
-/** Transcribe base64 f32 PCM audio → text (Whisper). */
-export async function transcribe(audio: string, sampleRate: number): Promise<string> {
-  return await invoke<string>("transcribe", { audio, sampleRate });
+/** Transcribe base64 f32 PCM audio → text (Whisper base.en by default). */
+export async function transcribe(
+  audio: string,
+  sampleRate: number,
+  multilingual = false,
+): Promise<string> {
+  return await invoke<string>("transcribe", { audio, sampleRate, multilingual });
 }
 
-/** Synthesize speech for text (Kokoro) → base64 f32 PCM + sample rate. */
+/** Synthesize speech (Kokoro, or Chinese VITS when explicitly enabled). */
 export async function synthesize(
   text: string,
   speed?: number,
   sid?: number,
+  chineseEnabled = false,
+  /** Speaker for the Chinese voice, chosen from its own list. The engine
+   *  decides per utterance which of the two speaks, so both travel. */
+  sidZh?: number,
 ): Promise<SynthAudio> {
-  return await invoke<SynthAudio>("synthesize", { text, speed, sid });
+  return await invoke<SynthAudio>("synthesize", { text, speed, sid, sidZh, chineseEnabled });
 }
 
 export interface EdgeVoice {
@@ -1250,6 +1325,10 @@ export async function logAppError(kind: string, detail: string): Promise<void> {
   await invoke("log_app_error", { kind, detail });
 }
 /** Open logs/chaty-error.log in the OS default viewer. */
+export async function clearErrorLog(): Promise<void> {
+  await invoke("clear_error_log");
+}
+
 export async function openErrorLog(): Promise<void> {
   await invoke("open_error_log");
 }

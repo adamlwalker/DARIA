@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useI18n, type TKey } from "../lib/i18n";
 import { useExitTransition } from "../lib/useExit";
@@ -14,12 +14,13 @@ import {
   ragStatus,
   ragClearAll,
   openModelsDir,
+  openErrorLog,
+  clearErrorLog,
   openExternal,
   listEdgeVoices,
-  openErrorLog,
   type EdgeVoice,
 } from "../lib/ipc";
-import { decodeAudio, playAudio } from "../lib/audio";
+import { decodeAudio, playAudio, primeAudioPlayback } from "../lib/audio";
 import { SAMPLING_PRESETS, matchingSamplingPreset, applySamplingPresetValues } from "../lib/samplingPresets";
 import { speakWithSettings, DEFAULT_EDGE_VOICE, type TtsEngine } from "../lib/tts";
 import { CODE_THEMES, type CodeTheme } from "../lib/codeTheme";
@@ -75,9 +76,19 @@ export interface GenSettings {
   voiceVolume: number;
   /** GPU offload: -1 = auto‑tune by VRAM, 0 = CPU only, >0 = that many layers. */
   gpuLayers: number;
+  /** Decode with the model's own multi-token-prediction head, on the models
+   *  that ship one. Off by default, and experimental: measured, it is a large
+   *  win on text whose continuation is obvious and a small loss on ordinary
+   *  prose, and nothing the app can read beforehand says which a reply will
+   *  be. A default that is sometimes slower is not a default. */
+  speculative: boolean;
   /** Context window to load the model with: 0 = memory-friendly default (≤8192),
    *  >0 = that many tokens (clamped to the model's trained length). */
   contextLength: number;
+  /** How many knowledge-base chunks a question may cite. Was hardcoded at 6
+   *  with a ceiling of 12, so a large library answered out of six chunks no
+   *  matter how much of it was relevant. */
+  ragTopK: number;
   /** Code mode: max agent steps per turn before it pauses. */
   codeMaxSteps: number;
   /** Code mode: default bash-command timeout in seconds. */
@@ -160,7 +171,9 @@ export const defaultSettings: GenSettings = {
   voicePitch: 0,
   voiceVolume: 0,
   gpuLayers: -1,
+  speculative: false,
   contextLength: 0,
+  ragTopK: 8,
   codeMaxSteps: 64,
   codeBashTimeout: 60,
   codeTemperature: 0.3,
@@ -200,6 +213,12 @@ export const HF_ENDPOINT_MIRROR = "https://hf-mirror.com";
  *  the larger Kokoro-82M set (af_heart, am_fenrir, …) needs a different model.
  *  Labels carry the Kokoro VOICES.md overall grade so users can pick good ones;
  *  ★ marks the best in each gender. */
+/** The five speakers `sherpa-onnx-vits-zh-ll` declares in its own
+ *  `G_multisperaker_latest.json` (`speakers`: suyingxue 0, gunian 1,
+ *  fushiyu 2, bingjiao 3, bazong 4). Named as the model names them rather
+ *  than translated — these are the ids it was trained with. */
+export const VOICES_ZH = ["suyingxue", "gunian", "fushiyu", "bingjiao", "bazong"];
+
 export const VOICES = [
   "af · warm female · C+",
   "★ af_bella · female · A-",
@@ -266,9 +285,80 @@ function SetRow({ label, hint, children }: { label: string; hint?: string; child
   );
 }
 
-function Switch({ on, onToggle }: { on: boolean; onToggle: () => void }) {
+/**
+ * A number that can be switched off entirely: the off/custom pair, with the
+ * slider showing only while it is on.
+ *
+ * Three settings are this control — Sampling's max length and Code's step and
+ * timeout ceilings — and each had grown its own copy inline. They had drifted:
+ * two said "Limit / No limit" in that order against the third's "No limit /
+ * Custom", and their sliders lived in a bordered card of their own holding
+ * nothing but a bare bar. One component, so the next one cannot drift either.
+ */
+function LimitField({
+  label,
+  tip,
+  offLabel,
+  onLabel,
+  off,
+  onOff,
+  value,
+  children,
+}: {
+  label: string;
+  tip?: string;
+  offLabel: string;
+  onLabel: string;
+  off: boolean;
+  onOff: (off: boolean) => void;
+  /** Shown beside the label while the setting is on. */
+  value?: React.ReactNode;
+  /** The slider — rendered only while the setting is on. */
+  children: React.ReactNode;
+}) {
   return (
-    <button type="button" role="switch" aria-checked={on} className={`set-switch ${on ? "on" : ""}`} onClick={onToggle}>
+    <label className="field">
+      <span>
+        {tip ? (
+          <em className="has-tip" data-tip={tip}>
+            {label}
+          </em>
+        ) : (
+          label
+        )}
+        {!off && value != null && <> <b>{value}</b></>}
+      </span>
+      <div className="lang-switch">
+        <button type="button" className={off ? "active" : ""} onClick={() => onOff(true)}>
+          {offLabel}
+        </button>
+        <button type="button" className={off ? "" : "active"} onClick={() => onOff(false)}>
+          {onLabel}
+        </button>
+      </div>
+      {!off && children}
+    </label>
+  );
+}
+
+function Switch({
+  on,
+  onToggle,
+  disabled,
+}: {
+  on: boolean;
+  onToggle: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={on}
+      disabled={disabled}
+      className={`set-switch ${on ? "on" : ""}`}
+      onClick={onToggle}
+    >
       <span className="set-knob" />
     </button>
   );
@@ -281,6 +371,8 @@ export function SettingsPanel({
   onClose,
   maxTokensLimit = 4096,
   ctxTrainLimit,
+  layersLimit,
+  specSupported,
   onReloadModel,
   reloading = false,
   onDataCleared,
@@ -291,6 +383,10 @@ export function SettingsPanel({
   onClose: () => void;
   /** Upper bound for the max-length slider — adapts to the loaded model's context. */
   maxTokensLimit?: number;
+  /** The loaded model's layer count — ceiling for the GPU-offload slider. */
+  layersLimit?: number | null;
+  /** The loaded model carries a multi-token-prediction head. */
+  specSupported?: boolean;
   /** The loaded model's trained context length, used as the slider ceiling. */
   ctxTrainLimit?: number | null;
   /** Reload the current model so context/GPU changes take effect. Absent = no model. */
@@ -305,6 +401,72 @@ export function SettingsPanel({
   const [presetName, setPresetName] = useState("");
   const set = <K extends keyof GenSettings>(key: K, v: GenSettings[K]) =>
     onChange({ ...value, [key]: v });
+
+  /** The hover bubble for a `data-tip` label: its text and where to draw it.
+   *
+   *  This used to be a `::after` on the label, positioned `fixed` and clamped
+   *  to the window. It could not work. A fixed box is positioned against — and
+   *  clipped by — the nearest ancestor carrying a transform, and the panel's
+   *  open animation (`ui-pop-in`, `both`) leaves one on `.settings-modal`,
+   *  which is also `overflow: hidden`. So the bubble was measured against the
+   *  window, drawn against a `.field` 362px away, and then cut off by the
+   *  panel's own edge — the "sometimes hangs off the window" report, and why
+   *  clamping harder never fixed it. A real element under `document.body` has
+   *  no such ancestor: viewport coordinates mean the viewport, and nothing
+   *  clips it. It also has a measurable height, so the placement below reads
+   *  the box it is actually placing instead of estimating from text length. */
+  const [tip, setTip] = useState<{ text: string; x: number; y: number } | null>(null);
+  const tipRef = useRef<HTMLDivElement | null>(null);
+  const tipAnchor = useRef<DOMRect | null>(null);
+
+  useEffect(() => {
+    if (!open) {
+      setTip(null);
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onOver = (e: globalThis.MouseEvent) => {
+      const el = (e.target as HTMLElement | null)?.closest?.("[data-tip]");
+      const text = el instanceof HTMLElement ? el.getAttribute("data-tip") : null;
+      if (!text || !(el instanceof HTMLElement)) return;
+      clearTimeout(timer);
+      // The same short delay the CSS transition used to carry, so sweeping the
+      // pointer across a column of labels does not strobe.
+      timer = setTimeout(() => {
+        tipAnchor.current = el.getBoundingClientRect();
+        // Provisional: placed for real once the box below has been measured.
+        setTip({ text, x: -9999, y: -9999 });
+      }, 150);
+    };
+    const onOut = (e: globalThis.MouseEvent) => {
+      const el = (e.target as HTMLElement | null)?.closest?.("[data-tip]");
+      if (!el) return;
+      clearTimeout(timer);
+      setTip(null);
+    };
+    document.addEventListener("mouseover", onOver, true);
+    document.addEventListener("mouseout", onOut, true);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener("mouseover", onOver, true);
+      document.removeEventListener("mouseout", onOut, true);
+    };
+  }, [open]);
+
+  // Place the bubble once it has a box: above its label, below when there is no
+  // room above, and clamped into the window either way.
+  useLayoutEffect(() => {
+    const box = tipRef.current;
+    const anchor = tipAnchor.current;
+    if (!box || !anchor || !tip || tip.x !== -9999) return;
+    const MARGIN = 12;
+    const { width: w, height: h } = box.getBoundingClientRect();
+    const x = Math.min(Math.max(MARGIN, anchor.left), window.innerWidth - w - MARGIN);
+    const above = anchor.top - 7 - h;
+    const want = above >= MARGIN ? above : anchor.bottom + 7;
+    const y = Math.max(MARGIN, Math.min(want, window.innerHeight - h - MARGIN));
+    setTip({ text: tip.text, x: Math.round(x), y: Math.round(y) });
+  }, [tip]);
 
   useEffect(() => {
     if (!open) return;
@@ -333,7 +495,9 @@ export function SettingsPanel({
           code: ds.codeSessions,
           db: ds.dbBytes,
           models: models.length,
-          modelBytes: models.reduce((a, m) => a + (m.sizeMb ?? 0) * 1e6, 0),
+          // sizeMb is mebibytes (bytes / 1024²) — scaling it by 1e6 quietly
+          // shaved ~4.6% off every model folder the panel reported.
+          modelBytes: models.reduce((a, m) => a + (m.sizeMb ?? 0) * 1024 * 1024, 0),
           kbDocs: rs?.docs ?? 0,
           kbChunks: rs?.chunks ?? 0,
         }),
@@ -360,6 +524,7 @@ export function SettingsPanel({
   const [edgeVoicesLoading, setEdgeVoicesLoading] = useState(false);
   const testVoice = () => {
     if (voiceTesting) return;
+    primeAudioPlayback();
     setVoiceTesting(true);
     speakWithSettings(value, "Hi! This is how I sound. Nice to meet you.")
       .then((a) => playAudio(decodeAudio(a.audio), a.sampleRate).done)
@@ -513,7 +678,6 @@ export function SettingsPanel({
     { id: "sampling", label: t("setCatSampling") },
     { id: "model", label: t("setCatModel") },
     { id: "code", label: t("setCatCode") },
-    // TTS is English-only, so the voice section only exists in English UI.
     ...(lang === "en" ? [{ id: "voice" as CatId, label: t("setCatVoice") }] : []),
     { id: "data", label: t("setCatData") },
     { id: "about", label: t("setCatAbout") },
@@ -522,6 +686,19 @@ export function SettingsPanel({
   if (!mounted) return null;
 
   return createPortal(
+    <>
+    {tip && (
+      // Outside the overlay on purpose: the overlay's descendants establish
+      // containing blocks and clip, which is the whole reason this is not a
+      // pseudo-element on the label any more.
+      <div
+        ref={tipRef}
+        className={`settings-tip ${tip.x === -9999 ? "" : "placed"}`}
+        style={{ left: tip.x, top: tip.y }}
+      >
+        {tip.text}
+      </div>
+    )}
     <div className={`settings-overlay ${closing ? "closing" : ""}`} onMouseDown={onClose}>
       <div className="settings-modal" onMouseDown={(e) => e.stopPropagation()}>
         <aside className="settings-nav">
@@ -608,9 +785,32 @@ export function SettingsPanel({
                 <Switch on={value.reduceMotion} onToggle={() => set("reduceMotion", !value.reduceMotion)} />
               </SetRow>
               <SetRow label={t("errorLog")} hint={t("errorLogHint")}>
-                <div className="lang-switch">
-                  <button type="button" onClick={() => { void openErrorLog().catch(() => {}); }}>
-                    {t("errorLogOpen")}
+                {/* Open and clear sit one above the other: they act on the same
+                    file, so a row each would read as two unrelated settings. */}
+                <div className="log-actions">
+                  <div className="lang-switch">
+                    <button type="button" onClick={() => { void openErrorLog().catch(() => {}); }}>
+                      {t("errorLogOpen")}
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    className="data-btn danger"
+                    onClick={async () => {
+                      if (
+                        !(await confirm({
+                          message: t("confirmClearErrorLog"),
+                          title: t("errorLogClear"),
+                          confirmLabel: t("errorLogClear"),
+                          danger: true,
+                        }))
+                      ) {
+                        return;
+                      }
+                      void clearErrorLog().catch(console.error);
+                    }}
+                  >
+                    {t("errorLogClear")}
                   </button>
                 </div>
               </SetRow>
@@ -709,6 +909,21 @@ export function SettingsPanel({
               <SetRow label={t("setAutoTitle")} hint={t("setAutoTitleHint")}>
                 <Switch on={value.autoTitle} onToggle={() => set("autoTitle", !value.autoTitle)} />
               </SetRow>
+
+              <label className="field">
+                <span>
+                  <em className="has-tip" data-tip={t("tipRagTopK")}>{t("ragTopK")}</em> <b>{value.ragTopK}</b>
+                </span>
+                <input
+                  type="range"
+                  min={1}
+                  max={32}
+                  step={1}
+                  value={value.ragTopK}
+                  onChange={(e) => set("ragTopK", Number(e.target.value))}
+                />
+              </label>
+              <div className="settings-hint">{t("ragTopKHint")}</div>
             </>
           )}
 
@@ -806,28 +1021,24 @@ export function SettingsPanel({
                 </span>
                 <input type="range" min={0.1} max={1} step={0.01} value={value.topP} onChange={(e) => set("topP", Number(e.target.value))} />
               </label>
-              <label className="field">
-                <span><em className="has-tip" data-tip={t("tipMaxTokens")}>{t("maxTokens")}</em></span>
-                <div className="lang-switch">
-                  <button type="button" className={!value.limitTokens ? "active" : ""} onClick={() => set("limitTokens", false)}>{t("noLimit")}</button>
-                  <button type="button" className={value.limitTokens ? "active" : ""} onClick={() => set("limitTokens", true)}>{t("gpuCustom")}</button>
-                </div>
-              </label>
-              {value.limitTokens && (
-                <label className="field">
-                  <span>
-                    {t("maxTokens")} <b>{value.maxTokens}</b>
-                  </span>
-                  <input
-                    type="range"
-                    min={128}
-                    max={maxTokensLimit}
-                    step={128}
-                    value={Math.min(value.maxTokens, maxTokensLimit)}
-                    onChange={(e) => set("maxTokens", Number(e.target.value))}
-                  />
-                </label>
-              )}
+              <LimitField
+                label={t("maxTokens")}
+                tip={t("tipMaxTokens")}
+                offLabel={t("noLimit")}
+                onLabel={t("gpuCustom")}
+                off={!value.limitTokens}
+                onOff={(o) => set("limitTokens", !o)}
+                value={Math.min(value.maxTokens, maxTokensLimit)}
+              >
+                <input
+                  type="range"
+                  min={128}
+                  max={maxTokensLimit}
+                  step={128}
+                  value={Math.min(value.maxTokens, maxTokensLimit)}
+                  onChange={(e) => set("maxTokens", Number(e.target.value))}
+                />
+              </LimitField>
               <label className="field">
                 <span>
                   <em className="has-tip" data-tip={t("tipTopK")}>Top-K</em> <b>{value.topK === 0 ? t("off") : value.topK}</b>
@@ -897,7 +1108,7 @@ export function SettingsPanel({
                   <span>
                     {t("gpuLayersLabel")} <b>{value.gpuLayers}</b>
                   </span>
-                  <input type="range" min={1} max={80} step={1} value={value.gpuLayers} onChange={(e) => set("gpuLayers", Number(e.target.value))} />
+                  <input type="range" min={1} max={Math.max(1, layersLimit ?? 80)} step={1} value={value.gpuLayers} onChange={(e) => set("gpuLayers", Number(e.target.value))} />
                 </label>
               )}
               <div className="settings-hint">{t("gpuHint")}</div>
@@ -937,6 +1148,18 @@ export function SettingsPanel({
                   );
                 })()}
               <div className="settings-hint">{t("ctxHint")}</div>
+
+              <SetRow
+                label={`${t("specDecode")} · ${t("experimental")}`}
+                hint={specSupported ? t("specDecodeHint") : t("specDecodeUnsupported")}
+              >
+                <Switch
+                  on={value.speculative && !!specSupported}
+                  disabled={!specSupported}
+                  onToggle={() => set("speculative", !value.speculative)}
+                />
+              </SetRow>
+
               {onReloadModel && (
                 <button className="settings-reload" onClick={onReloadModel} disabled={reloading}>
                   {reloading ? "…" : t("reloadApply")}
@@ -1002,34 +1225,42 @@ export function SettingsPanel({
 
           {cat === "code" && (
             <>
-              <label className="field">
-                <span>
-                  {t("cmMaxSteps")} <b>{value.codeMaxSteps}</b>
-                </span>
+              <LimitField
+                label={t("cmMaxSteps")}
+                offLabel={t("noLimit")}
+                onLabel={t("gpuCustom")}
+                off={value.codeMaxSteps <= 0}
+                onOff={(o) => set("codeMaxSteps", o ? 0 : 64)}
+                value={value.codeMaxSteps}
+              >
                 <input
                   type="range"
                   min={8}
-                  max={96}
+                  max={256}
                   step={4}
                   value={value.codeMaxSteps}
                   onChange={(e) => set("codeMaxSteps", Number(e.target.value))}
                 />
-              </label>
+              </LimitField>
               <div className="settings-hint">{t("cmMaxStepsHint")}</div>
 
-              <label className="field">
-                <span>
-                  {t("cmBashTimeout")} <b>{value.codeBashTimeout}s</b>
-                </span>
+              <LimitField
+                label={t("cmBashTimeout")}
+                offLabel={t("noLimit")}
+                onLabel={t("gpuCustom")}
+                off={value.codeBashTimeout <= 0}
+                onOff={(o) => set("codeBashTimeout", o ? 0 : 60)}
+                value={`${value.codeBashTimeout}s`}
+              >
                 <input
                   type="range"
                   min={10}
-                  max={300}
+                  max={1800}
                   step={10}
                   value={value.codeBashTimeout}
                   onChange={(e) => set("codeBashTimeout", Number(e.target.value))}
                 />
-              </label>
+              </LimitField>
               <div className="settings-hint">{t("cmBashTimeoutHint")}</div>
 
               <label className="field">
@@ -1574,7 +1805,8 @@ export function SettingsPanel({
           </div>
         </div>
       </div>
-    </div>,
+    </div>
+    </>,
     document.body,
   );
 }

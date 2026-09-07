@@ -18,10 +18,11 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::params::{LlamaContextParams, LlamaContextType};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::speculative::{MtpSpeculative, MtpSpeculativeParams};
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::mtmd::{
@@ -44,7 +45,12 @@ use super::{ChatMessage, GenParams, GenRequest, GenStats, InferenceBackend, Mode
 // and the UI is told to say so.
 
 const GPU_INFLIGHT: &str = "llama-load.inflight";
+/// Pre-2.1.3 marker: its mere existence meant "GPU off, forever". Still read so
+/// a machine carrying one is not left stranded, but never written again.
 const GPU_BLOCKED: &str = "llama-gpu-blocked";
+/// How many layers the engine may offload after a load killed the process.
+/// A number, not a tombstone.
+const GPU_CAP: &str = "llama-gpu-cap";
 
 use crate::errlog::chaty_data_dir;
 
@@ -54,14 +60,45 @@ use crate::errlog::chaty_data_dir;
 /// from in here, so every `cargo test` run stamped a false "gpu crashed"
 /// entry into the dev machine's user log (the errlog-pollution sin, third
 /// occurrence). The production caller logs; the state machine doesn't.
-fn gpu_guard_check(base: &Path) -> bool {
+// The production caller is inside `#[cfg(windows)]`; everywhere else this is
+// exercised only by its own test, which is the point of keeping it pure.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn gpu_guard_check(base: &Path) -> Option<i32> {
     let inflight = base.join(GPU_INFLIGHT);
-    let blocked = base.join(GPU_BLOCKED);
+    let cap_file = base.join(GPU_CAP);
+    // The old tombstone: honour it as "CPU only" so an existing install keeps
+    // its protection, but let a successful load clear it like any other cap.
+    let legacy = base.join(GPU_BLOCKED);
+    let mut cap = if legacy.exists() {
+        Some(0)
+    } else {
+        std::fs::read_to_string(&cap_file).ok().and_then(|t| t.trim().parse().ok())
+    };
     if inflight.exists() {
-        let _ = std::fs::write(&blocked, "previous model load crashed the process\n");
+        // The marker survived, so the process died inside a load. It carries
+        // what that load was attempting; try half as much rather than giving
+        // up on the GPU entirely. A 26B model asked to put every layer on a
+        // 12 GB card takes the driver down with it — that is a reason to offer
+        // fewer layers, not to spend the rest of the install on the CPU.
+        let attempted: i32 = std::fs::read_to_string(&inflight)
+            .ok()
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or(0);
+        let next = backoff_layers(attempted.max(0));
+        cap = Some(cap.map_or(next, |c: i32| c.min(next)));
+        let _ = std::fs::write(&cap_file, next.to_string());
+        let _ = std::fs::remove_file(&legacy);
         let _ = std::fs::remove_file(&inflight);
     }
-    blocked.exists()
+    cap
+}
+
+/// Forget the cap — the machine is not the one that crashed any more. Called
+/// when a load succeeds with the GPU, and by the user from Settings.
+pub fn clear_gpu_cap() {
+    let base = chaty_data_dir();
+    let _ = std::fs::remove_file(base.join(GPU_CAP));
+    let _ = std::fs::remove_file(base.join(GPU_BLOCKED));
 }
 
 /// Known bad-conversion tells, per model family. Two cases so far:
@@ -96,42 +133,53 @@ fn conversion_suspect(name: &str, arch: &str, tokenizer_pre: &str) -> bool {
 /// Metal (which ignores the env), and an active guard off-Windows can only
 /// produce FALSE "gpu crashed" warnings — a cargo-test on the dev Mac once
 /// raced the real app into exactly that.
-pub fn apply_gpu_crash_guard() -> bool {
+pub fn apply_gpu_crash_guard() -> Option<i32> {
     #[cfg(windows)]
     {
         let base = chaty_data_dir();
-        let promoted = base.join(GPU_INFLIGHT).exists();
-        let blocked = gpu_guard_check(&base);
-        if promoted && blocked {
+        let crashed = base.join(GPU_INFLIGHT).exists();
+        let cap = gpu_guard_check(&base);
+        if crashed {
             crate::errlog::append_error(
                 "gpu-crash-guard",
-                "previous model load crashed the process (likely GPU driver abort, issue #5 class); GPU offload disabled — running CPU-only from now on",
+                &match cap {
+                    Some(0) => "previous model load crashed the process (likely GPU driver abort, issue #5 class); running CPU-only until a load succeeds or the cap is reset in Settings".to_string(),
+                    Some(n) => format!("previous model load crashed the process (likely GPU driver abort, issue #5 class); retrying with at most {n} GPU layers"),
+                    None => "previous model load crashed the process".to_string(),
+                },
             );
         }
-        if blocked {
+        if cap == Some(0) {
             // Vulkan backend: zero visible devices = never touches the
             // driver's allocation/pipeline paths again.
             std::env::set_var("GGML_VK_VISIBLE_DEVICES", "");
         }
-        return blocked;
+        return cap;
     }
     #[cfg(not(windows))]
     {
         // Hygiene only: a stale inflight marker (crashed dev build, killed
-        // test run) is removed without promoting it to a block.
+        // test run) is removed without becoming a cap.
         let _ = std::fs::remove_file(chaty_data_dir().join(GPU_INFLIGHT));
-        false
+        None
     }
 }
 
 /// Whether the guard is currently blocking GPU offload (for the load reply).
-pub fn gpu_crash_blocked() -> bool {
+/// The current cap, if a previous load crashed. `Some(0)` is CPU-only.
+pub fn gpu_layer_cap() -> Option<i32> {
     #[cfg(windows)]
     {
-        return chaty_data_dir().join(GPU_BLOCKED).exists();
+        let base = chaty_data_dir();
+        if base.join(GPU_BLOCKED).exists() {
+            return Some(0);
+        }
+        return std::fs::read_to_string(base.join(GPU_CAP))
+            .ok()
+            .and_then(|t| t.trim().parse().ok());
     }
     #[cfg(not(windows))]
-    false
+    None
 }
 
 /// Removes the marker when load() returns — normally OR with an error. Only
@@ -139,14 +187,17 @@ pub fn gpu_crash_blocked() -> bool {
 /// Armed on Windows only (see apply_gpu_crash_guard).
 struct LoadGuard(Option<std::path::PathBuf>);
 impl LoadGuard {
-    fn arm_at(base: &Path) -> Self {
+    /// `layers` is what this load is about to attempt. If the process dies, the
+    /// marker survives carrying that number, and the next start offers half —
+    /// which is the useful thing to know, and what "GPU off forever" threw away.
+    fn arm_at(base: &Path, layers: i32) -> Self {
         let p = base.join(GPU_INFLIGHT);
-        let _ = std::fs::write(&p, "loading\n");
+        let _ = std::fs::write(&p, layers.to_string());
         Self(Some(p))
     }
-    fn arm() -> Self {
+    fn arm(layers: i32) -> Self {
         if cfg!(windows) {
-            Self::arm_at(&chaty_data_dir())
+            Self::arm_at(&chaty_data_dir(), layers)
         } else {
             Self(None)
         }
@@ -173,7 +224,9 @@ fn llama_backend() -> Result<&'static LlamaBackend> {
         return Ok(b);
     }
     let mut backend = LlamaBackend::init().context("failed to initialize llama.cpp backend")?;
-    backend.void_logs();
+    if std::env::var("CHATY_LLAMA_LOG").as_deref() != Ok("1") {
+        backend.void_logs();
+    }
     let _ = LLAMA_BACKEND.set(backend);
     Ok(LLAMA_BACKEND.get().unwrap())
 }
@@ -202,6 +255,29 @@ fn probe_n_layer(backend: &LlamaBackend, path: &str) -> Option<u32> {
             0 => None,
             n => Some(n),
         })
+}
+
+/// How many multi-token-prediction (`nextn`) layers the file declares.
+///
+/// These layers are a small head trained to guess the tokens the model is
+/// about to produce, and llama.cpp skips them unless the load asks for them —
+/// so whether to ask has to be decided before the model is loaded. The
+/// question is answered from metadata rather than by trying: a load that has
+/// to fail and be retried costs a full pass over a file that can be tens of
+/// gigabytes.
+fn probe_mtp_layers(backend: &LlamaBackend, path: &str) -> u32 {
+    let params = LlamaModelParams::default().with_vocab_only(true);
+    let Ok(model) = LlamaModel::load_from_file(backend, path, &params) else {
+        return 0;
+    };
+    let Ok(arch) = model.meta_val_str("general.architecture") else {
+        return 0;
+    };
+    model
+        .meta_val_str(&format!("{arch}.nextn_predict_layers"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0)
 }
 
 /// Find the vision encoder (mmproj) GGUF paired with a model file.
@@ -275,6 +351,12 @@ struct MediaCache {
     body: String,
     /// Positions resident at the end of `body`.
     n_past_body: i32,
+    /// Whether `prompt`/`n_past` describe the KV *including* the reply this
+    /// turn generated. When they do, a prompt that string-extends them is a
+    /// pure append with nothing to truncate — which is the only way a
+    /// hybrid/recurrent model can reuse a media prefill at all, since its
+    /// state cannot be rewound to drop a generation tail.
+    complete: bool,
 }
 
 /// Total images pushed through the vision encoder (observability: the media
@@ -318,7 +400,12 @@ fn inject_media_markers(messages: &[ChatMessage]) -> Vec<ChatMessage> {
                     content.push('\n');
                 }
                 content.push_str(&m.content);
-                ChatMessage { role: m.role.clone(), content, images: m.images.clone() }
+                ChatMessage {
+                    role: m.role.clone(),
+                    content,
+                    images: m.images.clone(),
+                    reasoning_content: m.reasoning_content.clone(),
+                }
             }
         })
         .collect()
@@ -370,14 +457,19 @@ impl LlamaEngine {
     ///
     /// `gpu_pref`: `None`/negative = auto‑tune by VRAM, `Some(0)` = force CPU,
     /// `Some(n>0)` = offload exactly `n` layers.
-    pub fn load(path: &str, gpu_pref: Option<i32>, n_ctx_pref: Option<u32>) -> Result<(Self, ModelInfo)> {
-        // Armed for the whole load: if the process dies in here (Vulkan
-        // driver abort — issue #5), the marker survives and the next start
-        // falls back to CPU instead of dying again.
-        let _crash_guard = LoadGuard::arm();
+    /// `speculative` is the user's setting for decoding with the model's own
+    /// multi-token-prediction head. It only matters for a model that HAS one;
+    /// the returned `ModelInfo` reports both facts separately so the UI can
+    /// offer the switch on exactly the models it does something for.
+    pub fn load(
+        path: &str,
+        gpu_pref: Option<i32>,
+        n_ctx_pref: Option<u32>,
+        speculative: bool,
+    ) -> Result<(Self, ModelInfo)> {
         let backend = llama_backend()?;
         if !Path::new(path).exists() {
-            bail!("model file not found: {path}");
+            bail!(trf!("找不到模型文件:{path}", "model file not found: {path}"));
         }
 
         // ---- pre-flight: refuse loads that can only end in a swap-freeze ----
@@ -419,6 +511,23 @@ impl LlamaEngine {
                 None => 0,
             },
         };
+        // A load that killed the process last time gets less than it asked for,
+        // not nothing. The cap halves per crash and clears on the first load
+        // that survives, so a machine that has freed some VRAM — or a smaller
+        // model — climbs straight back onto the GPU.
+        let cap = gpu_layer_cap();
+        // Whether the cap actually took layers away from THIS load. A cap left
+        // by a crash on a bigger model can be wider than what a small one asks
+        // for, and that load is not degraded — saying so would be noise.
+        let capped_by_guard = matches!(cap, Some(c) if c < requested);
+        let requested = match cap {
+            Some(c) => requested.min(c),
+            None => requested,
+        };
+        // Armed for the whole load, carrying what it is attempting: if the
+        // process dies in here (Vulkan driver abort — issue #5), the marker
+        // survives and the next start offers half of this.
+        let _crash_guard = LoadGuard::arm(requested);
 
         // CPU-side worker threads. On Apple Silicon this is the performance-core
         // count (efficiency cores hurt throughput); elsewhere the logical CPUs.
@@ -434,8 +543,21 @@ impl LlamaEngine {
         // of memory, return a clear error instead of a cryptic crash.
         let mut layers = requested.max(0);
         let mut oom_fallback = false;
+        // Whether this file carries an MTP head, decided from metadata before
+        // the weights are read — `load_mtp` has to be set on the load itself.
+        // Whether the FILE has a head, and whether it will be used. The first
+        // is what the settings switch is enabled on, so it is read even when
+        // the switch is off. `CHATY_MTP=0` overrides the setting — a way to
+        // compare against plain decoding without touching the UI.
+        let has_head = probe_mtp_layers(backend, path) > 0;
+        let mtp =
+            has_head && speculative && std::env::var("CHATY_MTP").as_deref() != Ok("0");
         let (model, tx, handle, mtmd_err) = loop {
-            let params = LlamaModelParams::default().with_n_gpu_layers(layers.max(0) as u32);
+            let params = LlamaModelParams::default()
+                .with_n_gpu_layers(layers.max(0) as u32)
+                // The head's layers are extra ones plain decoding never
+                // touches, so llama.cpp leaves them on disk unless asked.
+                .with_load_mtp(mtp);
             // macOS: load via malloc instead of mmap. Freeing malloc'd weights
             // is synchronous, whereas the Metal-wired pages of an mmap'd MoE
             // model have been observed to never return to the kernel after
@@ -455,6 +577,17 @@ impl LlamaEngine {
                     if is_oom(&msg) {
                         bail!("加载模型权重时内存不足 (out of memory while loading the model weights)");
                     }
+                    // llama.cpp's null pointer says nothing. The file usually
+                    // does — read its header and pass on what it says.
+                    if let Some(why) = std::fs::File::open(path)
+                        .ok()
+                        .and_then(|f| gguf_diagnosis(std::io::BufReader::new(f)))
+                    {
+                        bail!(trf!(
+                            "无法加载 GGUF 模型 {path}:{why}",
+                            "cannot load the GGUF model {path}: {why}"
+                        ));
+                    }
                     return Err(e).with_context(|| format!("failed to load GGUF model: {path}"));
                 }
             };
@@ -472,7 +605,10 @@ impl LlamaEngine {
             let handle = std::thread::Builder::new()
                 .name("chaty-llama".into())
                 .spawn(move || {
-                    worker(worker_model, n_ctx, n_threads, worker_mmproj, worker_gpu, rx, init_tx)
+                    worker(
+                        worker_model, n_ctx, n_threads, worker_mmproj, worker_gpu, mtp, rx,
+                        init_tx,
+                    )
                 })
                 .context("failed to start inference thread")?;
 
@@ -490,11 +626,17 @@ impl LlamaEngine {
                         continue;
                     }
                     if is_oom(&msg) {
-                        bail!("out of memory while allocating the model context");
+                        bail!(trf!(
+                            "内存不足,无法为该模型分配上下文。换更小的模型,或在设置里调低上下文长度。",
+                            "out of memory while allocating the model context — try a smaller model, or a shorter context in Settings."
+                        ));
                     }
-                    bail!("failed to initialize inference context: {msg}");
+                    bail!(trf!("推理上下文初始化失败:{msg}", "failed to initialize inference context: {msg}"));
                 }
-                Err(_) => bail!("inference thread exited during initialization"),
+                Err(_) => bail!(trf!(
+                    "推理线程在初始化期间退出",
+                    "the inference thread exited during initialization"
+                )),
             }
         };
 
@@ -518,10 +660,19 @@ impl LlamaEngine {
         if let Some(err) = &mtmd_err {
             eprintln!("mmproj load failed (vision disabled): {err}");
         }
-        let warning = if gpu_crash_blocked() {
+        // A GPU load that made it this far means the machine is healthy again.
+        if gpu_layers > 0 {
+            clear_gpu_cap();
+        }
+        let warning = if cap == Some(0) {
             // A previous load crashed the process (issue #5: broken Vulkan
             // driver aborts mid-load) — this run is CPU-only by the guard.
             Some("gpu-crash-cpu".to_string())
+        } else if capped_by_guard {
+            // The middle rungs of the same ladder. These used to load in
+            // silence: the model ran, slower, and nothing said why — which is
+            // the shape of the bug the ladder replaced (issue #9), just quieter.
+            Some("gpu-crash-capped".to_string())
         } else if oom_fallback {
             Some("gpu-oom".to_string())
         } else if mtmd_err.is_some() {
@@ -568,6 +719,14 @@ impl LlamaEngine {
         // no soft switch — the architecture field is authoritative over
         // template text, which community finetunes frequently customize.
         let is_qwen35plus = is_qwen3_5_plus_arch(&arch_lc);
+        // Can the engine turn thinking off by itself, by prefilling an empty
+        // reasoning block after the assistant header? Same question
+        // `template_uses_think` answers at render time — asked here so the soft
+        // switch knows whether it is needed. Architecture is authoritative: the
+        // Qwen3 line reasons in `<think>` blocks whatever template a finetune
+        // shipped, and some ship none at all.
+        let engine_can_prefill_think =
+            is_think_paradigm_arch(&arch_lc) || template_lc.contains("<think>");
         let supports_thinking = is_qwen35plus
             || template_lc.contains("think")
             || template_lc.contains("reasoning")
@@ -589,11 +748,29 @@ impl LlamaEngine {
                 model.apply_chat_template(&t, &probe, true).ok()
             })
             .is_some();
-        // The soft switch is Qwen3-only; never offer it on 3.5+/finetunes
-        // whose legacy templates still mention it.
+        // `/no_think` appended to the user's message: Qwen3's soft switch, and
+        // the last resort. It is offered only when nothing better exists,
+        // because it is worse in both directions. It mutates the turn, so the
+        // next prompt — rendered without it — diverges at that message and the
+        // cache dies there: 51-71% reuse against 100% for the engine flag,
+        // measured over four turns on two Qwen3 builds. And on those same two it
+        // does not even work — both kept reasoning with `/no_think` appended,
+        // the trained behaviour apparently lost in the finetune, while the flag
+        // silenced them.
+        //
+        // So: whenever the engine can prefill an empty reasoning block itself,
+        // that is the mechanism, and this stays off.
+        //
+        // The probe also has to drop `</think>` before asking, because that
+        // closing tag CONTAINS `/think` — every template that closes a block
+        // matched, which is all of them. LFM2 was handed a switch it has never
+        // heard of, the app stopped sending the flag on its behalf, and thinking
+        // could not be turned off on it at all.
+        let switch_probe = template_lc.replace("</think>", "");
         let think_switch = !is_qwen35plus
+            && !engine_can_prefill_think
             && template_usable
-            && (template_lc.contains("no_think") || template_lc.contains("/think"));
+            && (switch_probe.contains("no_think") || switch_probe.contains("/think"));
         let multimodal = mmproj.is_some()
             || model
                 .meta_val_str(&format!("{arch}.vision.block_count"))
@@ -612,6 +789,13 @@ impl LlamaEngine {
             .map(|ft| quant_name(ft).to_string());
 
         let effort_levels = effort_levels_of(template.as_deref().unwrap_or(""));
+        let tool_role = probe_tool_role(&model);
+        // llama.cpp's chat message carries a role and a body and nothing else,
+        // so a structured reasoning field cannot reach a template it renders.
+        // Where Chaty renders the prompt itself the field is read straight off
+        // the message, and ATEM's template is one that wants it — its reasoning
+        // is a span of its own, not something to inline into the answer.
+        let reasoning_field = is_muse_glimmer(&model);
         let info = ModelInfo {
             name,
             path: path.to_string(),
@@ -623,6 +807,8 @@ impl LlamaEngine {
             n_ctx_train: Some(n_ctx_train),
             n_ctx: Some(n_ctx),
             n_layer: Some(model.n_layer()),
+            speculative: has_head,
+            speculative_on: mtp,
             gpu_layers,
             gpu_name,
             model_name,
@@ -632,9 +818,14 @@ impl LlamaEngine {
             supports_thinking,
             think_switch,
             effort_levels,
+            tool_role,
+            reasoning_field,
             supports_tools,
             multimodal,
             vision_ready,
+            // llama.cpp feeds pictures through mtmd, which takes as many as a
+            // prompt carries — including a tall page's tiles.
+            multi_image: true,
             mmproj,
             warning,
         };
@@ -701,12 +892,143 @@ impl InferenceBackend for LlamaEngine {
 
 /// Owns the persistent context for one model and serves jobs until the engine
 /// (and its `Sender`) is dropped.
+/// How far ahead the MTP head is asked to guess, and how sure of a guess it
+/// has to be to make it.
+///
+/// Both are measured, not assumed. On an M4 Pro with the 4B design model,
+/// against 53.0 tok/s of plain decoding: one guess at a time is 56.3, two is
+/// 54.3, and three is 49.9 — slower than not guessing at all. The head's own
+/// context has to read every token the model reads, so a round that wins
+/// nothing still costs a pass; and this model is a hybrid, where rewinding a
+/// rejected guess means restoring recurrent state rather than just dropping
+/// cache rows, which is dear enough that a deep draft loses more on its
+/// mistakes than it gains on its hits.
+///
+/// The confidence gate does the adaptive part: llama.cpp drops a guess the
+/// head is unsure of instead of spending a round verifying it. Loosening it to
+/// 0.4 was worth more than any depth change (56.3 against 54.7 at 0.6), and
+/// tightening it past that only buys back rounds the head would have won.
+const MTP_DRAFT_MAX: i32 = 1;
+const MTP_DRAFT_P_MIN: f32 = 0.4;
+
+/// The decoder for one loaded model.
+///
+/// A checkpoint that ships a multi-token-prediction head can be decoded with
+/// it: the head guesses a short run of tokens, and the model checks the whole
+/// run in ONE pass instead of one pass per token. Every token that survives is
+/// one the model's own sampler drew, and the first guess it disagrees with
+/// ends the run — so the reply is the reply plain decoding would have given,
+/// and only the number of passes changes.
+///
+/// The head needs a context of its own, and the two must stay in lockstep:
+/// anything that rewinds or clears one has to do the same to the other, or the
+/// head starts guessing from a conversation that is no longer there. That is
+/// why clearing goes through here rather than through the context directly.
+enum Decoder<'m> {
+    Plain(LlamaContext<'m>),
+    /// Boxed because `MtpSpeculative` carries two contexts inline.
+    Speculative {
+        spec: Box<MtpSpeculative<'m>>,
+        /// Cleared the moment the head loses track of the decode. From then on
+        /// this decodes exactly like `Plain` — the head's guesses would be
+        /// drawn from a conversation the model is no longer having, and a
+        /// wrong guess that gets verified is not wrong output, but a head that
+        /// cannot be fed is an error on every single decode.
+        head: bool,
+    },
+}
+
+impl<'m> Decoder<'m> {
+    fn ctx(&self) -> &LlamaContext<'m> {
+        match self {
+            Self::Plain(ctx) => ctx,
+            Self::Speculative { spec, .. } => spec.target_context(),
+        }
+    }
+
+    fn ctx_mut(&mut self) -> &mut LlamaContext<'m> {
+        match self {
+            Self::Plain(ctx) => ctx,
+            Self::Speculative { spec, .. } => spec.target_context_mut(),
+        }
+    }
+
+    /// The head, while it can still be trusted.
+    fn spec_mut(&mut self) -> Option<&mut MtpSpeculative<'m>> {
+        match self {
+            Self::Speculative { spec, head: true } => Some(spec),
+            _ => None,
+        }
+    }
+
+    /// Stop using the head for the rest of this model's life. Called when it
+    /// has failed once: a head that has fallen out of step with the model
+    /// cannot be resynchronised without re-reading the whole conversation,
+    /// which costs more than the speedup is worth.
+    fn disable_head(&mut self, why: &str) {
+        if let Self::Speculative { head, .. } = self {
+            if *head {
+                eprintln!("MTP head switched off ({why}); decoding without it");
+            }
+            *head = false;
+        }
+    }
+
+    /// Decode a batch, and let the head see the same batch. The head reads the
+    /// model's hidden state for every token in it, so a batch it never sees is
+    /// a hole in what it can guess from.
+    fn decode(&mut self, batch: &mut LlamaBatch) -> Result<()> {
+        match self {
+            Self::Plain(ctx) => ctx.decode(batch).context("decode failed"),
+            Self::Speculative { spec, head } => {
+                spec.target_context_mut().decode(batch).context("decode failed")?;
+                if !*head {
+                    return Ok(());
+                }
+                if let Err(e) = spec.process(batch) {
+                    // The model read the batch — that part is done and the
+                    // reply is unaffected. Only the head is behind now, so it
+                    // is switched off rather than failing the turn.
+                    eprintln!("MTP head switched off (lost track of the decode: {e})");
+                    *head = false;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn clear_kv_cache(&mut self) {
+        match self {
+            Self::Plain(ctx) => ctx.clear_kv_cache(),
+            Self::Speculative { spec, .. } => {
+                spec.target_context_mut().clear_kv_cache();
+                spec.draft_context_mut().clear_kv_cache();
+            }
+        }
+    }
+
+    /// Drop `[p0, p1)` from both caches. True only when BOTH gave the range up:
+    /// a rewind that half happened is worse than one that did not, because the
+    /// two halves then describe different conversations.
+    fn clear_kv_cache_seq(&mut self, seq: Option<u32>, p0: Option<u32>, p1: Option<u32>) -> bool {
+        match self {
+            Self::Plain(ctx) => ctx.clear_kv_cache_seq(seq, p0, p1) == Ok(true),
+            Self::Speculative { spec, .. } => {
+                let tgt = spec.target_context_mut().clear_kv_cache_seq(seq, p0, p1) == Ok(true);
+                let dft = spec.draft_context_mut().clear_kv_cache_seq(seq, p0, p1) == Ok(true);
+                tgt && dft
+            }
+        }
+    }
+}
+
 fn worker(
     model: Arc<LlamaModel>,
     n_ctx: u32,
     n_threads: i32,
     mmproj: Option<String>,
     use_gpu: bool,
+    mtp: bool,
     rx: Receiver<Job>,
     init: Sender<Result<Option<String>, String>>,
 ) {
@@ -720,12 +1042,20 @@ fn worker(
     let ctx_params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(n_ctx))
         .with_n_threads(n_threads)
-        .with_n_threads_batch(n_threads);
+        .with_n_threads_batch(n_threads)
+        // Rollback points for the recurrent half of a hybrid model. A run of
+        // guesses that is only partly accepted has to be rewound, and a
+        // recurrent state cannot be replayed out of the cache the way
+        // attention can — without somewhere to rewind TO, llama.cpp refuses
+        // partial removal and the speculative path is unusable. Costs nothing
+        // on a model with no recurrent layers, and llama.cpp clamps it to zero
+        // on architectures that cannot roll back at all.
+        .with_n_rs_seq(if mtp { MTP_DRAFT_MAX as u32 } else { 0 });
     // Flash attention (less KV memory + faster long-context decode, a real win on
     // Metal) is left at llama.cpp's default policy (AUTO), which enables it
     // automatically on Apple Silicon when the model supports it. To force it,
     // `with_flash_attention_policy(..)` takes a raw `llama_flash_attn_type`.
-    let mut ctx = match model.new_context(backend, ctx_params) {
+    let ctx = match model.new_context(backend, ctx_params.clone()) {
         Ok(c) => c,
         Err(e) => {
             // Almost always a VRAM/RAM OOM allocating the KV cache + compute
@@ -734,6 +1064,47 @@ fn worker(
             return;
         }
     };
+    // Pair the model with its own MTP head when it has one. A failure here is
+    // a lost speedup, not a lost model: fall back to plain decoding and say
+    // why, rather than failing a load that would otherwise have worked.
+    let mut dec = Decoder::Plain(ctx);
+    if mtp {
+        // The head's own context keeps no rollback snapshots — it is the
+        // model's cache that gets rewound when a run is cut short — and it has
+        // to name the context it is drafting for, which is how llama.cpp finds
+        // the hidden states to guess from.
+        let draft_params = ctx_params
+            .clone()
+            .with_context_type(LlamaContextType::Mtp)
+            .with_n_rs_seq(0);
+        match model.new_context_with_ctx_other(backend, draft_params, dec.ctx()) {
+            Ok(draft) => {
+                // `MtpSpeculative::new` consumes both contexts and hands
+                // neither back, so the target is moved out and re-made if the
+                // pairing is rejected.
+                let Decoder::Plain(target) = dec else { unreachable!() };
+                let params = MtpSpeculativeParams {
+                    n_max: MTP_DRAFT_MAX,
+                    n_min: 0,
+                    p_min: MTP_DRAFT_P_MIN,
+                };
+                match MtpSpeculative::new(target, draft, params) {
+                    Ok(spec) => dec = Decoder::Speculative { spec: Box::new(spec), head: true },
+                    Err(e) => {
+                        eprintln!("MTP head unusable ({e}); decoding without it");
+                        match model.new_context(backend, ctx_params) {
+                            Ok(c) => dec = Decoder::Plain(c),
+                            Err(e) => {
+                                let _ = init.send(Err(format!("{e:#}")));
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("MTP draft context unavailable ({e}); decoding without it"),
+        }
+    }
     // Vision encoder (mmproj), when the model ships one. A failure here is
     // non-fatal: the model still chats, images are just unavailable.
     let mut mtmd_err: Option<String> = None;
@@ -770,7 +1141,7 @@ fn worker(
             Job::Generate { req, sink, cancel, done } => {
                 let result = run_turn(
                     &model,
-                    &mut ctx,
+                    &mut dec,
                     &mut cached,
                     mtmd.as_ref(),
                     &mut media_cache,
@@ -785,7 +1156,7 @@ fn worker(
                 let sink = StringSink { buf: std::cell::RefCell::new(String::new()) };
                 let result = run_turn(
                     &model,
-                    &mut ctx,
+                    &mut dec,
                     &mut cached,
                     mtmd.as_ref(),
                     &mut media_cache,
@@ -804,7 +1175,7 @@ fn worker(
 /// Decode `tokens[from..]` into the context in `n_batch`-sized chunks, setting
 /// logits on the final token. `n_batch` must be ≥ 1.
 fn decode_prompt(
-    ctx: &mut LlamaContext,
+    dec: &mut Decoder,
     batch: &mut LlamaBatch,
     tokens: &[LlamaToken],
     from: usize,
@@ -820,7 +1191,7 @@ fn decode_prompt(
         for (j, tok) in tokens[pos..end].iter().enumerate() {
             batch.add(*tok, (pos + j) as i32, &[0], pos + j == n_prompt - 1)?;
         }
-        ctx.decode(batch).context("decode failed")?;
+        dec.decode(batch)?;
         pos = end;
         on_batch(pos, n_prompt);
     }
@@ -835,15 +1206,111 @@ pub trait EventSink {
 }
 impl EventSink for Channel<StreamEvent> {
     fn emit(&self, ev: StreamEvent) -> Result<()> {
-        self.send(ev)?;
+        // A listener that has gone away is NOT a reason to stop generating.
+        // The page can be replaced under a running turn — the webview reloads
+        // and takes the JS context with it — and every send after that fails.
+        // Propagating the first one aborted the turn, so a long answer minutes
+        // in died because nobody was listening any more. The work continues;
+        // where the text ends up is the caller's business, not the sink's.
+        // (The MLX backend already drops send failures this way.)
+        let _ = self.send(ev);
         Ok(())
     }
 }
 
 #[allow(clippy::too_many_arguments)]
+/// One speculative round: guess, check the whole guess in one pass, and keep
+/// the run the model agrees with.
+///
+/// `token` is the token the model has drawn but not yet read back. The head
+/// guesses what follows it; the model then reads `[token, guess…]` in a single
+/// pass, which gives it an opinion at every one of those positions at once.
+/// Walking those opinions in order, a guess that matches is a token the model
+/// would have produced anyway, and the first that does not ends the run — the
+/// model's own draw is kept in its place. So the returned run is exactly what
+/// plain decoding would have given: the tokens are drawn with the SAME
+/// sampler, and the guesses only decide how many passes it took to get them.
+///
+/// Returns the tokens to emit. The last is the one the model has not read back
+/// — the next round's starting point — and every earlier one is in the cache.
+/// The run is never empty.
+fn speculate(
+    dec: &mut Decoder,
+    sampler: &mut LlamaSampler,
+    batch: &mut LlamaBatch,
+    token: LlamaToken,
+    n_past: i32,
+    cached: &[LlamaToken],
+) -> Result<Option<(Vec<LlamaToken>, usize)>> {
+    let spec = dec.spec_mut().context("no MTP head")?;
+    let drafts = spec.draft(n_past, token, cached).context("MTP draft failed")?;
+    // Guessing left the guesses in the head's own cache, at the very positions
+    // the model is about to be asked about. Take them back out: the head has
+    // to re-read those positions as the model saw them, from the model's
+    // hidden state, and it cannot read a position it already holds. This is
+    // needed even when nothing was guessed — deciding not to guess costs a
+    // position too, and the next ordinary step would then land on it.
+    spec.draft_context_mut().clear_kv_cache_seq(Some(0), Some(n_past as u32), None).ok();
+    if drafts.is_empty() {
+        // The head was not confident enough to guess anything. Nothing is left
+        // open — llama.cpp only holds a draft it actually produced — so this
+        // is not an error, just an ordinary step for the caller to take.
+        return Ok(None);
+    }
+
+    batch.clear();
+    // Logits at every position: the whole point is to have the model's opinion
+    // about each guess, not only about the last one.
+    batch.add(token, n_past, &[0], true)?;
+    for (i, d) in drafts.iter().enumerate() {
+        batch.add(*d, n_past + 1 + i as i32, &[0], true)?;
+    }
+    dec.decode(batch)?;
+
+    // Draw at each position with the real sampler, in order, stopping at the
+    // first draw the guess did not predict. `ids` is the accepted run plus the
+    // model's own token at the position the run ended — always at least one.
+    let mut ids: Vec<LlamaToken> = Vec::with_capacity(drafts.len() + 1);
+    for (i, d) in drafts.iter().enumerate() {
+        let id = sampler.sample(dec.ctx(), i as i32);
+        sampler.accept(id);
+        ids.push(id);
+        if id != *d {
+            break;
+        }
+    }
+    if ids.len() == drafts.len() {
+        // Every guess held: the position after the last one is a token the
+        // model just produced for free.
+        let id = sampler.sample(dec.ctx(), drafts.len() as i32);
+        sampler.accept(id);
+        ids.push(id);
+    }
+
+    // Past this point the round has happened: the model read the batch and drew
+    // every token in `ids` itself, so the run is what the reply is made of
+    // whatever becomes of the head. Nothing here may return an error — the
+    // caller answers one by taking an ordinary step, which would decode
+    // `token` a second time at a position the model already holds.
+    let accepted = u16::try_from(ids.len() - 1).unwrap_or(u16::MAX);
+    match dec.spec_mut() {
+        // Telling the head what survived is bookkeeping for the NEXT round.
+        Some(spec) => {
+            if let Err(e) = spec.accept(accepted) {
+                dec.disable_head(&format!("accept refused: {e}"));
+            }
+        }
+        // The head fell over while verifying (`decode` switches it off rather
+        // than failing a decode the model completed). It will not be asked
+        // again; this run still stands.
+        None => {}
+    }
+    Ok(Some((ids, drafts.len())))
+}
+
 fn run_turn(
     model: &LlamaModel,
-    ctx: &mut LlamaContext,
+    dec: &mut Decoder,
     cached: &mut Vec<LlamaToken>,
     mtmd: Option<&MtmdContext>,
     media_cache: &mut Option<MediaCache>,
@@ -885,13 +1352,17 @@ fn run_turn(
         sink.emit(StreamEvent::Token { text: "<think>\n".to_string() })?;
     }
 
-    let n_batch = (ctx.n_batch() as usize).max(1);
+    let n_batch = (dec.ctx().n_batch() as usize).max(1);
     let mut batch = LlamaBatch::new(n_batch, 1);
 
     // ---- prefill: two regimes sharing one generation loop below ----
     // `n_prompt_pos` = positions resident after prefill; `idx` = where to
     // sample the first token (-1 = "last logits" after an mtmd prefill).
     let (n_prompt_pos, mut idx): (i32, i32);
+    // How many prompt tokens the KV already held — the same observability the
+    // MLX engine reports, and the number that shows an agent turn is a pure
+    // append rather than a full re-read.
+    let kv_reused: u32;
 
     if media_turn {
         let mtmd = mtmd.expect("media_turn implies mtmd");
@@ -899,8 +1370,14 @@ fn run_turn(
         // while a conversation is in the media regime (and vice versa).
         cached.clear();
 
-        n_prompt_pos = prefill_media(
-            ctx,
+        // The media path reuses too — the whole point of MediaCache — but it
+        // used to report nothing, so every screenshot turn showed 0% reused
+        // whatever the cache had actually kept. The stat is the only way an
+        // agent turn's "pure append" can be seen from outside; leaving it
+        // unset on this path made the media cache invisible and, worse, made
+        // it look broken.
+        let (pos, reused_media) = prefill_media(
+            dec.ctx_mut(),
             mtmd,
             media_cache,
             &prompt,
@@ -911,6 +1388,8 @@ fn run_turn(
             sink,
             cancel,
         )?;
+        n_prompt_pos = pos;
+        kv_reused = reused_media;
         if cancel.load(Ordering::Relaxed) {
             return done_event(sink, n_prompt_pos as u32, 0, 0.0, "cancelled");
         }
@@ -919,17 +1398,22 @@ fn run_turn(
         // Leaving the media regime: the KV holds media embeddings the token
         // cache can't account for — start clean.
         if media_cache.take().is_some() {
-            ctx.clear_kv_cache();
+            dec.clear_kv_cache();
             cached.clear();
         }
 
+        // Diagnostic parity with the MLX engine: what the model actually sees.
+        // Off unless asked for — prompts carry user content.
+        if std::env::var("CHATY_DUMP_PROMPT").as_deref() == Ok("1") {
+            eprintln!("PROMPT[{} chars]>>>{prompt}<<<END", prompt.len());
+        }
         let tokens = model
             .str_to_token(&prompt, AddBos::Always)
             .context("tokenization failed")?;
         let n_prompt = tokens.len();
 
         if n_prompt + 4 >= n_ctx as usize {
-            ctx.clear_kv_cache();
+            dec.clear_kv_cache();
             cached.clear();
             bail!("提示词 {n_prompt} tokens 超出上下文窗口 {n_ctx}，请新建对话或缩短输入。(Prompt exceeds the {n_ctx}-token context window — start a new chat or shorten the input.)");
         }
@@ -951,16 +1435,16 @@ fn run_turn(
         // leave the previous conversation's state in place and the model
         // would see BOTH conversations at once. Fall back to a full clear.
         if prefix < cached.len()
-            && ctx.clear_kv_cache_seq(Some(0), Some(prefix as u32), None) != Ok(true)
+            && !dec.clear_kv_cache_seq(Some(0), Some(prefix as u32), None)
         {
-            ctx.clear_kv_cache();
+            dec.clear_kv_cache();
             cached.clear();
             prefix = 0;
         }
         cached.truncate(prefix);
 
         if cancel.load(Ordering::Relaxed) {
-            ctx.clear_kv_cache();
+            dec.clear_kv_cache();
             cached.clear();
             return done_event(sink, n_prompt as u32, 0, 0.0, "cancelled");
         }
@@ -982,21 +1466,42 @@ fn run_turn(
         // tolerate partial KV reuse (llama.cpp's decode returns an error); if so,
         // clear the KV and decode the whole prompt fresh. If that still fails, reset
         // state so the next turn / new chat starts clean instead of staying broken.
-        if let Err(e) = decode_prompt(ctx, &mut batch, &tokens, prefix, n_batch, progress(prefix)) {
+        if let Err(e) = decode_prompt(dec, &mut batch, &tokens, prefix, n_batch, progress(prefix)) {
             eprintln!("prompt decode (reuse from {prefix}) failed: {e:#}; retrying from a clean KV");
-            ctx.clear_kv_cache();
-            if let Err(e2) = decode_prompt(ctx, &mut batch, &tokens, 0, n_batch, progress(0)) {
-                ctx.clear_kv_cache();
+            dec.clear_kv_cache();
+            if let Err(e2) = decode_prompt(dec, &mut batch, &tokens, 0, n_batch, progress(0)) {
+                dec.clear_kv_cache();
                 cached.clear();
                 return Err(e2).context("prompt decode failed");
             }
         }
+        kv_reused = prefix as u32;
         *cached = tokens; // KV now holds the full prompt
         n_prompt_pos = n_prompt as i32;
         idx = batch.n_tokens() - 1;
+        // The head guesses from the conversation so far; tell it what that is.
+        // Everything but the last token, which is the one the model has just
+        // been asked about and has not yet answered.
+        if let Some(spec) = dec.spec_mut() {
+            let prompt_in_kv = cached[..cached.len().saturating_sub(1)].to_vec();
+            if let Err(e) = spec.begin(&prompt_in_kv) {
+                eprintln!("MTP head could not take the prompt ({e}); decoding without it");
+            }
+        }
     }
 
-    let mut sampler = build_sampler(&req.params);
+    // Diagnostic parity with the MLX engine's CHATY_MLX_DUMP_TOKENS: the exact
+    // ids this turn generated. The text a turn streams is what the NEXT turn's
+    // prompt is rebuilt from, so any id whose piece renders empty — a control
+    // token — is an id the next prompt cannot reproduce, and the KV prefix
+    // diverges at exactly that position.
+    let dump_gen = std::env::var("CHATY_DUMP_GEN_TOKENS").as_deref() == Ok("1");
+    let mut gen_ids: Vec<i32> = Vec::new();
+
+    // How much of `out` is actually resident in the KV. See the snapshot below.
+    let mut decoded_len = 0usize;
+
+    let mut sampler = build_sampler(model, &req.params);
     // Robust incremental UTF-8 assembly: accumulate raw token bytes and only
     // emit the valid-UTF-8 prefix, carrying any incomplete trailing bytes to
     // the next token. This never drops a byte (the old streaming decoder could
@@ -1029,15 +1534,31 @@ fn run_turn(
     let mut stopped = false;
     let mut stop_reason = "eos";
 
+    // What the head cost and won this turn, for `CHATY_MTP_STATS=1`.
+    let mtp_stats = std::env::var("CHATY_MTP_STATS").as_deref() == Ok("1");
+    let (mut mtp_rounds, mut mtp_drafted, mut mtp_kept, mut mtp_declined) = (0u32, 0u32, 0u32, 0u32);
+    // Tokens a speculative round has already settled but not yet emitted. The
+    // last of them is the one the model has NOT read back — every earlier one
+    // is in the cache already — so the run ends when this empties.
+    let mut settled: std::collections::VecDeque<LlamaToken> = std::collections::VecDeque::new();
     loop {
         if cancel.load(Ordering::Relaxed) {
             stop_reason = "cancelled";
             break;
         }
-        let token = sampler.sample(ctx, idx);
-        sampler.accept(token);
+        let token = match settled.pop_front() {
+            Some(t) => t,
+            None => {
+                let t = sampler.sample(dec.ctx(), idx);
+                sampler.accept(t);
+                t
+            }
+        };
         if model.is_eog_token(token) {
             break;
+        }
+        if dump_gen {
+            gen_ids.push(token.0);
         }
         pending.extend_from_slice(&piece_bytes(model, token));
         let valid = match std::str::from_utf8(&pending) {
@@ -1109,24 +1630,85 @@ fn run_turn(
             stop_reason = "context";
             break;
         }
-        batch.clear();
-        batch.add(token, n_past, &[0], true)?;
-        n_past += 1;
-        if let Err(e) = ctx.decode(&mut batch) {
-            // The ledger must never run ahead of the cache — reset both
-            // rather than leaving a phantom token the next turn would reuse.
-            ctx.clear_kv_cache();
-            cached.clear();
-            *media_cache = None;
-            return Err(e).context("decode failed");
+        // Every settled token but the last is already in the cache: the round
+        // that produced them read them all in one pass.
+        if !settled.is_empty() {
+            decoded_len = out.len();
+            continue;
         }
-        // The token cache only describes text-regime KV contents; generated
-        // tokens in a media conversation live beyond `media_cache.n_past` and
-        // are truncated away by the next incremental media prefill.
-        if !media_turn {
-            cached.push(token);
+        // A run needs room for the guesses as well as the token itself, and
+        // the head cannot be asked for a shorter one — its ceiling was fixed
+        // when it was paired with the model. Near the end of the window, step.
+        // An image turn is prefilled by the vision helper, whose batches this
+        // code never sees — so the head has not been fed them and must not be
+        // asked to guess from a conversation it only half knows.
+        let room = !media_turn
+            && dec.spec_mut().is_some()
+            && n_past + 1 + MTP_DRAFT_MAX < n_ctx as i32;
+        let round = if room {
+            match speculate(dec, &mut sampler, &mut batch, token, n_past, cached) {
+                Ok(Some((r, drafted))) => {
+                    MTP_TOKENS_WON.fetch_add((r.len() - 1) as u64, Ordering::Relaxed);
+                    if mtp_stats {
+                        mtp_rounds += 1;
+                        mtp_drafted += drafted as u32;
+                        mtp_kept += (r.len() - 1) as u32;
+                    }
+                    Some(r)
+                }
+                // The head declined to guess — the reply just advances one
+                // token, as it would without a head at all.
+                Ok(None) => {
+                    if mtp_stats {
+                        mtp_declined += 1;
+                    }
+                    None
+                }
+                // Every error `speculate` returns is raised before the model
+                // reads anything, so an ordinary step from here is safe.
+                Err(e) => {
+                    dec.disable_head(&format!("round failed: {e:#}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        match round {
+            Some(ids) => {
+                // The model read `token` and every guess it accepted; the last
+                // id it drew is the next token and is not in the cache yet.
+                n_past += ids.len() as i32;
+                cached.push(token);
+                cached.extend(ids.iter().take(ids.len() - 1).copied());
+                // Drop the guesses the model disagreed with. They were decoded
+                // into the cache and describe a reply that is not being given.
+                dec.clear_kv_cache_seq(Some(0), Some(n_past as u32), None);
+                settled.extend(ids);
+            }
+            None => {
+                batch.clear();
+                batch.add(token, n_past, &[0], true)?;
+                n_past += 1;
+                if let Err(e) = dec.decode(&mut batch) {
+                    // The ledger must never run ahead of the cache — reset both
+                    // rather than leaving a phantom token the next turn would reuse.
+                    dec.clear_kv_cache();
+                    cached.clear();
+                    *media_cache = None;
+                    return Err(e).context("decode failed");
+                }
+                if !media_turn {
+                    cached.push(token);
+                }
+                idx = batch.n_tokens() - 1;
+            }
         }
-        idx = batch.n_tokens() - 1;
+        // The text of everything the KV now holds. A token reaches the cache
+        // only here, at the end of its iteration — a stop sequence breaks out
+        // above, with that token's piece already in `out` but never decoded —
+        // so the snapshot has to be taken after the decode, not before.
+        decoded_len = out.len();
     }
     // Flush the unsent tail (unless we halted on a stop sequence).
     if !stopped {
@@ -1141,8 +1723,59 @@ fn run_turn(
         }
     }
 
+    if mtp_stats && (mtp_rounds > 0 || mtp_declined > 0) {
+        let rate = if mtp_drafted > 0 {
+            f64::from(mtp_kept) / f64::from(mtp_drafted)
+        } else {
+            0.0
+        };
+        eprintln!(
+            "MTP rounds={mtp_rounds} declined={mtp_declined} drafted={mtp_drafted} \
+             kept={mtp_kept} acceptance={rate:.3} \
+             per-round={:.2} wall={:.2}s",
+            if mtp_rounds > 0 { f64::from(mtp_kept + mtp_rounds) / f64::from(mtp_rounds) } else { 0.0 },
+            start.elapsed().as_secs_f64()
+        );
+    }
+    if dump_gen {
+        let pieces: Vec<String> = gen_ids
+            .iter()
+            .map(|t| {
+                let text = String::from_utf8_lossy(&piece_bytes(model, LlamaToken(*t))).to_string();
+                if text.is_empty() {
+                    // Nothing should land here now that control tokens render;
+                    // if one does, it is a token the next prompt cannot
+                    // reproduce and the prefix will break on it.
+                    format!("{t}:<EMPTY>")
+                } else {
+                    format!("{t}:{text:?}")
+                }
+            })
+            .collect();
+        eprintln!("GEN_TOKENS[{}]>>>{}<<<END", gen_ids.len(), pieces.join(" "));
+    }
+
+    // Record the reply into the media ledger, so the next turn's prompt — which
+    // contains this very reply — extends it instead of colliding with a tail
+    // nothing describes. Without this the next prefill had to rewind the KV
+    // past the generated tokens, and a hybrid model cannot rewind: it re-read
+    // the whole conversation and re-encoded every image, on every single round.
+    //
+    // Only when `pending` is empty, because a multi-byte character split across
+    // tokens leaves bytes that have not reached `out` yet — the ledger would
+    // then describe less than the KV holds, and the next turn would evaluate a
+    // tail the model has already seen. In that case the ledger stays
+    // prompt-only and the old rewind path handles it.
+    if media_turn && pending.is_empty() && decoded_len > 0 {
+        if let Some(c) = media_cache.as_mut() {
+            c.prompt.push_str(&out[..decoded_len]);
+            c.n_past = n_past;
+            c.complete = true;
+        }
+    }
+
     let secs = start.elapsed().as_secs_f32().max(1e-3);
-    done_event(sink, n_prompt_pos as u32, n_decoded, n_decoded as f32 / secs, stop_reason)
+    done_event_reused(sink, n_prompt_pos as u32, n_decoded, n_decoded as f32 / secs, stop_reason, kv_reused)
 }
 
 /// Prefill a multimodal prompt through mtmd, reusing the media KV cache
@@ -1161,7 +1794,7 @@ fn prefill_media(
     n_batch: i32,
     sink: &dyn EventSink,
     cancel: &AtomicBool,
-) -> Result<i32> {
+) -> Result<(i32, u32)> {
     let images: Vec<&String> = messages.iter().flat_map(|m| m.images.iter()).collect();
     let image_keys: Vec<String> = images.iter().map(|p| image_cache_key(p)).collect();
 
@@ -1184,13 +1817,15 @@ fn prefill_media(
     // an empty tail would leave the sampler without fresh logits.
     let reuse = media_cache.as_ref().and_then(|c| {
         if prompt.len() > c.prompt.len() && prompt.starts_with(c.prompt.as_str()) && img_prefix_ok(c) {
-            Some((c.n_past, c.prompt.len(), c.image_keys.len()))
+            Some((c.n_past, c.prompt.len(), c.image_keys.len(), c.complete))
         } else if !c.body.is_empty()
             && prompt.len() > c.body.len()
             && prompt.starts_with(c.body.as_str())
             && img_prefix_ok(c)
         {
-            Some((c.n_past_body, c.body.len(), c.image_keys.len()))
+            // The anchor deliberately points behind the generation tail, so
+            // this one always has something to truncate.
+            Some((c.n_past_body, c.body.len(), c.image_keys.len(), false))
         } else {
             None
         }
@@ -1201,7 +1836,13 @@ fn prefill_media(
         // state — seq_rm reports false — so fall back to a clean full
         // prefill (correct, just slower; the frontend caps how many images
         // ride along, so the re-encode cost stays bounded).
-        Some((n_past, prompt_len, n_imgs))
+        // A complete ledger means the KV ends exactly where the cached prompt
+        // does: the new prompt appends to it, so there is nothing to remove and
+        // no rewind to ask for. This is what lets a hybrid model reuse at all.
+        Some((n_past, prompt_len, n_imgs, true)) => {
+            (n_past, &prompt[prompt_len..], &images[n_imgs..])
+        }
+        Some((n_past, prompt_len, n_imgs, false))
             if ctx.clear_kv_cache_seq(Some(0), Some(n_past as u32), None) == Ok(true) =>
         {
             (n_past, &prompt[prompt_len..], &images[n_imgs..])
@@ -1235,7 +1876,7 @@ fn prefill_media(
     let mut bitmaps: Vec<MtmdBitmap> = Vec::with_capacity(new_images.len());
     for p in new_images {
         if cancel.load(Ordering::Relaxed) {
-            return Ok(start_past.max(0));
+            return Ok((start_past.max(0), start_past.max(0) as u32));
         }
         // Oversized screenshots (full-page captures at 2x scale reach tens of
         // megapixels) are downscaled before they hit the vision encoder — the
@@ -1362,7 +2003,7 @@ fn prefill_media(
         );
     }
     if cancel.load(Ordering::Relaxed) {
-        return Ok(start_past.max(0));
+        return Ok((start_past.max(0), start_past.max(0) as u32));
     }
 
     // Image turns are always worth a ring (encoding takes seconds); text-only
@@ -1385,7 +2026,7 @@ fn prefill_media(
             // Mid-prefill cancel: the KV holds a partial media prefill the
             // cache can't describe — drop it so the next turn starts clean.
             clear_all(ctx, media_cache);
-            return Ok(start_past.max(0));
+            return Ok((start_past.max(0), start_past.max(0) as u32));
         }
         n_past = match seg.chunks.eval_chunks(mtmd, ctx, n_past, 0, n_batch, i == last) {
             Ok(p) => p,
@@ -1413,8 +2054,11 @@ fn prefill_media(
         n_past,
         body: if anchored { prompt_body.to_string() } else { String::new() },
         n_past_body,
+        // The reply has not been generated yet; the generation loop marks this
+        // true once it has recorded what it decoded.
+        complete: false,
     });
-    Ok(n_past)
+    Ok((n_past, start_past.max(0) as u32))
 }
 
 /// Feed-side image budget for the vision encoder. Full-page browser
@@ -1491,15 +2135,24 @@ fn done_event(
     tps: f32,
     stop_reason: &str,
 ) -> Result<()> {
+    done_event_reused(sink, prompt_tokens, completion_tokens, tps, stop_reason, 0)
+}
+
+fn done_event_reused(
+    sink: &dyn EventSink,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    tps: f32,
+    stop_reason: &str,
+    reused: u32,
+) -> Result<()> {
     sink.emit(StreamEvent::Done {
         stats: GenStats {
             prompt_tokens,
             completion_tokens,
             tokens_per_second: tps,
             stop_reason: stop_reason.to_string(),
-            // llama.cpp manages its KV prefix via n_past truncation; reuse
-            // accounting is only surfaced for the MLX engine.
-            reused: 0,
+            reused,
         },
     })?;
     Ok(())
@@ -1519,6 +2172,152 @@ fn build_prompt(model: &LlamaModel, messages: &[ChatMessage], think: Option<bool
 /// diverges from how the assistant turn is later re-rendered. Truncating the
 /// KV back to the body costs a handful of tokens — re-encoding every image
 /// (the old behavior on any tail divergence) cost seconds per turn.
+/// The empty reasoning block Chaty prefills when thinking is off, as it must
+/// appear at the head of a stored assistant turn. Kept next to the injection
+/// site below — the two spellings have to stay identical.
+const THINK_OFF_PREFIX: &str = "<think>\n\n</think>\n\n";
+
+/// Put that block back in front of prior assistant turns, so re-rendering the
+/// conversation reproduces the prompt the model actually continued from. A turn
+/// that already opens with a reasoning block is left alone — the model wrote one
+/// despite the request, and doubling it would break the prefix just as badly.
+fn with_think_off_prefix(
+    model: &LlamaModel,
+    messages: &[ChatMessage],
+    think: Option<bool>,
+) -> Vec<ChatMessage> {
+    prefixed_assistant_turns(messages, think == Some(false) && template_uses_think(model))
+}
+
+/// The message rewrite itself, with the model question already answered so the
+/// rule is testable on its own.
+fn prefixed_assistant_turns(messages: &[ChatMessage], apply: bool) -> Vec<ChatMessage> {
+    if !apply {
+        return messages.to_vec();
+    }
+    messages
+        .iter()
+        .map(|m| {
+            if !matches!(m.role, Role::Assistant) || m.content.trim_start().starts_with("<think>") {
+                return m.clone();
+            }
+            ChatMessage {
+                content: format!("{THINK_OFF_PREFIX}{}", m.content),
+                ..m.clone()
+            }
+        })
+        .collect()
+}
+
+/// Does this model's template use the `<think>` convention? Architecture is
+/// authoritative: Qwen3.5/3.6 use it even when a finetune ships a custom
+/// template without the markers.
+fn template_uses_think(model: &LlamaModel) -> bool {
+    let arch = model
+        .meta_val_str("general.architecture")
+        .map(|a| is_think_paradigm_arch(&a.to_lowercase()))
+        .unwrap_or(false);
+    arch || model
+        .meta_val_str("tokenizer.chat_template")
+        .map(|t| t.contains("<think>"))
+        .unwrap_or(false)
+}
+
+/// Muse Glimmer speaks ATEM, whose template llama.cpp cannot render: its
+/// built-in applier is a matcher over known templates, not a Jinja engine, so
+/// every custom template comes back as a bare error and the fallback chain
+/// lands on ChatML — a model quietly speaking the wrong protocol. The GGUF
+/// declares the architecture, which is the reliable marker.
+fn is_muse_glimmer(model: &LlamaModel) -> bool {
+    model
+        .meta_val_str("general.architecture")
+        .map(|a| a.to_lowercase().contains("muse-glimmer") || a.to_lowercase().contains("muse_glimmer"))
+        .unwrap_or(false)
+}
+
+/// Native renderer for ATEM:
+///
+/// ```text
+/// <|start|>system<|message|>…\n\nReasoning strength: high.\n\n# Valid recipients: "self", "user".<|eot|>
+/// <|start|>user<|message|>…<|eot|>
+/// <|start|>assistant to=self<|message|>…<|eom|><|start|>assistant to=user<|message|>…<|eot|>
+/// <|start|>assistant
+/// ```
+///
+/// Each span is addressed to a recipient rather than tagged: `to=self` is the
+/// reasoning, `to=user` the answer. The generation prompt stops after
+/// `<|start|>assistant`, so the model picks its own recipient — which is why
+/// the stored turn has to carry both spans or the next prompt stops being an
+/// append of the last.
+///
+/// The rung sentence is always written at `high`, the value the template's own
+/// default renders; `apply_effort` rewrites it in place for the other rungs.
+/// Tool definitions are not rendered here: Chaty carries its tool manual in the
+/// system message, not through the template's `tools` argument.
+fn render_muse_glimmer(messages: &[ChatMessage], add_gen: bool) -> String {
+    const RECIPIENTS: &str = "# Valid recipients: \"self\", \"user\".";
+    let mut p = String::new();
+    if !messages.iter().any(|m| matches!(m.role, Role::System)) {
+        p.push_str("<|start|>system<|message|>You are a helpful AI assistant.");
+        p.push_str("\nKnowledge cutoff: 2026-01-04.");
+        p.push_str("\n\n");
+        p.push_str(STRENGTH_PREFIX);
+        p.push_str("high.\n\n");
+        p.push_str(RECIPIENTS);
+        p.push_str("<|eot|>");
+    }
+    for m in messages {
+        match m.role {
+            Role::System => {
+                p.push_str("<|start|>system<|message|>");
+                p.push_str(&m.content);
+                // The template leaves a caller-written directive alone and adds
+                // its own only when there is none.
+                if !m.content.to_lowercase().contains("reasoning strength") {
+                    p.push_str("\n\n");
+                    p.push_str(STRENGTH_PREFIX);
+                    p.push_str("high.");
+                }
+                p.push_str("\n\n");
+                p.push_str(RECIPIENTS);
+                p.push_str("<|eot|>");
+            }
+            Role::User => {
+                p.push_str("<|start|>user<|message|>");
+                p.push_str(&m.content);
+                p.push_str("<|eot|>");
+            }
+            Role::Tool => {
+                // Chaty's results arrive without the name the template would
+                // look up from a structured call, and the name is written twice
+                // — keep both spellings consistent whatever it is.
+                let name = "tool";
+                p.push_str("<|start|>tool ");
+                p.push_str(name);
+                p.push_str("<|message|><tool_output name=\"");
+                p.push_str(name);
+                p.push_str("\">\n");
+                p.push_str(&m.content);
+                p.push_str("\n</tool_output><|eot|>");
+            }
+            Role::Assistant => {
+                if let Some(r) = m.reasoning_content.as_deref().filter(|r| !r.is_empty()) {
+                    p.push_str("<|start|>assistant to=self<|message|>");
+                    p.push_str(r);
+                    p.push_str("<|eom|>");
+                }
+                p.push_str("<|start|>assistant to=user<|message|>");
+                p.push_str(&m.content);
+                p.push_str("<|eot|>");
+            }
+        }
+    }
+    if add_gen {
+        p.push_str("<|start|>assistant");
+    }
+    p
+}
+
 fn build_prompt_pair(
     model: &LlamaModel,
     messages: &[ChatMessage],
@@ -1533,6 +2332,16 @@ fn build_prompt_pair(
             render_gemma4(messages, think, false),
         ));
     }
+    // What Chaty appends after the assistant header when thinking is off (see
+    // below) has to appear in front of every STORED assistant turn too, or the
+    // next prompt is not an append of the last one. Round one ends with
+    // `…assistant\n<think>\n\n</think>\n\n` and the model continues from there;
+    // if round two renders that same turn as `…assistant\n<answer>`, the common
+    // prefix ends at the header and every turn after the first pays a full
+    // prefill. Measured at 0% KV reuse on qwen35 and lfm2 with thinking off —
+    // which is the default in code mode.
+    let messages = with_think_off_prefix(model, messages, think);
+    let messages = messages.as_slice();
     let body = render_chat(model, messages, false).unwrap_or_default();
     let mut prompt = render_chat(model, messages, true)?;
 
@@ -1550,11 +2359,7 @@ fn build_prompt_pair(
         .meta_val_str("general.architecture")
         .map(|a| is_qwen3_5_plus_arch(&a.to_lowercase()))
         .unwrap_or(false);
-    let template_uses_think = qwen35plus
-        || model
-            .meta_val_str("tokenizer.chat_template")
-            .map(|t| t.contains("<think>"))
-            .unwrap_or(false);
+    let template_uses_think = template_uses_think(model);
     // Thinking ON for a model whose official template PRE-OPENS the block
     // after the assistant header (Qwen3.5/3.6: literal `'<think>\n'` in the
     // generation section — Qwen3 emits the tag itself and must NOT get this):
@@ -1590,7 +2395,7 @@ fn build_prompt_pair(
                 // The template already opened a reasoning block — just close it.
                 prompt.push_str("\n</think>\n\n");
             } else {
-                prompt.push_str("<think>\n\n</think>\n\n");
+                prompt.push_str(THINK_OFF_PREFIX);
             }
         }
     }
@@ -1605,6 +2410,17 @@ fn build_prompt_pair(
 /// `/no_think` soft switch, a pre-opened `<think>` block. Parse the minor
 /// version out of the GGUF arch string instead of listing each release —
 /// `qwen35`, `qwen36`, `qwen38` all qualify, `qwen3`/`qwen3moe` do not.
+/// Does this architecture reason in `<think>` blocks at all? The whole Qwen3
+/// line does — 3, 3.5, 3.6, 3.8 — and that is a property of the model, not of
+/// whatever chat template a finetune happened to ship. Some ship none: the
+/// abliterated Qwen3 4B carries an EMPTY template, so llama.cpp renders it with
+/// its ChatML fallback and every think-off mechanism that keyed off template
+/// text silently did nothing. Thinking could not be turned off on that model at
+/// all, in either mode, and the only sign was a slow reply.
+pub(crate) fn is_think_paradigm_arch(arch_lc: &str) -> bool {
+    arch_lc.starts_with("qwen3")
+}
+
 pub(crate) fn is_qwen3_5_plus_arch(arch_lc: &str) -> bool {
     let Some(rest) = arch_lc.strip_prefix("qwen3") else { return false };
     match rest.chars().next() {
@@ -1616,13 +2432,195 @@ pub(crate) fn is_qwen3_5_plus_arch(arch_lc: &str) -> bool {
 /// The three sentences Qwen3.8's chat template injects for its
 /// `reasoning_effort` ladder, verbatim from the official template. `medium`
 /// deliberately injects nothing — it is the neutral baseline.
+/// ATEM's rung sentence, up to the rung itself.
+pub(crate) const STRENGTH_PREFIX: &str = "Reasoning strength: ";
 pub(crate) const EFFORT_XHIGH: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
 pub(crate) const EFFORT_LOW: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
 
 /// The ladder a template offers, weakest first — detected from the template
 /// text, never from the model name (finetunes rename freely, and a template
 /// that takes the kwarg is exactly the set of models that honour it).
+/// Does delivering a tool result under its own role keep the next prompt an
+/// APPEND onto the last one?
+///
+/// That is the property the KV cache actually needs: round two must begin with
+/// round one's prompt followed by exactly the text the model generated on top
+/// of it. Templates decide "does this turn still belong to the request being
+/// answered" from the index of the last *user* message, so a result wearing
+/// the user role pushes that index past every assistant turn — some templates
+/// then drop their reasoning, others re-wrap the stored turn inside an empty
+/// thinking block. Either way the prompt no longer reproduces what the model
+/// just wrote, the prefix dies at the first assistant turn, and a model whose
+/// memory cannot rewind re-reads the entire conversation every step.
+///
+/// Testing the append property directly, rather than looking for reasoning in
+/// the output, is what distinguishes a template that genuinely preserves the
+/// turn from one that merely passes the markup through as content.
+/// What is actually wrong with a GGUF the loader refused.
+///
+/// `llama_model_load_from_file` answers every failure with a null pointer, so
+/// the error that reaches the user says only "null result from llama cpp" —
+/// true, and useless: it cannot tell a broken file from an unsupported one
+/// from a machine out of memory. The file itself usually says why.
+///
+/// The giveaway for a bad conversion is that GGUF requires every architecture
+/// parameter to be keyed `<arch>.<name>`. A converter that writes the model's
+/// NAME into `general.architecture` (`"Qwen3-VL-2B-Thinking"` instead of
+/// `"qwen3vl"`) leaves a file whose arch matches nothing and which carries not
+/// one prefixed key — llama.cpp supports the model, but nothing in the file
+/// says which model it is.
+fn gguf_diagnosis<R: std::io::Read>(mut r: R) -> Option<String> {
+    fn take<R: std::io::Read>(r: &mut R, n: usize) -> Option<Vec<u8>> {
+        let mut b = vec![0u8; n];
+        r.read_exact(&mut b).ok()?;
+        Some(b)
+    }
+    fn u32le<R: std::io::Read>(r: &mut R) -> Option<u32> {
+        Some(u32::from_le_bytes(take(r, 4)?.try_into().ok()?))
+    }
+    fn u64le<R: std::io::Read>(r: &mut R) -> Option<u64> {
+        Some(u64::from_le_bytes(take(r, 8)?.try_into().ok()?))
+    }
+    fn string<R: std::io::Read>(r: &mut R) -> Option<String> {
+        let n = u64le(r)?;
+        // A length this large is a malformed file, not a long key.
+        if n > 1 << 20 {
+            return None;
+        }
+        String::from_utf8(take(r, n as usize)?).ok()
+    }
+    /// Read past a value without keeping it.
+    fn skip_value<R: std::io::Read>(r: &mut R, t: u32) -> Option<()> {
+        match t {
+            0 | 1 | 7 => take(r, 1).map(|_| ()),
+            2 | 3 => take(r, 2).map(|_| ()),
+            4..=6 => take(r, 4).map(|_| ()),
+            10..=12 => take(r, 8).map(|_| ()),
+            8 => string(r).map(|_| ()),
+            9 => {
+                let et = u32le(r)?;
+                let n = u64le(r)?;
+                if n > 8_000_000 {
+                    return None;
+                }
+                for _ in 0..n {
+                    skip_value(r, et)?;
+                }
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    let magic = take(&mut r, 4)?;
+    if magic != b"GGUF" {
+        return Some(trf!(
+            "这不是 GGUF 文件:开头不是 GGUF 魔数",
+            "not a GGUF file: it does not start with the GGUF magic"
+        ));
+    }
+    let _version = u32le(&mut r)?;
+    let _n_tensors = u64le(&mut r)?;
+    let n_kv = u64le(&mut r)?;
+    if n_kv > 100_000 {
+        return None;
+    }
+
+    let mut arch: Option<String> = None;
+    let mut keys: Vec<String> = Vec::new();
+    for _ in 0..n_kv {
+        let key = string(&mut r)?;
+        let t = u32le(&mut r)?;
+        if key == "general.architecture" && t == 8 {
+            arch = string(&mut r);
+        } else {
+            skip_value(&mut r, t)?;
+        }
+        keys.push(key);
+    }
+
+    let arch = arch?;
+    let prefix = format!("{arch}.");
+    if keys.iter().any(|k| k.starts_with(&prefix)) {
+        // A well-formed file whose architecture this build does not implement.
+        return Some(trf!(
+            "这个 llama.cpp 版本不认识架构 \"{arch}\"",
+            "this llama.cpp build does not know the architecture \"{arch}\""
+        ));
+    }
+    Some(trf!(
+        "GGUF 的 general.architecture 是 \"{arch}\" —— 那是模型的名字,不是架构标识,\
+         而且文件里没有任何 \"{arch}.\" 开头的元数据键。这个文件是转换工具写坏的,\
+         llama.cpp 无从知道该按哪种模型加载它;请换一个转换正确的 GGUF。",
+        "this file's general.architecture is \"{arch}\" — the model's name rather than \
+         an architecture, and it carries no \"{arch}.\" metadata keys at all. It was \
+         written by a broken converter, so llama.cpp cannot tell what to load it as. \
+         A correctly converted GGUF of the same model will work."
+    ))
+}
+
+fn probe_tool_role(model: &LlamaModel) -> bool {
+    const REASONED: &str = "PROBE_REASONING\n</think>\n\nPROBE_ANSWER";
+    let msg = |role: Role, content: &str| ChatMessage {
+    reasoning_content: None,
+        role,
+        content: content.into(),
+        images: vec![],
+    };
+    let opening = [msg(Role::System, "s"), msg(Role::User, "q")];
+    let Ok(first) = render_chat(model, &opening, true) else { return false };
+    // A template that pre-opens the thinking block supplies that tag itself, so
+    // the model's own output starts after it — and the loop stores the turn the
+    // same way, tag included.
+    // The stored turn always carries the opening tag; what the model *generated*
+    // does not when the template pre-opened it. Both conventions exist (Qwen3.5
+    // pre-opens, Qwen3 emits the tag itself), and getting this backwards makes
+    // the probe test a shape that never occurs.
+    let stored = format!("<think>\n{REASONED}");
+    let generated = if first.trim_end().ends_with("<think>") {
+        REASONED.to_string()
+    } else {
+        stored.clone()
+    };
+    const PROBE_RESULT: &str = "PROBE_TOOL_RESULT";
+    let appends = |tool_role: Role| {
+        let second = [
+            opening[0].clone(),
+            opening[1].clone(),
+            msg(Role::Assistant, &stored),
+            msg(tool_role, PROBE_RESULT),
+        ];
+        render_chat(model, &second, true)
+            .map(|p| {
+                // The turn has to APPEND, and the result has to actually be in
+                // there. A template with no branch for a role can drop the
+                // message rather than fail — which appends perfectly well and
+                // hands the model nothing.
+                p.starts_with(&format!("{first}{generated}")) && p.contains(PROBE_RESULT)
+            })
+            .unwrap_or(false)
+    };
+    // Whether the template HAS a tool role, not whether the user role also
+    // happens to work. It usually does — a user turn is a user turn — and
+    // requiring it to fail meant the tool role was rejected on exactly the
+    // templates that support it best. A Qwen3.5 template scans backwards for
+    // the last real user query, skipping tool turns; a tool result arriving as
+    // plain user text is counted as the user asking something new, and the
+    // model says so, halfway through the work it was already doing.
+    appends(Role::Tool)
+}
+
 pub(crate) fn effort_levels_of(template: &str) -> Vec<String> {
+    // ATEM (Muse Glimmer) renders its rung into a sentence — `Reasoning
+    // strength: <rung>.` — instead of branching on each name, so the ladder
+    // cannot be read back out of the template the way the Qwen one can. The
+    // four rungs are the protocol's, not the template's.
+    if template.contains("reasoning_strength") {
+        return ["low", "medium", "high", "xhigh"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+    }
     if !template.contains("reasoning_effort") {
         return Vec::new();
     }
@@ -1641,6 +2639,36 @@ pub(crate) fn effort_levels_of(template: &str) -> Vec<String> {
 /// Anything unexpected (finetuned template, fallback renderer that never
 /// emitted the sentence) leaves the prompt untouched.
 pub(crate) fn apply_effort(prompt: &str, effort: &str) -> String {
+    // ATEM states the rung in one sentence, and its template re-reads that
+    // sentence from the system block when the caller already wrote one —
+    // rewriting it in place is byte-identical to what the template renders for
+    // that rung, which is the same trick the Qwen branch below relies on.
+    if prompt.contains(STRENGTH_PREFIX) {
+        if !["low", "medium", "high", "xhigh"].contains(&effort) {
+            return prompt.to_string();
+        }
+        let mut out = String::with_capacity(prompt.len());
+        let mut rest = prompt;
+        while let Some(i) = rest.find(STRENGTH_PREFIX) {
+            let after = &rest[i + STRENGTH_PREFIX.len()..];
+            // Only a bare rung word ends the sentence; anything else is prose
+            // that merely opens the same way and is left alone.
+            match after.find('.') {
+                Some(dot) if after[..dot].chars().all(|c| c.is_ascii_alphabetic()) => {
+                    out.push_str(&rest[..i]);
+                    out.push_str(STRENGTH_PREFIX);
+                    out.push_str(effort);
+                    rest = &after[dot..];
+                }
+                _ => {
+                    out.push_str(&rest[..i + STRENGTH_PREFIX.len()]);
+                    rest = after;
+                }
+            }
+        }
+        out.push_str(rest);
+        return out;
+    }
     if !prompt.contains(EFFORT_XHIGH) {
         return prompt.to_string();
     }
@@ -1699,16 +2727,31 @@ fn render_gemma4(messages: &[ChatMessage], think: Option<bool>, add_gen: bool) -
     for m in messages {
         let role = match m.role {
             Role::System => continue,
-            Role::User => "user",
+            // Gemma's format has no tool turn — a result is spoken by the user,
+            // which is exactly the shape this renderer already produced.
+            Role::User | Role::Tool => "user",
             Role::Assistant => "model",
         };
-        // Strip reasoning channels from prior assistant turns — official
-        // templates never feed thought traces back into the context.
-        let content = if matches!(m.role, Role::Assistant) {
-            strip_thought_channels(&m.content)
-        } else {
-            m.content.clone()
-        };
+        // A turn keeps the channel it was written in.
+        //
+        // This is a DELIBERATE departure from Google's documented contract, so
+        // do not quietly restore the strip. Their guidance is in two parts:
+        // thoughts must NOT be removed between the tool calls of one model turn,
+        // and they must be removed from previous turns before the next one.
+        // Gemma's own template obeys neither half cleanly — `strip_thinking`
+        // runs over every model message unconditionally, so it breaks the
+        // tool-call half, which is what made an agent step re-read its whole
+        // transcript.
+        //
+        // Keeping the whole channel fixes that half and costs the other: 13%
+        // cache reuse across four chat turns became 100%. The owner ran it and
+        // found no drop in answer quality with reasoning in history, and took
+        // the trade knowingly. Compaction reclaims stale reasoning when the
+        // window tightens, which is also what Google suggests for long sessions
+        // — carry the substance, not the raw trace.
+        //
+        // https://ai.google.dev/gemma/docs/capabilities/thinking
+        let content = m.content.clone();
         p.push_str("<|turn>");
         p.push_str(role);
         p.push('\n');
@@ -1719,24 +2762,6 @@ fn render_gemma4(messages: &[ChatMessage], think: Option<bool>, add_gen: bool) -
         p.push_str("<|turn>model\n");
     }
     p
-}
-
-/// Remove `<|channel>…<channel|>` reasoning spans (and stray markers).
-fn strip_thought_channels(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(open) = rest.find("<|channel>") {
-        out.push_str(&rest[..open]);
-        match rest[open..].find("<channel|>") {
-            Some(close) => rest = &rest[open + close + "<channel|>".len()..],
-            None => {
-                rest = "";
-                break;
-            }
-        }
-    }
-    out.push_str(rest);
-    out.trim().to_string()
 }
 
 /// Apply the chat template with a robust fallback chain:
@@ -1755,18 +2780,34 @@ fn render_chat(model: &LlamaModel, messages: &[ChatMessage], add_ass: bool) -> R
             .context("invalid message content")
     }
 
+    // ATEM has no thinking-off branch — the rung ladder is the control — so
+    // `think` never reaches this renderer, which is why it can live here rather
+    // than beside the Gemma 4 one. Every caller needs it, the load-time probes
+    // included: a probe that measured the ChatML fallback would decide how to
+    // store turns for a protocol the model does not speak.
+    if is_muse_glimmer(model) {
+        return Ok(render_muse_glimmer(messages, add_ass));
+    }
+
     let chat = to_chat(messages)?;
     let folded = fold_system(messages);
     let folded_chat = to_chat(&folded)?;
 
+    // Why the embedded template was rejected, kept for the fallback message
+    // below: falling back silently turns a template this llama.cpp cannot parse
+    // into a model that quietly speaks the wrong protocol.
+    let rejected: String;
     if let Ok(t) = model.chat_template(None) {
-        if let Ok(p) = model.apply_chat_template(&t, &chat, add_ass) {
-            return Ok(p);
+        match model.apply_chat_template(&t, &chat, add_ass) {
+            Ok(p) => return Ok(p),
+            Err(e) => rejected = e.to_string(),
         }
         if let Ok(p) = model.apply_chat_template(&t, &folded_chat, add_ass) {
             eprintln!("chat template rejected the system role; folded it into the user turn");
             return Ok(p);
         }
+    } else {
+        rejected = "the model embeds no chat template".to_string();
     }
 
     let arch = model
@@ -1776,12 +2817,17 @@ fn render_chat(model: &LlamaModel, messages: &[ChatMessage], add_ass: bool) -> R
     for name in builtin_template_candidates(&arch) {
         if let Ok(t) = LlamaChatTemplate::new(name) {
             if let Ok(p) = model.apply_chat_template(&t, &folded_chat, add_ass) {
-                eprintln!("embedded chat template unusable; using built-in '{name}' (arch: {arch})");
+                eprintln!(
+                    "embedded chat template unusable; using built-in '{name}' (arch: {arch}): {rejected}"
+                );
                 return Ok(p);
             }
         }
     }
-    bail!("no usable chat template (arch: {arch})")
+    bail!(trf!(
+        "没有可用的对话模板(架构:{arch})",
+        "no usable chat template (arch: {arch})"
+    ))
 }
 
 /// Merge any system messages into the first user turn (for templates that
@@ -1806,13 +2852,22 @@ fn fold_system(messages: &[ChatMessage]) -> Vec<ChatMessage> {
                 out.push(ChatMessage { images: Vec::new(),
                     role: Role::User,
                     content: format!("{sys_text}\n\n{}", m.content),
+                    reasoning_content: None,
                 });
             }
             _ => out.push(m.clone()),
         }
     }
     if !injected {
-        out.insert(0, ChatMessage { images: Vec::new(), role: Role::User, content: sys_text });
+        out.insert(
+            0,
+            ChatMessage {
+                images: Vec::new(),
+                role: Role::User,
+                content: sys_text,
+                reasoning_content: None,
+            },
+        );
     }
     out
 }
@@ -1839,16 +2894,36 @@ fn role_str(role: &Role) -> &'static str {
         Role::System => "system",
         Role::User => "user",
         Role::Assistant => "assistant",
+        Role::Tool => "tool",
     }
 }
 
 /// Raw bytes of a token's piece, handling pieces longer than the initial
-/// buffer. `special = false` so control tokens render empty.
+/// buffer.
+///
+/// `special = true`: a control token renders as its literal text rather than as
+/// nothing. This used to be `false`, which quietly deleted information the rest
+/// of Chaty needs. A turn's streamed text is what the NEXT turn's prompt is
+/// rebuilt from, so a token whose piece renders empty is a token the next
+/// prompt cannot reproduce, and the KV prefix diverges at exactly that
+/// position — every later turn paid a full prefill. Worse, LFM2 emits its tool
+/// calls as `<|tool_call_start|>[read_file(path='x')]<|tool_call_end|>` no
+/// matter what format the system prompt asks for: with the markers deleted the
+/// text read as ordinary prose and the tool call never fired at all.
+///
+/// The MLX engine has always kept them (swift-transformers decodes with
+/// `skipSpecialTokens: false`), and the front end already normalises such
+/// markers away for display in `normalizeChannels` — this restores the same
+/// contract on the GGUF side: the engine streams what the model actually
+/// produced, and the front end decides what a person sees.
+///
+/// End-of-generation tokens never reach here — the sampling loop breaks on
+/// `is_eog_token` first.
 fn piece_bytes(model: &LlamaModel, token: LlamaToken) -> Vec<u8> {
-    match model.token_to_piece_bytes(token, 32, false, None) {
+    match model.token_to_piece_bytes(token, 32, true, None) {
         Ok(b) => b,
         Err(llama_cpp_2::TokenToStringError::InsufficientBufferSpace(i)) => model
-            .token_to_piece_bytes(token, (-i) as usize, false, None)
+            .token_to_piece_bytes(token, (-i) as usize, true, None)
             .unwrap_or_default(),
         Err(_) => Vec::new(),
     }
@@ -1998,7 +3073,7 @@ fn quant_name(ft: u32) -> &'static str {
     }
 }
 
-fn build_sampler(params: &GenParams) -> LlamaSampler {
+fn build_sampler(model: &LlamaModel, params: &GenParams) -> LlamaSampler {
     let seed = params.seed.map_or(0xFFFF_FFFF, |s| s as u32);
     // Repetition penalty applies to greedy and sampled decoding alike.
     let repeat = if params.repeat_penalty > 0.0 {
@@ -2006,7 +3081,9 @@ fn build_sampler(params: &GenParams) -> LlamaSampler {
     } else {
         1.0
     };
-    let penalties = LlamaSampler::penalties(64, repeat, 0.0, 0.0);
+    // `penalties` takes the vocabulary size ahead of the window; the four
+    // penalty values that follow are unchanged.
+    let penalties = LlamaSampler::penalties(model.n_vocab(), 64, repeat, 0.0, 0.0);
     if params.temperature <= 0.0 {
         LlamaSampler::chain_simple([penalties, LlamaSampler::greedy()])
     } else {
@@ -2029,6 +3106,52 @@ fn build_sampler(params: &GenParams) -> LlamaSampler {
 #[cfg(test)]
 mod tests {
 
+    /// A GGUF the loader refuses must come back with the reason, not with
+    /// llama.cpp's null pointer. The shapes that matter: a file that is not a
+    /// GGUF at all, and the one the owner hit — a converter that wrote the
+    /// model's NAME into `general.architecture`, leaving nothing keyed to it.
+    #[test]
+    fn a_refused_gguf_says_what_is_wrong_with_it() {
+        use std::io::Cursor;
+        fn gguf(arch: &str, extra_keys: &[&str]) -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend_from_slice(b"GGUF");
+            b.extend_from_slice(&3u32.to_le_bytes());
+            b.extend_from_slice(&0u64.to_le_bytes());
+            b.extend_from_slice(&((1 + extra_keys.len()) as u64).to_le_bytes());
+            let push = |b: &mut Vec<u8>, k: &str, v: &str| {
+                b.extend_from_slice(&(k.len() as u64).to_le_bytes());
+                b.extend_from_slice(k.as_bytes());
+                b.extend_from_slice(&8u32.to_le_bytes());
+                b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+                b.extend_from_slice(v.as_bytes());
+            };
+            push(&mut b, "general.architecture", arch);
+            for k in extra_keys {
+                push(&mut b, k, "x");
+            }
+            b
+        }
+
+        let msg = super::gguf_diagnosis(Cursor::new(b"NOPE....".to_vec())).unwrap();
+        assert!(msg.contains("GGUF"), "{msg}");
+
+        // The owner's file: architecture is the model's name, nothing keyed to it.
+        let msg =
+            super::gguf_diagnosis(Cursor::new(gguf("Qwen3-VL-2B-Thinking", &["hidden_size"])))
+                .unwrap();
+        assert!(msg.contains("Qwen3-VL-2B-Thinking"), "{msg}");
+        assert!(msg.contains("converter") || msg.contains("转换"), "names the cause: {msg}");
+
+        // Well-formed, but an architecture this build does not implement.
+        let msg = super::gguf_diagnosis(Cursor::new(gguf("somearch", &["somearch.block_count"])))
+            .unwrap();
+        assert!(
+            msg.contains("does not know") || msg.contains("不认识"),
+            "unsupported, not malformed: {msg}"
+        );
+    }
+
     /// The Qwen3.5+ paradigm test parses the minor version instead of listing
     /// releases — 3.8 must qualify the day it ships, `qwen3`/`qwen3moe` must
     /// not (they still use the `/no_think` soft switch).
@@ -2045,6 +3168,41 @@ mod tests {
     /// The effort ladder is detected from the template text (never the model
     /// name), and a rung request rewrites the rendered prompt to exactly what
     /// the official template emits for that rung.
+    /// The wire name a template sees. The sidecar used to fold every role it
+    /// did not recognise into `user`, which silently undid the whole point.
+    #[test]
+    fn tool_role_goes_over_the_wire_as_tool() {
+        assert_eq!(super::role_str(&Role::Tool), "tool");
+        assert_eq!(serde_json::to_string(&Role::Tool).unwrap(), "\"tool\"");
+        let back: Role = serde_json::from_str("\"tool\"").unwrap();
+        assert!(matches!(back, Role::Tool));
+    }
+
+    /// Gemma's format has no tool turn, so a result is spoken by the user —
+    /// exactly the bytes this renderer produced before the role existed.
+    #[test]
+    fn gemma4_renders_a_tool_result_exactly_as_it_did_a_user_turn() {
+        let msg = |role: Role, text: &str| ChatMessage {
+            role,
+            content: text.into(),
+            images: vec![],
+            reasoning_content: None,
+};
+        let with = |role: Role| {
+            super::render_gemma4(
+                &[
+                    msg(Role::System, "s"),
+                    msg(Role::User, "q"),
+                    msg(Role::Assistant, "a"),
+                    msg(role, "<tool_result name=\"ls\">x</tool_result>"),
+                ],
+                Some(true),
+                true,
+            )
+        };
+        assert_eq!(with(Role::Tool), with(Role::User));
+    }
+
     #[test]
     fn reasoning_effort_ladder_detect_and_apply() {
         let tmpl = "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}\
@@ -2085,6 +3243,76 @@ mod tests {
         assert_eq!(super::apply_effort("plain prompt", "low"), "plain prompt");
     }
 
+    #[test]
+    fn an_atem_turn_carries_both_of_its_spans() {
+        use super::{ChatMessage, Role};
+        let msg = |role: Role, content: &str, reasoning: Option<&str>| ChatMessage {
+            role,
+            content: content.into(),
+            reasoning_content: reasoning.map(str::to_string),
+            images: vec![],
+        };
+        let live = super::render_muse_glimmer(
+            &[msg(Role::System, "Be terse.", None), msg(Role::User, "q", None)],
+            true,
+        );
+        assert!(live.contains("Reasoning strength: high."), "{live}");
+        assert!(live.contains(r#"# Valid recipients: "self", "user"."#), "{live}");
+        // The generation prompt stops before the recipient — the model picks it.
+        assert!(live.ends_with("<|start|>assistant"), "{live}");
+
+        // The stored turn carries reasoning and answer as separate spans, and
+        // the next prompt is a pure append onto the last one.
+        let next = super::render_muse_glimmer(
+            &[
+                msg(Role::System, "Be terse.", None),
+                msg(Role::User, "q", None),
+                msg(Role::Assistant, "A", Some("R")),
+                msg(Role::User, "q2", None),
+            ],
+            true,
+        );
+        assert!(
+            next.starts_with(
+                &(live.clone() + " to=self<|message|>R<|eom|><|start|>assistant to=user<|message|>A")
+            ),
+            "{next}"
+        );
+
+        // A caller that wrote its own rung directive keeps it — the template
+        // adds its sentence only when there is none.
+        let own = super::render_muse_glimmer(
+            &[msg(Role::System, "Reasoning strength: low.", None)],
+            false,
+        );
+        assert_eq!(own.matches("Reasoning strength").count(), 1, "{own}");
+    }
+
+    #[test]
+    fn an_atem_prompt_states_its_rung_in_one_sentence() {
+        // The ladder is the protocol's: the template renders the rung into a
+        // sentence rather than naming each one, so nothing to filter on.
+        assert_eq!(
+            super::effort_levels_of("{{- 'Reasoning strength: ' + reasoning_strength + '.' -}}"),
+            vec!["low", "medium", "high", "xhigh"]
+        );
+
+        // llama.cpp renders with default kwargs, which is `high`.
+        let rendered = "<|start|>system<|message|>Knowledge cutoff: 2026-01.\n\nReasoning strength: high.\n\nYou are helpful.<|eot|>";
+        assert_eq!(super::apply_effort(rendered, "high"), rendered);
+        let low = super::apply_effort(rendered, "low");
+        assert!(low.contains("Reasoning strength: low."), "{low}");
+        assert!(low.contains("You are helpful."), "{low}");
+        assert!(!low.contains("high"), "{low}");
+        assert!(super::apply_effort(rendered, "xhigh").contains("Reasoning strength: xhigh."));
+
+        // An unknown rung is not written into the prompt.
+        assert_eq!(super::apply_effort(rendered, "bogus"), rendered);
+        // Prose that merely opens the same way is not a rung sentence.
+        let prose = "Reasoning strength: the model decides how long to think.";
+        assert_eq!(super::apply_effort(prose, "low"), prose);
+    }
+
     use super::*;
 
     /// The crash-guard state machine (issue #5): a leftover inflight marker
@@ -2111,12 +3339,42 @@ mod tests {
     fn gpu_crash_guard_state_machine() {
         let base = std::env::temp_dir().join(format!("chaty-gpu-guard-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
-        assert!(!gpu_guard_check(&base), "clean dir must not block");
-        std::fs::write(base.join(GPU_INFLIGHT), "loading").unwrap();
-        assert!(gpu_guard_check(&base), "stale inflight must block");
+        assert_eq!(gpu_guard_check(&base), None, "a clean dir caps nothing");
+
+        // A load died attempting 40 layers. Offer half, not zero: the reporter
+        // in issue #9 crashed once on a 26B model and spent every session since
+        // on the CPU, with nothing in the app able to undo it.
+        std::fs::write(base.join(GPU_INFLIGHT), "40").unwrap();
+        assert_eq!(gpu_guard_check(&base), Some(20), "a crash halves the offer");
         assert!(!base.join(GPU_INFLIGHT).exists(), "inflight must be consumed");
-        assert!(base.join(GPU_BLOCKED).exists(), "block must persist");
-        assert!(gpu_guard_check(&base), "block persists across restarts");
+        assert_eq!(gpu_guard_check(&base), Some(20), "the cap survives a restart");
+
+        // Crash again and it halves again, down to CPU.
+        std::fs::write(base.join(GPU_INFLIGHT), "20").unwrap();
+        assert_eq!(gpu_guard_check(&base), Some(10));
+        std::fs::write(base.join(GPU_INFLIGHT), "10").unwrap();
+        assert_eq!(gpu_guard_check(&base), Some(5));
+        std::fs::write(base.join(GPU_INFLIGHT), "5").unwrap();
+        assert_eq!(gpu_guard_check(&base), Some(0), "the ladder ends at CPU-only");
+
+        // A cap never rises on its own — only a successful load clears it.
+        std::fs::write(base.join(GPU_INFLIGHT), "999").unwrap();
+        assert_eq!(gpu_guard_check(&base), Some(0), "a later crash cannot raise it");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// An install carrying the old tombstone keeps its protection, and can get
+    /// out of it — before this the file was written once and read forever.
+    #[test]
+    fn the_old_tombstone_is_honoured_and_escapable() {
+        let base = std::env::temp_dir().join(format!("chaty-gpu-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join(GPU_BLOCKED), "previous model load crashed\n").unwrap();
+        assert_eq!(gpu_guard_check(&base), Some(0), "an old block still means CPU-only");
+        // A crash on top of it replaces it with a real cap rather than stacking.
+        std::fs::write(base.join(GPU_INFLIGHT), "8").unwrap();
+        assert_eq!(gpu_guard_check(&base), Some(0));
+        assert!(!base.join(GPU_BLOCKED).exists(), "the tombstone is migrated away");
         std::fs::remove_dir_all(&base).ok();
     }
 
@@ -2128,36 +3386,12 @@ mod tests {
     fn load_guard_cleans_up_on_drop() {
         let base = std::env::temp_dir().join(format!("chaty-loadguard-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
-        let g = LoadGuard::arm_at(&base);
+        let g = LoadGuard::arm_at(&base, 42);
         let p = g.0.clone().unwrap();
         assert!(p.exists());
         drop(g);
         assert!(!p.exists());
         std::fs::remove_dir_all(&base).ok();
-    }
-
-    #[test]
-    fn strips_a_single_channel_span() {
-        assert_eq!(strip_thought_channels("a<|channel>secret<channel|>b"), "ab");
-    }
-
-    #[test]
-    fn strips_multiple_channel_spans() {
-        assert_eq!(
-            strip_thought_channels("x<|channel>1<channel|>y<|channel>2<channel|>z"),
-            "xyz"
-        );
-    }
-
-    #[test]
-    fn drops_unterminated_channel_tail() {
-        // No closing marker: everything from the open tag on is discarded.
-        assert_eq!(strip_thought_channels("answer<|channel>still thinking"), "answer");
-    }
-
-    #[test]
-    fn leaves_plain_text_untouched() {
-        assert_eq!(strip_thought_channels("  just a normal reply  "), "just a normal reply");
     }
 
     // ---- find_mmproj: the vision folder-layout pairing rules ----
@@ -2500,7 +3734,9 @@ mod agent_e2e {
             .with_n_ctx(NonZeroU32::new(n_ctx))
             .with_n_threads(nt)
             .with_n_threads_batch(nt);
-        let mut ctx = model.new_context(backend, ctx_params).expect("ctx");
+        // The engine decodes through a `Decoder`; without a head that is just
+        // the context.
+        let mut ctx = Decoder::Plain(model.new_context(backend, ctx_params).expect("ctx"));
 
         let ws = std::env::temp_dir().join(format!("chaty-agent-sf-e2e-{}", std::process::id()));
         std::fs::create_dir_all(ws.join("src")).unwrap();
@@ -2510,11 +3746,12 @@ mod agent_e2e {
         crate::agent::agent_set_workspace(ws.to_string_lossy().to_string()).unwrap();
 
         let mut messages = vec![
-            ChatMessage { images: Vec::new(), role: Role::System, content: SYS_CODE.replace("{WS}", &ws.to_string_lossy()) },
+            ChatMessage { images: Vec::new(), role: Role::System, content: SYS_CODE.replace("{WS}", &ws.to_string_lossy()), reasoning_content: None },
             ChatMessage { images: Vec::new(),
                 role: Role::User,
                 content: "用 search_files 找出这个项目里所有和 \"token\" 有关的文件和代码,把命中的文件路径列出来。".into(),
-            },
+                reasoning_content: None,
+},
         ];
         let think = Some(false);
         let cancel = AtomicBool::new(false);
@@ -2547,11 +3784,12 @@ mod agent_e2e {
                     let result = exec_tool(&name, &args);
                     eprintln!("  ◀ RESULT\n{}", result.chars().take(500).collect::<String>());
                     let with_close = if raw.contains("</tool_call>") { raw.clone() } else { format!("{raw}</tool_call>") };
-                    messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&with_close) });
+                    messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&with_close), reasoning_content: None });
                     messages.push(ChatMessage { images: Vec::new(),
                         role: Role::User,
                         content: format!("<tool_result name=\"{name}\">\n{result}\n</tool_result>"),
-                    });
+                        reasoning_content: None,
+});
                 }
                 None => {
                     final_text = strip_think(&raw);
@@ -2588,7 +3826,9 @@ mod agent_e2e {
             .with_n_ctx(NonZeroU32::new(n_ctx))
             .with_n_threads(nt)
             .with_n_threads_batch(nt);
-        let mut ctx = model.new_context(backend, ctx_params).expect("ctx");
+        // The engine decodes through a `Decoder`; without a head that is just
+        // the context.
+        let mut ctx = Decoder::Plain(model.new_context(backend, ctx_params).expect("ctx"));
 
         let ws = std::env::temp_dir().join(format!("chaty-agent-refactor-e2e-{}", std::process::id()));
         std::fs::create_dir_all(&ws).unwrap();
@@ -2614,11 +3854,12 @@ if __name__ == "__main__":
         crate::agent::agent_set_workspace(ws.to_string_lossy().to_string()).unwrap();
 
         let mut messages = vec![
-            ChatMessage { images: Vec::new(), role: Role::System, content: SYS_CODE.replace("{WS}", &ws.to_string_lossy()) },
+            ChatMessage { images: Vec::new(), role: Role::System, content: SYS_CODE.replace("{WS}", &ws.to_string_lossy()), reasoning_content: None },
             ChatMessage { images: Vec::new(),
                 role: Role::User,
                 content: "把 shop.py 里的函数 calc_total 重命名为 compute_total,并更新文件里所有调用它的地方(先用 outline 看结构,同一文件的多处修改用一次 edit_file 的 edits 数组一次完成)。改完运行 python3 shop.py 确认输出仍然是 TOTAL: 33.00 和 AUDIT: 30.00。".into(),
-            },
+                reasoning_content: None,
+},
         ];
         let think = Some(false);
         let cancel = AtomicBool::new(false);
@@ -2656,11 +3897,12 @@ if __name__ == "__main__":
                     let result = exec_tool(&name, &args);
                     eprintln!("  ◀ RESULT\n{}", result.chars().take(600).collect::<String>());
                     let with_close = if raw.contains("</tool_call>") { raw.clone() } else { format!("{raw}</tool_call>") };
-                    messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&with_close) });
+                    messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&with_close), reasoning_content: None });
                     messages.push(ChatMessage { images: Vec::new(),
                         role: Role::User,
                         content: format!("<tool_result name=\"{name}\">\n{result}\n</tool_result>"),
-                    });
+                        reasoning_content: None,
+});
                 }
                 None => {
                     eprintln!("  ✔ FINAL\n{}", strip_think(&raw));
@@ -2729,18 +3971,21 @@ if __name__ == "__main__":
             .with_n_ctx(NonZeroU32::new(n_ctx))
             .with_n_threads(nt)
             .with_n_threads_batch(nt);
-        let mut ctx = model.new_context(backend, ctx_params).expect("ctx");
+        // The engine decodes through a `Decoder`; without a head that is just
+        // the context.
+        let mut ctx = Decoder::Plain(model.new_context(backend, ctx_params).expect("ctx"));
 
         let ws = std::env::temp_dir().join(format!("chaty-agent-video-e2e-{}", std::process::id()));
         std::fs::create_dir_all(&ws).unwrap();
         crate::agent::agent_set_workspace(ws.to_string_lossy().to_string()).unwrap();
 
         let mut messages = vec![
-            ChatMessage { images: Vec::new(), role: Role::System, content: SYS_WEB.replace("{WS}", &ws.to_string_lossy()) },
+            ChatMessage { images: Vec::new(), role: Role::System, content: SYS_WEB.replace("{WS}", &ws.to_string_lossy()), reasoning_content: None },
             ChatMessage { images: Vec::new(),
                 role: Role::User,
                 content: "在 YouTube 上搜索 \"me at the zoo\",找到 YouTube 历史上的第一条视频,用 web_fetch 获取它的字幕转写,然后把视频中拍摄者实际谈论的动物和他说的重点写进 NOTES.md(必须依据字幕内容,不要凭标题猜)。".into(),
-            },
+                reasoning_content: None,
+},
         ];
         let think = Some(false);
         let cancel = AtomicBool::new(false);
@@ -2770,11 +4015,12 @@ if __name__ == "__main__":
                     let result = exec_tool(&name, &args);
                     eprintln!("  ◀ RESULT\n{}", result.chars().take(500).collect::<String>());
                     let with_close = if raw.contains("</tool_call>") { raw.clone() } else { format!("{raw}</tool_call>") };
-                    messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&with_close) });
+                    messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&with_close), reasoning_content: None });
                     messages.push(ChatMessage { images: Vec::new(),
                         role: Role::User,
                         content: format!("<tool_result name=\"{name}\">\n{result}\n</tool_result>"),
-                    });
+                        reasoning_content: None,
+});
                 }
                 None => {
                     eprintln!("  ✔ FINAL\n{}", strip_think(&raw));
@@ -2826,18 +4072,21 @@ if __name__ == "__main__":
             .with_n_ctx(NonZeroU32::new(n_ctx))
             .with_n_threads(nt)
             .with_n_threads_batch(nt);
-        let mut ctx = model.new_context(backend, ctx_params).expect("ctx");
+        // The engine decodes through a `Decoder`; without a head that is just
+        // the context.
+        let mut ctx = Decoder::Plain(model.new_context(backend, ctx_params).expect("ctx"));
 
         let ws = std::env::temp_dir().join(format!("chaty-agent-web-e2e-{}", std::process::id()));
         std::fs::create_dir_all(&ws).unwrap();
         crate::agent::agent_set_workspace(ws.to_string_lossy().to_string()).unwrap();
 
         let mut messages = vec![
-            ChatMessage { images: Vec::new(), role: Role::System, content: SYS_WEB.replace("{WS}", &ws.to_string_lossy()) },
+            ChatMessage { images: Vec::new(), role: Role::System, content: SYS_WEB.replace("{WS}", &ws.to_string_lossy()), reasoning_content: None },
             ChatMessage { images: Vec::new(),
                 role: Role::User,
                 content: "帮我调研一个小众 Rust 库:在 GitHub 上搜索 \"dom_smoothie readability\",找到那个把 Mozilla Readability 移植到 Rust 的仓库;用 web_fetch 打开它的仓库页面,把仓库全名和一句话简介写入 RESEARCH.md;最后用 web_download 把页面上列出的任意一张图片保存为 logo.png。全部完成后总结。".into(),
-            },
+                reasoning_content: None,
+},
         ];
         let think = Some(false);
         let cancel = AtomicBool::new(false);
@@ -2872,11 +4121,12 @@ if __name__ == "__main__":
                     let result = exec_tool(&name, &args);
                     eprintln!("  ◀ RESULT\n{}", result.chars().take(700).collect::<String>());
                     let with_close = if raw.contains("</tool_call>") { raw.clone() } else { format!("{raw}</tool_call>") };
-                    messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&with_close) });
+                    messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&with_close), reasoning_content: None });
                     messages.push(ChatMessage { images: Vec::new(),
                         role: Role::User,
                         content: format!("<tool_result name=\"{name}\">\n{result}\n</tool_result>"),
-                    });
+                        reasoning_content: None,
+});
                 }
                 None => {
                     eprintln!("  ✔ FINAL\n{}", strip_think(&raw));
@@ -2924,7 +4174,9 @@ if __name__ == "__main__":
             .with_n_ctx(NonZeroU32::new(n_ctx))
             .with_n_threads(nt)
             .with_n_threads_batch(nt);
-        let mut ctx = model.new_context(backend, ctx_params).expect("ctx");
+        // The engine decodes through a `Decoder`; without a head that is just
+        // the context.
+        let mut ctx = Decoder::Plain(model.new_context(backend, ctx_params).expect("ctx"));
 
         let ws = std::env::temp_dir().join(format!("chaty-agent-flaky-e2e-{}", std::process::id()));
         std::fs::create_dir_all(&ws).unwrap();
@@ -2934,11 +4186,12 @@ if __name__ == "__main__":
         const GARBAGE: &str = "1. 十大人气奶茶配方大公开 — https://example.com/boba\n   在家自制珍珠奶茶的完整教程…\n2. 2026 春季旅行地推荐 — https://example.com/travel\n   这些小众目的地值得一去…\n3. 如何挑选适合自己的跑鞋 — https://example.com/shoes\n   跑步爱好者的选鞋指南…";
 
         let mut messages = vec![
-            ChatMessage { images: Vec::new(), role: Role::System, content: SYS_WEB.replace("{WS}", &ws.to_string_lossy()) },
+            ChatMessage { images: Vec::new(), role: Role::System, content: SYS_WEB.replace("{WS}", &ws.to_string_lossy()), reasoning_content: None },
             ChatMessage { images: Vec::new(),
                 role: Role::User,
                 content: "调研一下 Rust crate dom_smoothie 是做什么用的,把一句话结论写入 FINDING.md,然后总结。".into(),
-            },
+                reasoning_content: None,
+},
         ];
         let think = Some(false);
         let cancel = AtomicBool::new(false);
@@ -2994,11 +4247,12 @@ if __name__ == "__main__":
                     };
                     eprintln!("  ◀ RESULT\n{}", result.chars().take(500).collect::<String>());
                     let with_close = if raw.contains("</tool_call>") { raw.clone() } else { format!("{raw}</tool_call>") };
-                    messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&with_close) });
+                    messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&with_close), reasoning_content: None });
                     messages.push(ChatMessage { images: Vec::new(),
                         role: Role::User,
                         content: format!("<tool_result name=\"{name}\">\n{result}\n</tool_result>"),
-                    });
+                        reasoning_content: None,
+});
                 }
                 None => {
                     eprintln!("  ✔ FINAL\n{}", strip_think(&raw));
@@ -3051,7 +4305,9 @@ if __name__ == "__main__":
             .with_n_ctx(NonZeroU32::new(n_ctx))
             .with_n_threads(nt)
             .with_n_threads_batch(nt);
-        let mut ctx = model.new_context(backend, ctx_params).expect("ctx");
+        // The engine decodes through a `Decoder`; without a head that is just
+        // the context.
+        let mut ctx = Decoder::Plain(model.new_context(backend, ctx_params).expect("ctx"));
 
         let ws = std::env::temp_dir().join(format!("chaty-agent-smart-{}", std::process::id()));
         std::fs::create_dir_all(ws.join("src")).unwrap();
@@ -3080,11 +4336,12 @@ if __name__ == "__main__":
         let _cp = crate::agent::agent_checkpoint_begin();
 
         let mut messages = vec![
-            ChatMessage { images: Vec::new(), role: Role::System, content: SYS_CODE.replace("{WS}", &ws.to_string_lossy()) },
+            ChatMessage { images: Vec::new(), role: Role::System, content: SYS_CODE.replace("{WS}", &ws.to_string_lossy()), reasoning_content: None },
             ChatMessage { images: Vec::new(),
                 role: Role::User,
                 content: "这个项目的注册邮箱校验有 bug:没有 @ 的字符串也能通过校验。找到相关代码修复(返回值必须仍是布尔值),然后验证修复是否正确。".into(),
-            },
+                reasoning_content: None,
+},
         ];
         let think = Some(false);
         let cancel = AtomicBool::new(false);
@@ -3125,11 +4382,12 @@ if __name__ == "__main__":
                     }
                     eprintln!("  ◀ RESULT\n{}", result.chars().take(600).collect::<String>());
                     let with_close = if raw.contains("</tool_call>") { raw.clone() } else { format!("{raw}</tool_call>") };
-                    messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&with_close) });
+                    messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&with_close), reasoning_content: None });
                     messages.push(ChatMessage { images: Vec::new(),
                         role: Role::User,
                         content: format!("<tool_result name=\"{name}\">\n{result}\n</tool_result>"),
-                    });
+                        reasoning_content: None,
+});
                 }
                 None => {
                     eprintln!("  ✔ FINAL\n{}", strip_think(&raw));
@@ -3174,7 +4432,9 @@ if __name__ == "__main__":
             .with_n_ctx(NonZeroU32::new(n_ctx))
             .with_n_threads(nt)
             .with_n_threads_batch(nt);
-        let mut ctx = model.new_context(backend, ctx_params).expect("ctx");
+        // The engine decodes through a `Decoder`; without a head that is just
+        // the context.
+        let mut ctx = Decoder::Plain(model.new_context(backend, ctx_params).expect("ctx"));
 
         // A realistic mini-project with a FAILING test the agent must fix:
         // calc.py is missing `subtract`, which test_calc.py exercises.
@@ -3189,11 +4449,12 @@ if __name__ == "__main__":
         crate::agent::agent_set_workspace(ws.to_string_lossy().to_string()).unwrap();
 
         let mut messages = vec![
-            ChatMessage { images: Vec::new(), role: Role::System, content: SYS.replace("{WS}", &ws.to_string_lossy()) },
+            ChatMessage { images: Vec::new(), role: Role::System, content: SYS.replace("{WS}", &ws.to_string_lossy()), reasoning_content: None },
             ChatMessage { images: Vec::new(),
                 role: Role::User,
                 content: "这个项目有一个失败的测试。请运行 `python3 test_calc.py`,找出失败原因并修复代码,直到测试全部通过(输出 ALL TESTS PASSED)。".into(),
-            },
+                reasoning_content: None,
+},
         ];
         // Simulate the app's thinking config: default forces no-think (Some(false)),
         // but CHATY_TEST_THINK=none reproduces the "model may think" path.
@@ -3247,11 +4508,12 @@ if __name__ == "__main__":
                         result.lines().take(3).collect::<Vec<_>>().join(" | ")
                     ));
                     let with_close = if raw.contains("</tool_call>") { raw.clone() } else { format!("{raw}</tool_call>") };
-                    messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&with_close) });
+                    messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&with_close), reasoning_content: None });
                     messages.push(ChatMessage { images: Vec::new(),
                         role: Role::User,
                         content: format!("<tool_result name=\"{name}\">\n{result}\n</tool_result>"),
-                    });
+                        reasoning_content: None,
+});
                 }
                 None => {
                     let final_text = strip_think(&raw);
@@ -3306,18 +4568,21 @@ if __name__ == "__main__":
             .with_n_ctx(NonZeroU32::new(n_ctx))
             .with_n_threads(nt)
             .with_n_threads_batch(nt);
-        let mut ctx = model.new_context(backend, ctx_params).expect("ctx");
+        // The engine decodes through a `Decoder`; without a head that is just
+        // the context.
+        let mut ctx = Decoder::Plain(model.new_context(backend, ctx_params).expect("ctx"));
 
         let ws = std::env::temp_dir().join(format!("chaty-agent-meta-{}", std::process::id()));
         std::fs::create_dir_all(&ws).unwrap();
         crate::agent::agent_set_workspace(ws.to_string_lossy().to_string()).unwrap();
 
         let mut messages = vec![
-            ChatMessage { images: Vec::new(), role: Role::System, content: SYS_META.replace("{WS}", &ws.to_string_lossy()) },
+            ChatMessage { images: Vec::new(), role: Role::System, content: SYS_META.replace("{WS}", &ws.to_string_lossy()), reasoning_content: None },
             ChatMessage { images: Vec::new(),
                 role: Role::User,
                 content: "请在工作区创建一个 Python 模块 greet.py,实现 greet(name) 函数,再写 test_greet.py 并用 bash 运行确认通过。开始前先用 update_plan 列出步骤。问候语的语言(中文还是英文)由我决定,请用 ask_user 问我。".into(),
-            },
+                reasoning_content: None,
+},
         ];
         let cancel = AtomicBool::new(false);
         let mut cached: Vec<LlamaToken> = Vec::new();
@@ -3350,7 +4615,7 @@ if __name__ == "__main__":
                 break;
             };
             let with_close = if raw.contains("</tool_call>") { raw.clone() } else { format!("{raw}</tool_call>") };
-            messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&with_close) });
+            messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&with_close), reasoning_content: None });
 
             let result = match name.as_str() {
                 "update_plan" => {
@@ -3394,7 +4659,8 @@ if __name__ == "__main__":
             messages.push(ChatMessage { images: Vec::new(),
                 role: Role::User,
                 content: format!("<tool_result name=\"{name}\">\n{result}\n</tool_result>"),
-            });
+                reasoning_content: None,
+});
         }
 
         let greet_src = std::fs::read_to_string(ws.join("greet.py")).unwrap_or_default();
@@ -3455,7 +4721,9 @@ mod vision_e2e {
             .with_n_ctx(NonZeroU32::new(n_ctx))
             .with_n_threads(nt)
             .with_n_threads_batch(nt);
-        let mut ctx = model.new_context(backend, ctx_params).expect("ctx");
+        // The engine decodes through a `Decoder`; without a head that is just
+        // the context.
+        let mut ctx = Decoder::Plain(model.new_context(backend, ctx_params).expect("ctx"));
 
         let mtmd_params = MtmdContextParams {
             use_gpu: true,
@@ -3473,7 +4741,7 @@ mod vision_e2e {
             .expect("write test image");
 
         let ask = |messages: Vec<ChatMessage>,
-                   ctx: &mut LlamaContext,
+                   ctx: &mut Decoder,
                    cached: &mut Vec<LlamaToken>,
                    media_cache: &mut Option<MediaCache>|
          -> String {
@@ -3503,7 +4771,8 @@ mod vision_e2e {
             images: vec![img_path.to_string_lossy().to_string()],
             role: Role::User,
             content: "What is the dominant color of this image? Answer with one English word.".into(),
-        }];
+            reasoning_content: None,
+}];
         let ans1 = ask(messages.clone(), &mut ctx, &mut cached, &mut media_cache);
         assert!(
             ans1.to_lowercase().contains("red"),
@@ -3515,12 +4784,13 @@ mod vision_e2e {
         assert!(cached.is_empty(), "token cache must stay empty in the media regime");
 
         // ---- turn 2: follow-up reuses the media prefill incrementally ----
-        messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: ans1 });
+        messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: ans1, reasoning_content: None });
         messages.push(ChatMessage {
             images: Vec::new(),
             role: Role::User,
             content: "Is this image mostly red? Answer strictly yes or no.".into(),
-        });
+            reasoning_content: None,
+});
         // The behavioral property the media cache exists for: a follow-up
         // turn must NOT re-encode the already-seen image. (Checked via the
         // encoder counter rather than string prefixes — on Qwen3.5+ the
@@ -3554,7 +4824,8 @@ mod vision_e2e {
                 images: Vec::new(),
                 role: Role::User,
                 content: "Say the single word 'hello'.".into(),
-            }],
+                reasoning_content: None,
+}],
             &mut ctx,
             &mut cached,
             &mut media_cache,
@@ -3584,11 +4855,11 @@ mod vision_engine {
                 return;
             }
         };
-        let (engine, info) = LlamaEngine::load(&model_path, None, Some(4096)).expect("load");
+        let (engine, info) = LlamaEngine::load(&model_path, None, Some(4096), true).expect("load");
         eprintln!("vision_ready={} mmproj={:?} warning={:?}", info.vision_ready, info.mmproj, info.warning);
         assert!(info.multimodal, "VLM must be flagged multimodal");
         assert!(info.vision_ready, "mmproj must be paired and loaded");
-        assert!(info.mmproj.as_deref().map_or(false, |p| p.to_lowercase().contains("mmproj")));
+        assert!(info.mmproj.as_deref().is_some_and(|p| p.to_lowercase().contains("mmproj")));
         assert!(info.warning.is_none(), "clean load expected, got {:?}", info.warning);
 
         // generate_collect (the one-shot vision path used by KB/Canvas/browser)
@@ -3601,7 +4872,8 @@ mod vision_engine {
                 images: vec![img.to_string_lossy().to_string()],
                 role: Role::User,
                 content: "What is the dominant color? One English word.".into(),
-            }],
+                reasoning_content: None,
+}],
             params: GenParams { temperature: 0.1, max_tokens: 32, think: Some(false), ..Default::default() },
         };
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
@@ -3633,7 +4905,8 @@ mod vision_engine {
                 images: vec![scene_path.to_string_lossy().to_string()],
                 role: Role::User,
                 content: "Describe this image thoroughly for search: shapes, colors, layout.".into(),
-            }],
+                reasoning_content: None,
+}],
             params: GenParams { temperature: 0.3, max_tokens: 200, think: Some(false), ..Default::default() },
         };
         let cancel2 = std::sync::Arc::new(AtomicBool::new(false));
@@ -3667,7 +4940,7 @@ mod vision_engine {
             eprintln!("SKIP: no Chrome"); return;
         }
         std::env::set_var("CHATY_BROWSER_HEADLESS", "1");
-        let (engine, info) = LlamaEngine::load(&model_path, None, Some(4096)).expect("load");
+        let (engine, info) = LlamaEngine::load(&model_path, None, Some(4096), true).expect("load");
         assert!(info.vision_ready);
 
         let html = "<!doctype html><html><head><title>Invoice</title></head>\
@@ -3693,7 +4966,8 @@ mod vision_engine {
                 images: vec![shot.to_string_lossy().to_string()],
                 role: Role::User,
                 content: "What is the heading text and the total amount shown on this page?".into(),
-            }],
+                reasoning_content: None,
+}],
             params: GenParams { temperature: 0.2, max_tokens: 96, think: Some(false), ..Default::default() },
         };
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
@@ -3776,7 +5050,9 @@ mod browser_task_probe {
         let mtmd_params = MtmdContextParams { use_gpu: true, n_threads: nt, ..MtmdContextParams::default() };
         let mmproj = find_mmproj(&model_path).expect("mmproj");
         let mtmd = MtmdContext::init_from_file(&mmproj.to_string_lossy(), &model, &mtmd_params).expect("mtmd");
-        let mut ctx = model.new_context(backend, ctx_params).expect("ctx");
+        // The engine decodes through a `Decoder`; without a head that is just
+        // the context.
+        let mut ctx = Decoder::Plain(model.new_context(backend, ctx_params).expect("ctx"));
         let mut cached: Vec<LlamaToken> = Vec::new();
         let mut media_cache: Option<MediaCache> = None;
 
@@ -3792,9 +5068,11 @@ mod browser_task_probe {
              CSS 选择器只支持标准语法(没有 :contains/:has-text);按文字点用 browser_click 的 text。首个页面:{home}"
         );
         let mut messages = vec![
-            ChatMessage { images: Vec::new(), role: Role::System, content: sys },
+            ChatMessage { images: Vec::new(), role: Role::System, content: sys, reasoning_content: None },
             ChatMessage { images: Vec::new(), role: Role::User,
-                content: format!("打开 {home},进入 Contact 页面,填写姓名 Alice、邮箱 alice@example.com、留言 Hello,然后提交表单。\n/no_think") },
+                content: format!("打开 {home},进入 Contact 页面,填写姓名 Alice、邮箱 alice@example.com、留言 Hello,然后提交表单。\n/no_think"),
+                reasoning_content: None,
+},
         ];
 
         let cancel = AtomicBool::new(false);
@@ -3830,9 +5108,11 @@ mod browser_task_probe {
             // Echo the model's ACTUAL output (with args) — the real loop does this;
             // a name-only echo makes the model mimic argument-less calls.
             let asst = strip_think(&raw);
-            messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: asst });
+            messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: asst, reasoning_content: None });
             let mut m = ChatMessage { images: image.clone().into_iter().collect(), role: Role::User,
-                content: format!("<tool_result>{}</tool_result>\n/no_think", result) };
+                content: format!("<tool_result>{}</tool_result>\n/no_think", result),
+                reasoning_content: None,
+};
             if image.is_some() { m.content = "<tool_result>这是当前页面截图,请查看后继续。</tool_result>\n/no_think".into(); }
             messages.push(m);
             if submitted { eprintln!("=== FORM SUBMITTED at step {step}"); break; }
@@ -3925,13 +5205,15 @@ mod browser_tasks_e2e {
             .with_n_ctx(NonZeroU32::new(n_ctx))
             .with_n_threads(nt)
             .with_n_threads_batch(nt);
-        let mut ctx = model.new_context(backend, ctx_params).expect("ctx");
+        // The engine decodes through a `Decoder`; without a head that is just
+        // the context.
+        let mut ctx = Decoder::Plain(model.new_context(backend, ctx_params).expect("ctx"));
         let mut cached: Vec<LlamaToken> = Vec::new();
         let mut media_cache: Option<MediaCache> = None;
 
         let mut messages = vec![
-            ChatMessage { images: Vec::new(), role: Role::System, content: sys.to_string() },
-            ChatMessage { images: Vec::new(), role: Role::User, content: format!("{task}\n/no_think") },
+            ChatMessage { images: Vec::new(), role: Role::System, content: sys.to_string(), reasoning_content: None },
+            ChatMessage { images: Vec::new(), role: Role::User, content: format!("{task}\n/no_think"), reasoning_content: None },
         ];
         let cancel = AtomicBool::new(false);
 
@@ -3969,9 +5251,11 @@ mod browser_tasks_e2e {
                 // is exactly what proves a legit repeated scroll is NOT blocked.
                 eprintln!("    (breaker: intercepted identical non-exempt call {tname})");
                 steps.push(format!("{tname}*BLOCKED"));
-                messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&raw) });
+                messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&raw), reasoning_content: None });
                 messages.push(ChatMessage { images: Vec::new(), role: Role::User,
-                    content: "<tool_result>这一步和上一步完全相同,已拦截。换一种做法或读取当前状态。</tool_result>\n/no_think".into() });
+                    content: "<tool_result>这一步和上一步完全相同,已拦截。换一种做法或读取当前状态。</tool_result>\n/no_think".into(),
+                    reasoning_content: None,
+});
                 continue;
             }
 
@@ -4023,13 +5307,17 @@ mod browser_tasks_e2e {
             };
 
             // Echo the model's ACTUAL output (with args), then the tool result.
-            messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&raw) });
+            messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&raw), reasoning_content: None });
             if let Some(img) = image {
                 messages.push(ChatMessage { images: vec![img], role: Role::User,
-                    content: "<tool_result>这是当前页面截图,请查看后继续。</tool_result>\n/no_think".into() });
+                    content: "<tool_result>这是当前页面截图,请查看后继续。</tool_result>\n/no_think".into(),
+                    reasoning_content: None,
+});
             } else {
                 messages.push(ChatMessage { images: Vec::new(), role: Role::User,
-                    content: format!("<tool_result>{result}</tool_result>\n/no_think") });
+                    content: format!("<tool_result>{result}</tool_result>\n/no_think"),
+                    reasoning_content: None,
+});
             }
 
             if break_on_done && done() { break; }
@@ -4319,7 +5607,9 @@ mod prefill_progress_e2e {
             .with_n_ctx(NonZeroU32::new(n_ctx))
             .with_n_threads(nt)
             .with_n_threads_batch(nt);
-        let mut ctx = model.new_context(backend, ctx_params).expect("ctx");
+        // The engine decodes through a `Decoder`; without a head that is just
+        // the context.
+        let mut ctx = Decoder::Plain(model.new_context(backend, ctx_params).expect("ctx"));
         let mut cached: Vec<LlamaToken> = Vec::new();
         let mut media_cache: Option<MediaCache> = None;
         let cancel = AtomicBool::new(false);
@@ -4330,7 +5620,8 @@ mod prefill_progress_e2e {
             images: Vec::new(),
             role: Role::User,
             content: format!("{filler}\n读完以上资料,回答:一加一等于几?只答数字。\n/no_think"),
-        }];
+            reasoning_content: None,
+}];
         let req = GenRequest {
             messages: messages.clone(),
             params: GenParams { temperature: 0.0, max_tokens: 8, think: Some(false), ..Default::default() },
@@ -4369,8 +5660,8 @@ mod prefill_progress_e2e {
 
         // ── Turn 2: append a short exchange → KV prefix reuse leaves a tiny
         //    tail (< one batch) → NO prefill events (the ring must not flash) ──
-        messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: reply });
-        messages.push(ChatMessage { images: Vec::new(), role: Role::User, content: "再答一次,只答数字。\n/no_think".into() });
+        messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: reply, reasoning_content: None });
+        messages.push(ChatMessage { images: Vec::new(), role: Role::User, content: "再答一次,只答数字。\n/no_think".into(), reasoning_content: None });
         let req2 = GenRequest {
             messages,
             params: GenParams { temperature: 0.0, max_tokens: 8, think: Some(false), ..Default::default() },
@@ -4529,7 +5820,9 @@ mod media_prefill_e2e {
         let mtmd_params = MtmdContextParams { use_gpu: true, n_threads: nt, ..MtmdContextParams::default() };
         let mmproj = find_mmproj(&model_path).expect("mmproj");
         let mtmd = MtmdContext::init_from_file(&mmproj.to_string_lossy(), &model, &mtmd_params).expect("mtmd");
-        let mut ctx = model.new_context(backend, ctx_params).expect("ctx");
+        // The engine decodes through a `Decoder`; without a head that is just
+        // the context.
+        let mut ctx = Decoder::Plain(model.new_context(backend, ctx_params).expect("ctx"));
         let mut cached: Vec<LlamaToken> = Vec::new();
         let mut media_cache: Option<MediaCache> = None;
         let cancel = AtomicBool::new(false);
@@ -4539,7 +5832,8 @@ mod media_prefill_e2e {
                 images: vec![img_path.to_string_lossy().to_string()],
                 role: Role::User,
                 content: "What is the dominant color of this image? Answer with one word.".into(),
-            }],
+                reasoning_content: None,
+}],
             params: GenParams { temperature: 0.0, max_tokens: 12, think: Some(false), ..Default::default() },
         };
         let sink = AllEvents { evs: RefCell::new(Vec::new()) };
@@ -4662,7 +5956,9 @@ pw.addEventListener("input",render);render();
         let mtmd_params = MtmdContextParams { use_gpu: true, n_threads: nt, ..MtmdContextParams::default() };
         let mmproj = find_mmproj(&model_path).expect("mmproj");
         let mtmd = MtmdContext::init_from_file(&mmproj.to_string_lossy(), &model, &mtmd_params).expect("mtmd");
-        let mut ctx = model.new_context(backend, ctx_params).expect("ctx");
+        // The engine decodes through a `Decoder`; without a head that is just
+        // the context.
+        let mut ctx = Decoder::Plain(model.new_context(backend, ctx_params).expect("ctx"));
         let mut cached: Vec<LlamaToken> = Vec::new();
         let mut media_cache: Option<MediaCache> = None;
 
@@ -4677,8 +5973,8 @@ pw.addEventListener("input",render);render();
              **只用 browser_read/browser_type 文字操作,绝不要用 browser_screenshot/browser_snapshot。** 首个页面:{url}"
         );
         let mut messages = vec![
-            ChatMessage { images: Vec::new(), role: Role::System, content: sys },
-            ChatMessage { images: Vec::new(), role: Role::User, content: format!("打开 {url},玩这个密码游戏,尽量多满足几条规则。\n/no_think") },
+            ChatMessage { images: Vec::new(), role: Role::System, content: sys, reasoning_content: None },
+            ChatMessage { images: Vec::new(), role: Role::User, content: format!("打开 {url},玩这个密码游戏,尽量多满足几条规则。\n/no_think"), reasoning_content: None },
         ];
 
         let cancel = AtomicBool::new(false);
@@ -4709,8 +6005,8 @@ pw.addEventListener("input",render);render();
                 other => format!("未知工具 {other}"),
             };
             best = best.max(solved_now());
-            messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&raw) });
-            messages.push(ChatMessage { images: Vec::new(), role: Role::User, content: format!("<tool_result>{}</tool_result>\n/no_think", result) });
+            messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&raw), reasoning_content: None });
+            messages.push(ChatMessage { images: Vec::new(), role: Role::User, content: format!("<tool_result>{}</tool_result>\n/no_think", result), reasoning_content: None });
             if best >= 8 { break; }
         }
         let elapsed = started.elapsed();
@@ -4818,7 +6114,9 @@ document.getElementById("submit").addEventListener("click",function(){
         let mtmd_params = MtmdContextParams { use_gpu: true, n_threads: nt, ..MtmdContextParams::default() };
         let mmproj = find_mmproj(&model_path).expect("mmproj");
         let mtmd = MtmdContext::init_from_file(&mmproj.to_string_lossy(), &model, &mtmd_params).expect("mtmd");
-        let mut ctx = model.new_context(backend, ctx_params).expect("ctx");
+        // The engine decodes through a `Decoder`; without a head that is just
+        // the context.
+        let mut ctx = Decoder::Plain(model.new_context(backend, ctx_params).expect("ctx"));
         let mut cached: Vec<LlamaToken> = Vec::new();
         let mut media_cache: Option<MediaCache> = None;
 
@@ -4833,9 +6131,11 @@ document.getElementById("submit").addEventListener("click",function(){
              这是一个很长、需要滚动的求职表单。**尽量用 steps 一次填多个字段、一次点多个按钮**以求最快。要求:填完所有字段(姓名/邮箱/公司/电话/城市/求职动机)、勾选同意条款、点提交。每次操作后读返回文字确认。首个页面:{url}"
         );
         let mut messages = vec![
-            ChatMessage { images: Vec::new(), role: Role::System, content: sys },
+            ChatMessage { images: Vec::new(), role: Role::System, content: sys, reasoning_content: None },
             ChatMessage { images: Vec::new(), role: Role::User, content: format!(
-                "打开 {url},填写这张求职表单并提交:姓名 Alice Chen、邮箱 alice@nimbus.io、公司 Acme、电话 5551234567、城市 Montreal、求职动机随便写一句,勾选同意条款,然后提交。\n/no_think") },
+                "打开 {url},填写这张求职表单并提交:姓名 Alice Chen、邮箱 alice@nimbus.io、公司 Acme、电话 5551234567、城市 Montreal、求职动机随便写一句,勾选同意条款,然后提交。\n/no_think"),
+                reasoning_content: None,
+},
         ];
 
         let cancel = AtomicBool::new(false);
@@ -4892,8 +6192,8 @@ document.getElementById("submit").addEventListener("click",function(){
                 other => format!("未知工具 {other}"),
             };
             steps_log.push(name.clone());
-            messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&raw) });
-            messages.push(ChatMessage { images: Vec::new(), role: Role::User, content: format!("<tool_result>{}</tool_result>\n/no_think", result) });
+            messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&raw), reasoning_content: None });
+            messages.push(ChatMessage { images: Vec::new(), role: Role::User, content: format!("<tool_result>{}</tool_result>\n/no_think", result), reasoning_content: None });
             if submitted() { break; }
         }
         let elapsed = started.elapsed();
@@ -5009,7 +6309,9 @@ mod visual_verify_e2e {
         let mtmd_params = MtmdContextParams { use_gpu: true, n_threads: nt, ..MtmdContextParams::default() };
         let mmproj = find_mmproj(&model_path).expect("mmproj");
         let mtmd = MtmdContext::init_from_file(&mmproj.to_string_lossy(), &model, &mtmd_params).expect("mtmd");
-        let mut ctx = model.new_context(backend, ctx_params).expect("ctx");
+        // The engine decodes through a `Decoder`; without a head that is just
+        // the context.
+        let mut ctx = Decoder::Plain(model.new_context(backend, ctx_params).expect("ctx"));
         let mut cached: Vec<LlamaToken> = Vec::new();
         let mut media_cache: Option<MediaCache> = None;
 
@@ -5019,8 +6321,8 @@ mod visual_verify_e2e {
              判断:要文字/状态用 browser_read;要判断图片画的是什么、颜色、外观,读文字看不出来,必须用 browser_screenshot/snapshot 亲眼看。首个页面:{url}"
         );
         let mut messages = vec![
-            ChatMessage { images: Vec::new(), role: Role::System, content: sys },
-            ChatMessage { images: Vec::new(), role: Role::User, content: format!("打开 {url},页面上有一张图片。告诉我这张图片主要是什么颜色、中间画的是什么形状。\n/no_think") },
+            ChatMessage { images: Vec::new(), role: Role::System, content: sys, reasoning_content: None },
+            ChatMessage { images: Vec::new(), role: Role::User, content: format!("打开 {url},页面上有一张图片。告诉我这张图片主要是什么颜色、中间画的是什么形状。\n/no_think"), reasoning_content: None },
         ];
 
         let cancel = AtomicBool::new(false);
@@ -5052,11 +6354,11 @@ mod visual_verify_e2e {
                 }
                 other => (format!("未知工具 {other}"), None),
             };
-            messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&raw) });
+            messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&raw), reasoning_content: None });
             if let Some(img) = image {
-                messages.push(ChatMessage { images: vec![img], role: Role::User, content: "<tool_result>这是当前页面截图,请查看后回答。</tool_result>\n/no_think".into() });
+                messages.push(ChatMessage { images: vec![img], role: Role::User, content: "<tool_result>这是当前页面截图,请查看后回答。</tool_result>\n/no_think".into(), reasoning_content: None });
             } else {
-                messages.push(ChatMessage { images: Vec::new(), role: Role::User, content: format!("<tool_result>{result}</tool_result>\n/no_think") });
+                messages.push(ChatMessage { images: Vec::new(), role: Role::User, content: format!("<tool_result>{result}</tool_result>\n/no_think"), reasoning_content: None });
             }
         }
         crate::browser::shutdown();
@@ -5165,7 +6467,9 @@ document.getElementById("check").addEventListener("click",function(){
         let mtmd_params = MtmdContextParams { use_gpu: true, n_threads: nt, ..MtmdContextParams::default() };
         let mmproj = find_mmproj(&model_path).expect("mmproj");
         let mtmd = MtmdContext::init_from_file(&mmproj.to_string_lossy(), &model, &mtmd_params).expect("mtmd");
-        let mut ctx = model.new_context(backend, ctx_params).expect("ctx");
+        // The engine decodes through a `Decoder`; without a head that is just
+        // the context.
+        let mut ctx = Decoder::Plain(model.new_context(backend, ctx_params).expect("ctx"));
         let mut cached: Vec<LlamaToken> = Vec::new();
         let mut media_cache: Option<MediaCache> = None;
 
@@ -5176,8 +6480,8 @@ document.getElementById("check").addEventListener("click",function(){
              要求:①想好完整顺序后**用 browser_click 的 steps 一次把所有词按顺序点完**,不要一个一个点;②点 Check(会判分、不可逆)**之前先用 browser_snapshot 截屏,用视觉确认拼出的句子完全正确**,再点 Check。首个页面:{url}"
         );
         let mut messages = vec![
-            ChatMessage { images: Vec::new(), role: Role::System, content: sys },
-            ChatMessage { images: Vec::new(), role: Role::User, content: format!("打开 {url},把「我每天早上喝咖啡」这道选词造句题做对(目标英文句子是 I drink coffee every morning),按要求先批量选词、提交前截图确认,再点 Check。\n/no_think") },
+            ChatMessage { images: Vec::new(), role: Role::System, content: sys, reasoning_content: None },
+            ChatMessage { images: Vec::new(), role: Role::User, content: format!("打开 {url},把「我每天早上喝咖啡」这道选词造句题做对(目标英文句子是 I drink coffee every morning),按要求先批量选词、提交前截图确认,再点 Check。\n/no_think"), reasoning_content: None },
         ];
 
         let cancel = AtomicBool::new(false);
@@ -5213,11 +6517,11 @@ document.getElementById("check").addEventListener("click",function(){
                 }
                 other => (format!("未知工具 {other}"), None),
             };
-            messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&raw) });
+            messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&raw), reasoning_content: None });
             if let Some(img) = image {
-                messages.push(ChatMessage { images: vec![img], role: Role::User, content: "<tool_result>这是当前页面截图,请查看后继续。</tool_result>\n/no_think".into() });
+                messages.push(ChatMessage { images: vec![img], role: Role::User, content: "<tool_result>这是当前页面截图,请查看后继续。</tool_result>\n/no_think".into(), reasoning_content: None });
             } else {
-                messages.push(ChatMessage { images: Vec::new(), role: Role::User, content: format!("<tool_result>{result}</tool_result>\n/no_think") });
+                messages.push(ChatMessage { images: Vec::new(), role: Role::User, content: format!("<tool_result>{result}</tool_result>\n/no_think"), reasoning_content: None });
             }
             if checked() { break; }
         }
@@ -5302,12 +6606,14 @@ mod real_scenarios_e2e {
         done: &dyn Fn() -> bool,
     ) -> Report {
         let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(n_ctx)).with_n_threads(nt).with_n_threads_batch(nt);
-        let mut ctx = model.new_context(backend, ctx_params).expect("ctx");
+        // The engine decodes through a `Decoder`; without a head that is just
+        // the context.
+        let mut ctx = Decoder::Plain(model.new_context(backend, ctx_params).expect("ctx"));
         let mut cached: Vec<LlamaToken> = Vec::new();
         let mut media_cache: Option<MediaCache> = None;
         let mut messages = vec![
-            ChatMessage { images: Vec::new(), role: Role::System, content: sys.to_string() },
-            ChatMessage { images: Vec::new(), role: Role::User, content: format!("{task}\n/no_think") },
+            ChatMessage { images: Vec::new(), role: Role::System, content: sys.to_string(), reasoning_content: None },
+            ChatMessage { images: Vec::new(), role: Role::User, content: format!("{task}\n/no_think"), reasoning_content: None },
         ];
         let cancel = AtomicBool::new(false);
         let mut steps: Vec<String> = Vec::new();
@@ -5327,8 +6633,8 @@ mod real_scenarios_e2e {
             if exempt { last_key.clear(); repeat = 0; } else if key == last_key { repeat += 1; } else { last_key = key; repeat = 0; }
             if repeat >= 1 && !exempt {
                 steps.push(format!("{tname}*BLK"));
-                messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&raw) });
-                messages.push(ChatMessage { images: Vec::new(), role: Role::User, content: "<tool_result>这一步和上一步完全相同,已拦截,换做法。</tool_result>\n/no_think".into() });
+                messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&raw), reasoning_content: None });
+                messages.push(ChatMessage { images: Vec::new(), role: Role::User, content: "<tool_result>这一步和上一步完全相同,已拦截,换做法。</tool_result>\n/no_think".into(), reasoning_content: None });
                 continue;
             }
             steps.push(tname.clone());
@@ -5351,11 +6657,11 @@ mod real_scenarios_e2e {
                 "web_search" => match rt.block_on(crate::search::web_search(g("query").unwrap_or_default())) { Ok(rs)=>{let s=rs.iter().take(6).map(|r|format!("- {} — {}\n  {}",r.title,r.url,r.snippet)).collect::<Vec<_>>().join("\n");(if s.is_empty(){"(无结果)".into()}else{s},None)} Err(e)=>(format!("ERROR: {e}"),None) },
                 other => (format!("未知工具 {other}"), None),
             };
-            messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&raw) });
+            messages.push(ChatMessage { images: Vec::new(), role: Role::Assistant, content: strip_think(&raw), reasoning_content: None });
             if let Some(img) = image {
-                messages.push(ChatMessage { images: vec![img], role: Role::User, content: "<tool_result>这是当前页面截图,请查看后继续。</tool_result>\n/no_think".into() });
+                messages.push(ChatMessage { images: vec![img], role: Role::User, content: "<tool_result>这是当前页面截图,请查看后继续。</tool_result>\n/no_think".into(), reasoning_content: None });
             } else {
-                messages.push(ChatMessage { images: Vec::new(), role: Role::User, content: format!("<tool_result>{}</tool_result>\n/no_think", result.chars().take(6000).collect::<String>()) });
+                messages.push(ChatMessage { images: Vec::new(), role: Role::User, content: format!("<tool_result>{}</tool_result>\n/no_think", result.chars().take(6000).collect::<String>()), reasoning_content: None });
             }
             if done() && !final_text.is_empty() { break; }
         }
@@ -5462,7 +6768,7 @@ mod gguf_kv_e2e {
             eprintln!("SKIP: set CHATY_TEST_GGUF=/path/to/model.gguf");
             return;
         };
-        let (engine, info) = LlamaEngine::load(&path, None, Some(4096)).expect("load");
+        let (engine, info) = LlamaEngine::load(&path, None, Some(4096), true).expect("load");
         eprintln!("arch: {:?}", info.arch);
         let rt = tokio::runtime::Runtime::new().unwrap();
         let run = |content: &str| -> String {
@@ -5471,7 +6777,8 @@ mod gguf_kv_e2e {
                     role: Role::User,
                     content: content.into(),
                     images: vec![],
-                }],
+                    reasoning_content: None,
+}],
                 params: GenParams { max_tokens: 96, think: Some(false), ..Default::default() },
             };
             rt.block_on(engine.generate_collect(req, Arc::new(AtomicBool::new(false))))
@@ -5490,5 +6797,334 @@ mod gguf_kv_e2e {
             "conversation A leaked into B: {b}"
         );
         engine.unload();
+    }
+}
+/// Tokens the MTP head has won since the process started — every token a
+/// speculative round settled beyond the one it was given. Process-wide because
+/// it is the only way to see from outside that the head is still working: the
+/// head switches itself off on any failure, and without a count that shows up
+/// as nothing at all except a reply that took longer.
+pub(crate) static MTP_TOKENS_WON: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The MTP head, end to end through the engine.
+///
+/// Four facts about llama.cpp's drafter are load-bearing here, and each one
+/// cost a round of guessing to find:
+///
+/// - the draft context is a SECOND context over the same model, asked for with
+///   `LlamaContextType::Mtp`, and the model must have been loaded with
+///   `with_load_mtp(true)` or its layers were never read off disk;
+/// - it keeps no rollback snapshots of its own (`n_rs_seq` 0) — it is the
+///   model's cache that gets rewound — while the model's context needs as many
+///   as the draft is long, or a hybrid architecture refuses partial removal
+///   and every partly-accepted run is unrecoverable;
+/// - `process` must see every batch the model decodes, and `begin` only
+///   afterwards: it inspects the DRAFT context's position and warns if the
+///   prompt never reached it;
+/// - drafting leaves the guesses in the draft context's own cache at the
+///   positions the model is about to be asked about, so they have to be
+///   trimmed back out before verification — including when the head declined
+///   to guess, which costs a position too.
+///
+///   CHATY_TEST_MTP=<gguf with nextn layers> \
+///     cargo test -p chaty --lib mtp_head -- --ignored --nocapture --test-threads=1
+#[cfg(test)]
+mod mtp_head {
+    use super::*;
+    use crate::inference::{ChatMessage, GenParams, GenRequest, InferenceBackend, Role};
+    use std::sync::atomic::AtomicBool;
+
+    fn request(content: &str) -> GenRequest {
+        GenRequest {
+            messages: vec![ChatMessage {
+                role: Role::User,
+                content: content.into(),
+                images: vec![],
+                reasoning_content: None,
+            }],
+            params: GenParams { max_tokens: 64, think: Some(false), ..Default::default() },
+        }
+    }
+
+    /// The collecting path — what a title, a tool result, or the bench asks for.
+    fn ask(engine: &LlamaEngine, content: &str) -> String {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(engine.generate_collect(request(content), Arc::new(AtomicBool::new(false))))
+            .expect("generate")
+    }
+
+    /// The streaming path — what a reply in either mode actually runs on.
+    fn stream(engine: &LlamaEngine, content: &str) -> String {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(String::new()));
+        let into = seen.clone();
+        let sink: Channel<StreamEvent> = Channel::new(move |body: tauri::ipc::InvokeResponseBody| {
+            if let tauri::ipc::InvokeResponseBody::Json(text) = &body {
+                into.lock().unwrap().push_str(text);
+            }
+            Ok(())
+        });
+        rt.block_on(engine.generate(request(content), sink, Arc::new(AtomicBool::new(false))))
+            .expect("generate");
+        let out = seen.lock().unwrap().clone();
+        out
+    }
+
+    /// The head has to earn tokens AND leave the answer alone. Either half
+    /// alone is worthless: a head that is quietly switched off still answers
+    /// correctly, and one that wins tokens by changing the reply is a bug that
+    /// looks like a speedup.
+    #[test]
+    #[ignore]
+    fn the_head_wins_tokens_without_changing_the_answer() {
+        let path = std::env::var("CHATY_TEST_MTP").expect("set CHATY_TEST_MTP=<gguf>");
+        let backend = llama_backend().expect("backend");
+        assert!(
+            probe_mtp_layers(backend, &path) > 0,
+            "this model carries no nextn layers — nothing to draft with"
+        );
+
+        let question = "Name the capital of France. Answer with one word only.";
+
+        MTP_TOKENS_WON.store(0, Ordering::Relaxed);
+        let (engine, _) = LlamaEngine::load(&path, None, Some(2048), true).expect("load with head");
+        let with_head = ask(&engine, question);
+        let won = MTP_TOKENS_WON.load(Ordering::Relaxed);
+
+        assert!(
+            won > 0,
+            "the head never won a token — it was switched off, or never asked: {with_head:?}"
+        );
+        assert!(
+            with_head.to_lowercase().contains("paris"),
+            "expected 'Paris' with the head on: {with_head:?}"
+        );
+
+        // Chat and code mode are the same engine and the same head. They reach
+        // it through different calls — one streams, one collects — and if the
+        // head ever lived on one of those paths rather than on the engine, the
+        // switch would apply to one mode and not the other.
+        MTP_TOKENS_WON.store(0, Ordering::Relaxed);
+        let streamed = stream(&engine, question);
+        assert!(
+            MTP_TOKENS_WON.load(Ordering::Relaxed) > 0,
+            "the head won tokens when collecting but not when streaming: {streamed:?}"
+        );
+        engine.unload();
+    }
+
+    /// Turning the head off must leave an ordinary, working engine — this is
+    /// the path every model without a head already takes, and the one the head
+    /// falls back to when it fails.
+    #[test]
+    #[ignore]
+    fn the_same_model_answers_with_the_head_off() {
+        let path = std::env::var("CHATY_TEST_MTP").expect("set CHATY_TEST_MTP=<gguf>");
+        // SAFETY: single-threaded by construction — this suite must be run with
+        // --test-threads=1, which loading a model at all already requires.
+        unsafe { std::env::set_var("CHATY_MTP", "0") };
+        MTP_TOKENS_WON.store(0, Ordering::Relaxed);
+        let (engine, _) = LlamaEngine::load(&path, None, Some(2048), true).expect("load without head");
+        let plain = ask(&engine, "Name the capital of France. Answer with one word only.");
+        engine.unload();
+        unsafe { std::env::remove_var("CHATY_MTP") };
+
+        assert_eq!(MTP_TOKENS_WON.load(Ordering::Relaxed), 0, "the head ran despite CHATY_MTP=0");
+        assert!(
+            plain.to_lowercase().contains("paris"),
+            "expected 'Paris' with the head off: {plain:?}"
+        );
+    }
+}
+
+/// What a wider decode actually costs.
+///
+/// Speculative decoding rests on one assumption: checking a run of N guesses in
+/// one forward pass costs about what checking one token costs, because the pass
+/// is bound by reading the weights and the weights are read once either way. If
+/// that holds, N tokens arrive for the price of one. If it does not, no amount
+/// of guessing well can pay for itself.
+///
+/// This measures the assumption instead of trusting it, on whatever model is
+/// pointed at — run it on the model in question and on a plain attention model
+/// to see the difference.
+///
+///   CHATY_TEST_GGUF=<model.gguf> \
+///     cargo test -p chaty --lib decode_width_cost -- --ignored --nocapture --test-threads=1
+#[cfg(test)]
+mod decode_width_cost {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn a_wider_decode_should_cost_about_what_a_narrow_one_costs() {
+        let Ok(path) = std::env::var("CHATY_TEST_GGUF") else {
+            eprintln!("SKIP: set CHATY_TEST_GGUF=/path/to/model.gguf");
+            return;
+        };
+        let backend = llama_backend().expect("backend");
+        let model = Arc::new(
+            LlamaModel::load_from_file(
+                backend,
+                &path,
+                &LlamaModelParams::default().with_n_gpu_layers(999).with_use_mmap(false),
+            )
+            .expect("load model"),
+        );
+        let mut ctx = model
+            .new_context(
+                backend,
+                LlamaContextParams::default()
+                    .with_n_ctx(NonZeroU32::new(4096))
+                    // The engine sets these; leaving them at llama.cpp's
+                    // default measures a context the app never creates.
+                    .with_n_threads(crate::gpu::cpu_worker_threads() as i32)
+                    .with_n_threads_batch(crate::gpu::cpu_worker_threads() as i32),
+            )
+            .expect("context");
+
+        let all_logits = std::env::var("WIDTH_LAST_ONLY").as_deref() != Ok("1");
+        let filler = model
+            .str_to_token("The quick brown fox jumps over the lazy dog. ", AddBos::Always)
+            .expect("tokenize");
+        let mut batch = LlamaBatch::new(512, 1);
+
+        // Wake the GPU up before anything is recorded. Measured cold, the
+        // FIRST width in the loop reads three to five times slower than the
+        // same width measured later — the clocks are still ramping — and the
+        // whole curve is then a story about that rather than about width.
+        {
+            batch.clear();
+            for (i, t) in filler.iter().enumerate() {
+                batch.add(*t, i as i32, &[0], i == filler.len() - 1).expect("add");
+            }
+            ctx.decode(&mut batch).expect("warm prefill");
+            for k in 0..300 {
+                batch.clear();
+                batch
+                    .add(filler[k % filler.len()], filler.len() as i32 + k as i32, &[0], true)
+                    .expect("add");
+                ctx.decode(&mut batch).expect("warm decode");
+            }
+        }
+
+        // Two passes over the widths; the second is reported. Anything that
+        // drifts over the run shows up as a difference between them.
+        for pass in 1..=2 {
+        for width in [1usize, 2, 4, 8] {
+            ctx.clear_kv_cache();
+            // Some history first: a decode into an empty cache is not the
+            // regime speculative decoding runs in.
+            batch.clear();
+            for (i, t) in filler.iter().enumerate() {
+                batch.add(*t, i as i32, &[0], i == filler.len() - 1).expect("add");
+            }
+            ctx.decode(&mut batch).expect("prefill");
+            let mut pos = filler.len() as i32;
+
+            // Warm the GPU on this width before anything is recorded, then
+            // take the MEDIAN of many rounds: a mean over a handful of passes
+            // measures whatever else the machine was doing.
+            let rounds = 80;
+            let warm = 20;
+            let mut samples: Vec<f64> = Vec::with_capacity(rounds);
+            for r in 0..(rounds + warm) {
+                batch.clear();
+                for k in 0..width {
+                    // Verification needs an opinion at every position; this
+                    // switch measures what asking for them costs.
+                    let want = all_logits || k == width - 1;
+                    batch.add(filler[k % filler.len()], pos + k as i32, &[0], want).expect("add");
+                }
+                let t0 = Instant::now();
+                ctx.decode(&mut batch).expect("decode");
+                let dt = t0.elapsed().as_secs_f64();
+                pos += width as i32;
+                if r >= warm {
+                    samples.push(dt);
+                }
+                // Keep the history bounded so later widths are not measured
+                // against a much longer context than earlier ones.
+                if pos > 2048 {
+                    ctx.clear_kv_cache();
+                    batch.clear();
+                    for (i, t) in filler.iter().enumerate() {
+                        batch.add(*t, i as i32, &[0], i == filler.len() - 1).expect("add");
+                    }
+                    ctx.decode(&mut batch).expect("re-prefill");
+                    pos = filler.len() as i32;
+                }
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = samples[samples.len() / 2];
+            eprintln!(
+                "pass{pass} width {width}: {:.1} ms per pass, {:.2} ms per token",
+                median * 1000.0,
+                median * 1000.0 / width as f64
+            );
+        }
+        }
+    }
+
+}
+
+#[cfg(test)]
+mod think_off_prefix {
+    use super::*;
+
+    fn msg(role: Role, content: &str) -> ChatMessage {
+        ChatMessage { role, content: content.into(), images: vec![], reasoning_content: None }
+    }
+
+    #[test]
+    fn a_stored_turn_carries_what_the_prompt_prefilled() {
+        // Round one ends with `…assistant\n<think>\n\n</think>\n\n` and the model
+        // continues from there. Unless round two puts the same block in front of
+        // that stored turn, the common prefix ends at the assistant header and
+        // the whole conversation is prefilled again — measured at 0% KV reuse on
+        // qwen35 and lfm2 with thinking off, which is code mode's default.
+        let out = prefixed_assistant_turns(
+            &[msg(Role::User, "q"), msg(Role::Assistant, "the answer")],
+            true,
+        );
+        assert_eq!(out[1].content, format!("{THINK_OFF_PREFIX}the answer"));
+    }
+
+    #[test]
+    fn only_assistant_turns_are_touched() {
+        let out = prefixed_assistant_turns(
+            &[
+                msg(Role::System, "s"),
+                msg(Role::User, "q"),
+                msg(Role::Tool, "result"),
+            ],
+            true,
+        );
+        assert_eq!(out[0].content, "s");
+        assert_eq!(out[1].content, "q");
+        assert_eq!(out[2].content, "result");
+    }
+
+    #[test]
+    fn a_turn_that_already_reasons_is_left_alone() {
+        // The model wrote a block despite the request; doubling it would break
+        // the prefix exactly as badly as omitting it.
+        let already = "<think>\nhmm\n</think>\n\nthe answer";
+        let out = prefixed_assistant_turns(&[msg(Role::Assistant, already)], true);
+        assert_eq!(out[0].content, already);
+    }
+
+    #[test]
+    fn thinking_on_changes_nothing() {
+        let before = [msg(Role::User, "q"), msg(Role::Assistant, "a")];
+        let out = prefixed_assistant_turns(&before, false);
+        assert_eq!(out[1].content, "a");
+    }
+
+    #[test]
+    fn the_prefix_matches_what_the_prompt_appends() {
+        // The two spellings live apart; if they drift the prefix silently dies.
+        assert_eq!(THINK_OFF_PREFIX, "<think>\n\n</think>\n\n");
     }
 }

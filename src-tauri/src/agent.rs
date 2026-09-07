@@ -287,7 +287,7 @@ pub fn agent_grant_dir(path: String) -> Result<String, String> {
     }
     let canon = p.canonicalize().map_err(|e| e.to_string())?;
     let mut dirs = GRANTED_DIRS.lock().unwrap();
-    if !dirs.iter().any(|d| *d == canon) {
+    if !dirs.contains(&canon) {
         dirs.push(canon.clone());
     }
     Ok(canon.to_string_lossy().to_string())
@@ -790,7 +790,7 @@ pub async fn agent_validate_change(files: Option<Vec<String>>) -> Result<String,
         let rel = rel_display(&root, entry.path());
         // A test relates if it mentions a changed stem — or IS a changed file.
         let related = stems.iter().any(|st| lower.contains(st.as_str()))
-            || rels.iter().any(|r| *r == rel);
+            || rels.contains(&rel);
         if !related {
             continue;
         }
@@ -1710,15 +1710,11 @@ pub async fn browser_refresh() -> Result<String, String> {
 /// each one downscales to a fully legible image, and EVERY pixel of the page
 /// stays in the set — full-page semantics, zero information loss. Encode
 /// transients also shrink: N small ViT passes replace one giant one.
-/// Returns the tile bounds (y, height) top-to-bottom.
-fn tile_bounds(width: u32, height: u32) -> Vec<(u32, u32)> {
-    // ~one 2x viewport per tile; a page up to 1.35 tiles stays a single image
-    // (normal pages keep the old behavior byte-for-byte).
-    tile_bounds_with(width, height, None)
-}
-
-/// Same as `tile_bounds`, with an optional content-aware boundary chooser:
-/// given a candidate cut row, return the FLATTEST row nearby (whitespace
+/// Returns the tile bounds (y, height) top-to-bottom. A page up to 1.35 tiles
+/// tall stays a single image, so normal pages are untouched.
+///
+/// `pick_cut` is an optional content-aware boundary chooser:
+/// given a candidate cut row, it returns the FLATTEST row nearby (whitespace
 /// between page sections). A hard cut at a fixed offset halved a product
 /// card and the model saw it in NEITHER half; overlapping tiles duplicated
 /// content and diluted multi-image attention (both measured on the owner's
@@ -1782,9 +1778,16 @@ fn flattest_row_near(img: &image::DynamicImage, target: u32, window: u32) -> u32
     best.1
 }
 
-/// Full-page screenshot (auto-scrolls to trigger lazy content). Returns one
-/// temp PNG path per SEGMENT (newline-joined, top to bottom) — one path for
-/// normal pages, several for tall ones. The agent loop attaches them all.
+/// Full-page screenshot (auto-scrolls to trigger lazy content).
+///
+/// Returns the WHOLE page as line 0, marked `full:<path>`, then one temp PNG
+/// path per SEGMENT (top to bottom) — one segment for normal pages, several
+/// for tall ones. The two audiences want different things from one capture:
+/// the model is fed segments, because a picture is read in a single forward
+/// pass and a tall page as one image is an allocation no engine wants; the
+/// step card wants the page. Handing the card `shots[0]` gave it the top
+/// segment, which reads exactly like a viewport snapshot and is why a
+/// full-page capture appeared to take none of the page below the fold.
 #[tauri::command]
 pub async fn browser_screenshot() -> Result<String, String> {
     let png = tokio::task::spawn_blocking(crate::browser::screenshot)
@@ -1793,15 +1796,21 @@ pub async fn browser_screenshot() -> Result<String, String> {
     let img = match image::load_from_memory(&png) {
         Ok(i) => i,
         // Undecodable capture: hand it over untouched rather than failing.
-        Err(_) => return write_shot(png),
+        Err(_) => {
+            let p = write_shot(png)?;
+            return Ok(format!("full:{p}\n{p}"));
+        }
     };
     let (w, h) = (img.width(), img.height());
     let tile_h = ((w as f64) * 0.72) as u32;
     let window = tile_h / 5;
     let picker = |target: u32| flattest_row_near(&img, target, window);
     let tiles = tile_bounds_with(w, h, Some(&picker));
+    // The untiled capture, kept whatever the tiling decides — it is what the
+    // card previews and what a download hands over.
+    let full = write_shot(png)?;
     if tiles.len() == 1 {
-        return write_shot(png);
+        return Ok(format!("full:{full}\n{full}"));
     }
     let mut paths = Vec::new();
     for (i, (y, th)) in tiles.iter().enumerate() {
@@ -1825,7 +1834,7 @@ pub async fn browser_screenshot() -> Result<String, String> {
             .map_err(|e| trf!("写入失败: {e}", "write failed: {e}"))?;
         paths.push(path.to_string_lossy().to_string());
     }
-    Ok(paths.join("\n"))
+    Ok(format!("full:{full}\n{}", paths.join("\n")))
 }
 
 /// Snapshot of just the current viewport (immediate) — for lazy-load pages,
@@ -2013,10 +2022,9 @@ pub(crate) async fn read_doc_core(
     let text = match ext.as_str() {
         "pdf" => {
             let p = abs_str.clone();
-            tokio::task::spawn_blocking(move || pdf_extract::extract_text(&p))
+            tokio::task::spawn_blocking(move || crate::rag::extract_pdf(&p))
                 .await
-                .map_err(|e| e.to_string())?
-                .map_err(|e| trf!("PDF 解析失败: {e}", "PDF parse failed: {e}"))?
+                .map_err(|e| e.to_string())??
         }
         "docx" => crate::rag::extract_docx(&abs_str)?,
         "xlsx" => crate::rag::extract_xlsx(&abs_str)?,
@@ -3047,15 +3055,6 @@ fn decode_console_bytes(slice: &[u8]) -> String {
     String::from_utf8_lossy(slice).into_owned()
 }
 
-fn cap_utf8(bytes: Vec<u8>) -> String {
-    let truncated = bytes.len() > MAX_OUTPUT_BYTES;
-    let s = decode_console_bytes(&bytes[..bytes.len().min(MAX_OUTPUT_BYTES)]);
-    if truncated {
-        trf!("{s}\n… (输出已截断)", "{s}\n… (output truncated)")
-    } else {
-        s
-    }
-}
 
 /// Final decode of a shared (already tail-capped) buffer. The buffer keeps the
 /// TAIL on overflow — for shell output that's the right end to keep (the error
@@ -3218,13 +3217,13 @@ fn run_bash(
                 // model was asked to start.
                 if let Some(grace) = convert {
                     if started.elapsed() >= grace
-                        && tick % 25 == 0
+                        && tick.is_multiple_of(25)
                         && (server_signature(&shared_tail(&out_buf))
                             || server_signature(&shared_tail(&err_buf))
                             // Every ~3s ask the OS directly: banner-silent
                             // servers (buffered python http.server, custom
                             // node listeners) never print anything we match.
-                            || (tick % 75 == 0 && listening_socket(child.id())))
+                            || (tick.is_multiple_of(75) && listening_socket(child.id())))
                     {
                         match convert_running_to_bg(child, command, started, &out_buf, &err_buf) {
                             Ok(id) => {
@@ -3431,7 +3430,18 @@ pub async fn agent_bash(
     sudo_password: Option<String>,
 ) -> Result<BashResult, String> {
     let root = workspace()?;
-    let timeout = Duration::from_secs(timeout_secs.unwrap_or(120).clamp(1, 600));
+    // 0 means the user turned the limit off in Settings. The 600-second ceiling
+    // was written here on top of a slider that already stopped at 300, so a
+    // build, a test suite or a long install had two caps above it and no way to
+    // raise either — the command just died mid-run. A day is not "no timeout",
+    // but it is past anything a person is waiting on, and it still guarantees
+    // the process cannot be orphaned forever.
+    const NO_LIMIT: u64 = 24 * 60 * 60;
+    let timeout = Duration::from_secs(match timeout_secs {
+        Some(0) => NO_LIMIT,
+        Some(n) => n.clamp(1, NO_LIMIT),
+        None => 120,
+    });
     let is_sudo = command_uses_sudo(&command);
     let (command, stdin, sandboxed) = if is_sudo {
         let cmd = if sudo_password.is_some() { ensure_sudo_stdin(&command) } else { command };
@@ -3496,6 +3506,28 @@ impl BgJob {
 }
 
 static BG_JOBS: Mutex<Option<HashMap<u64, BgJob>>> = Mutex::new(None);
+/// Finished jobs stay readable after they are reported, but they were never
+/// dropped: a long session kept every command it had ever backgrounded, each
+/// holding its capped output for the life of the app. Keep the recent ones —
+/// far more than anything reads back — and let the rest go.
+const BG_KEEP_FINISHED: usize = 50;
+
+/// Drop all but the newest `BG_KEEP_FINISHED` jobs that have finished AND been
+/// reported. Ids increase, so the smallest are the oldest.
+fn bg_evict_finished(jobs: &mut HashMap<u64, BgJob>) {
+    let mut done: Vec<u64> = jobs
+        .iter()
+        .filter(|(_, j)| j.code.is_some() && j.reported)
+        .map(|(id, _)| *id)
+        .collect();
+    if done.len() <= BG_KEEP_FINISHED {
+        return;
+    }
+    done.sort_unstable();
+    for id in &done[..done.len() - BG_KEEP_FINISHED] {
+        jobs.remove(id);
+    }
+}
 static BG_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 const BG_MAX_JOBS: usize = 8;
 const BG_TAIL_BYTES: usize = 8 * 1024;
@@ -3540,6 +3572,7 @@ pub fn agent_bash_bg(command: String) -> Result<u64, String> {
     let root = workspace()?;
     let mut reg = BG_JOBS.lock().unwrap();
     let jobs = reg.get_or_insert_with(HashMap::new);
+    bg_evict_finished(jobs);
     let running = jobs.values().filter(|j| j.code.is_none()).count();
     if running >= BG_MAX_JOBS {
         return Err(trf!(
@@ -3752,11 +3785,11 @@ mod tests {
     #[test]
     fn screenshot_tiles_cover_everything_and_spare_normal_pages() {
         // Normal 2x viewport (2560x1800): single image.
-        assert_eq!(tile_bounds(2560, 1800), vec![(0, 1800)]);
+        assert_eq!(tile_bounds_with(2560, 1800, None), vec![(0, 1800)]);
         // Slightly tall (≤1.35 tiles) still single.
-        assert_eq!(tile_bounds(2560, 2400), vec![(0, 2400)]);
+        assert_eq!(tile_bounds_with(2560, 2400, None), vec![(0, 2400)]);
         // The owner's Hello-Kitty page: 2560x10780, fixed cuts.
-        let tiles = tile_bounds(2560, 10780);
+        let tiles = tile_bounds_with(2560, 10780, None);
         assert!(tiles.len() >= 5, "tall page must segment: {tiles:?}");
         let tile_h = (2560f64 * 0.72) as u32;
         let mut y = 0;
@@ -4148,17 +4181,48 @@ mod tests {
 
     /// Windows consoles emit the ANSI codepage (GBK on Chinese systems) — the
     /// old lossy-UTF-8 decode turned every non-ASCII byte into mojibake.
+    /// Reported jobs were kept for the life of the app, so a long session
+    /// carried every command it had ever backgrounded — each still holding its
+    /// output buffer. Running jobs and unreported results must survive.
     #[test]
-    fn cap_utf8_decodes_console_output() {
+    fn finished_background_jobs_stop_accumulating() {
+        use std::sync::Arc;
+        let job = |code: Option<i32>, reported: bool| BgJob {
+            command: "sleep 0".into(),
+            started: std::time::Instant::now(),
+            output: Arc::new(Mutex::new(Vec::new())),
+            stderr_extra: None,
+            code,
+            reported,
+            pid: 0,
+        };
+        let mut jobs: HashMap<u64, BgJob> = HashMap::new();
+        for id in 0..200u64 {
+            jobs.insert(id, job(Some(0), true));
+        }
+        jobs.insert(900, job(None, false)); // still running
+        jobs.insert(901, job(Some(1), false)); // finished, not yet collected
+
+        super::bg_evict_finished(&mut jobs);
+
+        assert_eq!(jobs.len(), super::BG_KEEP_FINISHED + 2);
+        assert!(jobs.contains_key(&900), "a running job must never be dropped");
+        assert!(jobs.contains_key(&901), "an uncollected result must never be dropped");
+        assert!(jobs.contains_key(&199), "the newest finished job is kept");
+        assert!(!jobs.contains_key(&0), "the oldest finished job is dropped");
+    }
+
+    #[test]
+    fn console_output_decodes_the_ansi_codepage() {
         // Plain UTF-8 passes through unchanged on every platform.
-        assert_eq!(cap_utf8("hello 世界".as_bytes().to_vec()), "hello 世界");
+        assert_eq!(decode_console_bytes("hello 世界".as_bytes()), "hello 世界");
         #[cfg(windows)]
         {
             // "找不到文件" (file not found) as GBK bytes — what a Chinese-locale
             // cmd.exe actually writes.
             let (gbk, _, _) = encoding_rs::GBK.encode("找不到文件 test");
             assert!(std::str::from_utf8(&gbk).is_err(), "fixture must not be valid UTF-8");
-            assert_eq!(cap_utf8(gbk.into_owned()), "找不到文件 test");
+            assert_eq!(decode_console_bytes(&gbk), "找不到文件 test");
         }
     }
 

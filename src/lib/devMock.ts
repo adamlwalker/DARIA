@@ -21,6 +21,10 @@ const MODEL = {
   nCtxTrain: 262144,
   nCtx: 40960,
   nLayer: 48,
+  // A model that CAN speculate, with the feature off — which is how it ships:
+  // the switch is live, and turned off.
+  speculative: true,
+  speculativeOn: false,
   gpuLayers: 48,
   gpuName: "Apple M4 Pro",
   modelName: "Qwen3.6 35B A3B",
