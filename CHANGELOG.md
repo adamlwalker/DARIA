@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.3.1 — Chat can call image gen
+
+- **Image gen is a chat tool.** With a model loaded, turn on Image gen and ask in plain language. The model writes the Z-Image-Turbo prompt and calls the generator; the PNG lands in the reply. Without a model, your message is still the prompt.
+- The UI is **English-only**. The language switcher is gone.
+
 ## v2.3.0 — Qwen 3.8 coding and a long run that stays on the cache
 
 Ported the coding-agent and Qwen 3.8 work from upstream Chaty v2.0.9–v2.1.7 (no TikTok skill, no extra UI languages).

@@ -34,9 +34,8 @@ pub(crate) fn hide_console(cmd: &mut Command) -> &mut Command {
 static WORKSPACE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Language for model-visible and user-visible backend strings.
-/// Production default is English. Chinese is used only when the UI
-/// language is explicitly Chinese (`zh`). Tests keep Zh as the default
-/// because most existing assertions expect Chinese tool output.
+/// Production is English-only. Tests keep Zh as the default (and may
+/// still switch) because most existing assertions expect Chinese tool output.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Lang {
     Zh,
@@ -49,13 +48,19 @@ static LANG: Mutex<Lang> = Mutex::new(Lang::Zh);
 
 #[tauri::command]
 pub fn agent_set_lang(lang: String) {
-    // Only an explicit Chinese selection enables Chinese. Anything else
-    // (including empty / unknown) stays English.
-    *LANG.lock().unwrap() = if lang.eq_ignore_ascii_case("zh") {
-        Lang::Zh
-    } else {
-        Lang::En
-    };
+    #[cfg(test)]
+    {
+        *LANG.lock().unwrap() = if lang.eq_ignore_ascii_case("zh") {
+            Lang::Zh
+        } else {
+            Lang::En
+        };
+    }
+    #[cfg(not(test))]
+    {
+        let _ = lang;
+        *LANG.lock().unwrap() = Lang::En;
+    }
 }
 
 /// Hashline anchor mode: read_file prefixes every line with `N:hh→` and the

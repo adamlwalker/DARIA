@@ -90,7 +90,7 @@ itself — every step shown live, every change behind an approval + diff.
 - **KaTeX** math, tables, **Mermaid** diagrams, per-block code copy, and in-app rendering of single-file HTML — including playable web games.
 - A **⌘K command palette**, pinnable / renameable conversations, drag-and-drop attachments, export (Markdown / JSON), and full-text search.
 - **Personalities** under Settings → Chat: Concise, Formal, Tutor, Comprehensive, Unhinged, Storyteller, and Sexy. One click fills the system prompt; click again to clear. Your own named presets still save underneath.
-- Four palettes (two dark, two light) with system-theme following, native UI zoom, reduced-motion support, and an **English / 简体中文** UI. Interface strings live in `src/locales/en.json` and `src/locales/zh.json` — the app stays English unless Chinese is selected.
+- Four palettes (two dark, two light) with system-theme following, native UI zoom, reduced-motion support, and an **English** UI. Interface strings live in `src/locales/en.json`.
 
 <br />
 
@@ -135,7 +135,7 @@ Text-only models keep the OCR path, so nothing regresses — and updating from a
 
 ## On-device image generation (Apple Silicon)
 
-Turn on **Image gen** in the chat tools menu (or `/imagegen`) and the next prompt returns a PNG — not a chat reply. Click the image to open it full-size in Preview. The **seed** is shown under the picture; click it to copy and reuse it for the next generate.
+Turn on **Image gen** in the chat tools menu (or `/imagegen`). With a chat model loaded, ask in plain language — the model writes a Z-Image-Turbo prompt and calls the generator. Without a model, your message is the prompt itself. Click the image to open it full-size in Preview. The **seed** is shown under the picture; click it to copy and reuse it for the next generate.
 
 - **Z-Image-Turbo** via a local **MLX** sidecar ([mflux](https://pypi.org/project/mflux/)). Generation stays on the Mac.
 - **Lazy load** — the sidecar never starts with the app. Weights load on the first generate, and turning Image gen off kills the process so the memory comes back.

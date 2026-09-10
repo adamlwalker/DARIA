@@ -5,8 +5,13 @@ import {
   clampImageGenSteps,
   formatImageSeedContent,
   imageGenDiskHintGb,
+  IMAGE_GEN_CHAT_TOOL_DOC,
+  parseGenerateImageCall,
   parseImageSeed,
   recommendedImageGenQuant,
+  stripGenerateImageMarkup,
+  stripImageSeedLine,
+  withImageSeed,
 } from "./imageGen";
 import { matchingPersonality, PERSONALITY_PRESETS } from "./personalityPresets";
 import en from "../locales/en.json";
@@ -45,6 +50,56 @@ describe("image gen helpers", () => {
     expect(parseImageSeed("  seed:184928301  ")).toBe(184928301);
     expect(parseImageSeed("")).toBeNull();
     expect(parseImageSeed("nice picture")).toBeNull();
+  });
+
+  it("reads a seed under a caption and can strip it for display", () => {
+    const stored = withImageSeed("Here you go.", 9);
+    expect(stored).toBe("Here you go.\n\nseed:9");
+    expect(parseImageSeed(stored)).toBe(9);
+    expect(stripImageSeedLine(stored)).toBe("Here you go.");
+  });
+});
+
+describe("chat generate_image tool", () => {
+  it("documents the XML tool protocol", () => {
+    expect(IMAGE_GEN_CHAT_TOOL_DOC).toContain("<tool_call>");
+    expect(IMAGE_GEN_CHAT_TOOL_DOC).toContain("generate_image");
+    expect(IMAGE_GEN_CHAT_TOOL_DOC).toContain("prompt");
+  });
+
+  it("parses a closed tool_call JSON block", () => {
+    const text =
+      'Sure.\n<tool_call>{"name":"generate_image","arguments":{"prompt":"a red cube on marble"}}</tool_call>';
+    expect(parseGenerateImageCall(text)).toEqual({ prompt: "a red cube on marble" });
+    expect(stripGenerateImageMarkup(text)).toBe("Sure.");
+  });
+
+  it("parses when the closer was trimmed by the stop sequence", () => {
+    const text =
+      '<tool_call>{"name":"generate_image","arguments":{"prompt":"neon diner at night, sign reads OPEN"}}';
+    expect(parseGenerateImageCall(text)?.prompt).toContain("neon diner");
+  });
+
+  it("accepts a flat prompt field and name aliases", () => {
+    expect(
+      parseGenerateImageCall('<tool_call>{"name":"image_gen","prompt":"oil painting of a fox"}'),
+    ).toEqual({ prompt: "oil painting of a fox" });
+  });
+
+  it("parses the LFM native call shape", () => {
+    const text =
+      "<|tool_call_start|>[generate_image(prompt='a watercolor lighthouse')]<|tool_call_end|>";
+    expect(parseGenerateImageCall(text)).toEqual({ prompt: "a watercolor lighthouse" });
+    expect(stripGenerateImageMarkup(text)).toBe("");
+  });
+
+  it("ignores other tools and empty prompts", () => {
+    expect(
+      parseGenerateImageCall('<tool_call>{"name":"web_search","arguments":{"query":"cats"}}</tool_call>'),
+    ).toBeNull();
+    expect(
+      parseGenerateImageCall('<tool_call>{"name":"generate_image","arguments":{"prompt":"  "}}</tool_call>'),
+    ).toBeNull();
   });
 });
 
@@ -89,6 +144,7 @@ describe("image gen locales", () => {
       "imageGenConfirm",
       "openImagesDir",
       "imageGenQuant4",
+      "inputPhImageTool",
     ]) {
       expect(en[key as keyof typeof en]).toBeTruthy();
       expect(zh[key as keyof typeof zh]).toBeTruthy();

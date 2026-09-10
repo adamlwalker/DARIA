@@ -4,36 +4,22 @@ import {
   useContext,
   useEffect,
   useMemo,
-  useState,
   type ReactNode,
 } from "react";
 import en from "../locales/en.json";
-import zh from "../locales/zh.json";
 
+/** Session language type kept so call sites that still branch on `"zh"` compile.
+ *  The running app is English-only. */
 export type Lang = "zh" | "en";
 
-/** Agent/model layer is only zh/en. UI Chinese stays Chinese; everything else is English. */
-export function agentLang(lang: Lang): "zh" | "en" {
-  return lang === "zh" ? "zh" : "en";
+/** Agent/model layer is English-only. */
+export function agentLang(_lang: Lang): "zh" | "en" {
+  return "en";
 }
 
 const LANG_KEY = "chaty.lang";
 
-const DICTS = { en, zh } as const;
-
 export type TKey = keyof typeof en;
-
-function detectLang(): Lang {
-  try {
-    const saved = localStorage.getItem(LANG_KEY);
-    if (saved === "zh" || saved === "en") return saved;
-  } catch {
-    /* ignore */
-  }
-  // Default first language is English (voice features are English-only and are
-  // hidden when the user explicitly switches to Chinese).
-  return "en";
-}
 
 interface I18n {
   lang: Lang;
@@ -44,29 +30,29 @@ interface I18n {
 const LangContext = createContext<I18n | null>(null);
 
 export function LangProvider({ children }: { children: ReactNode }) {
-  const [lang, setLang] = useState<Lang>(detectLang);
+  const lang: Lang = "en";
 
   useEffect(() => {
     try {
-      localStorage.setItem(LANG_KEY, lang);
+      localStorage.setItem(LANG_KEY, "en");
     } catch {
       /* ignore */
     }
-  }, [lang]);
+  }, []);
 
-  const t = useCallback(
-    (key: TKey, vars?: Record<string, string | number>) => {
-      const dict = DICTS[lang];
-      let s: string = dict[key] ?? DICTS.en[key] ?? key;
-      if (vars) {
-        for (const k of Object.keys(vars)) s = s.replace(`{${k}}`, String(vars[k]));
-      }
-      return s;
-    },
-    [lang],
-  );
+  const setLang = useCallback((_l: Lang) => {
+    /* UI language is English-only. */
+  }, []);
 
-  const value = useMemo<I18n>(() => ({ lang, setLang, t }), [lang, t]);
+  const t = useCallback((key: TKey, vars?: Record<string, string | number>) => {
+    let s: string = en[key] ?? key;
+    if (vars) {
+      for (const k of Object.keys(vars)) s = s.replace(`{${k}}`, String(vars[k]));
+    }
+    return s;
+  }, []);
+
+  const value = useMemo<I18n>(() => ({ lang, setLang, t }), [t, setLang]);
   return <LangContext.Provider value={value}>{children}</LangContext.Provider>;
 }
 

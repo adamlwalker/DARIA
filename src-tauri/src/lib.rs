@@ -189,8 +189,7 @@ pub fn run() {
                 let _ = w.eval("location.reload()");
             }
 
-            // ---- system tray (labels default to English; the UI syncs the
-            // language via `set_tray_language` on startup) ----
+            // ---- system tray (English labels) ----
             let show_i = MenuItem::with_id(app, "show", "Show DARIA", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_i, &quit_i])?;

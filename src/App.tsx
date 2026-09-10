@@ -118,7 +118,18 @@ import {
   standingTail,
 } from "./lib/ctxBudget";
 import { fmtGbFromMb } from "./lib/fmt";
-import { clampImageGenQuant, clampImageGenSize, clampImageGenSteps, formatImageSeedContent, imageGenDiskHintGb, parseImageSeed } from "./lib/imageGen";
+import {
+  clampImageGenQuant,
+  clampImageGenSize,
+  clampImageGenSteps,
+  IMAGE_GEN_CHAT_TOOL_DOC,
+  imageGenDiskHintGb,
+  parseGenerateImageCall,
+  parseImageSeed,
+  stripGenerateImageMarkup,
+  stripImageSeedLine,
+  withImageSeed,
+} from "./lib/imageGen";
 
 interface UiMessage extends ChatMessage {
   id: string;
@@ -748,11 +759,11 @@ export default function App() {
     refreshConversations();
   }, []);
 
-  // Keep the tray menu labels and backend error language in sync with the UI.
+  // Tray and backend tool-output language are English-only.
   useEffect(() => {
-    setTrayLanguage(lang).catch(() => {});
-    agentSetLang(lang).catch(() => {});
-  }, [lang]);
+    setTrayLanguage("en").catch(() => {});
+    agentSetLang("en").catch(() => {});
+  }, []);
 
   // Global ⌘K / Ctrl+K toggles the command palette. (DOM KeyboardEvent — the
   // bare name is React's here, imported above for composer key handling.)
@@ -2074,6 +2085,7 @@ export default function App() {
     // engine can resume from cache.
     const sysParts = [
       ...(webDesign ? [WEBDESIGN_PROMPT] : []),
+      ...(imageGen ? [IMAGE_GEN_CHAT_TOOL_DOC] : []),
       ...(sys ? [sys] : []),
       ...(attachment && attachment.kind !== "vision"
         ? [t("attachInstruction", { name: attachment.name }) + attachment.text.slice(0, 9000)]
@@ -2130,7 +2142,7 @@ export default function App() {
     };
     const pumpSpeech = (final: boolean) => {
       if (!useTTS || !speech) return;
-      const ans = answerOnly(acc.text);
+      const ans = answerOnly(visibleText());
       let pending = ans.slice(spokenLen);
       if (final) {
         spokenLen = ans.length;
@@ -2144,11 +2156,12 @@ export default function App() {
     };
 
     const acc = { text: "" };
+    const visibleText = () => (imageGen ? stripGenerateImageMarkup(acc.text) : acc.text);
     // Coalesce token → state into one re-render per animation frame (was: one
     // setMessages per token = a full re-render of the list on every token).
     let rafId: number | null = null;
     const renderMsg = () =>
-      setMessages((cur) => cur.map((m) => (m.id === asstId ? { ...m, content: acc.text } : m)));
+      setMessages((cur) => cur.map((m) => (m.id === asstId ? { ...m, content: visibleText() } : m)));
     const scheduleRender = () => {
       if (rafId == null)
         rafId = requestAnimationFrame(() => {
@@ -2168,7 +2181,7 @@ export default function App() {
             topK: settings.topK,
             minP: settings.minP,
             repeatPenalty: settings.repeatPenalty,
-            stop: parseStops(settings.stop),
+            stop: [...new Set([...parseStops(settings.stop), ...(imageGen ? ["</tool_call>"] : [])])],
             think: thinkParam,
             effort: effortParam,
           },
@@ -2211,14 +2224,16 @@ export default function App() {
         rafId = null;
       }
       renderMsg();
+      const cancelled = final.stats?.stopReason === "cancelled";
+      const imageCall = imageGen && !cancelled ? parseGenerateImageCall(acc.text) : null;
       // A finished turn with no answer in it must say so. It happens two ways:
       // the prompt outgrew the window, so the engine generated nothing at all
       // and the message was never even saved (the turn vanished on reload); or
       // the model reasoned to EOS and stopped without writing the answer, which
       // saved a bubble holding only a thought. Both read as the app dropping
       // the reply. A cancel is not one of these — the user knows why that one
-      // is short.
-      if (final.stats && final.stats.stopReason !== "cancelled" && !answerOnly(acc.text).trim()) {
+      // is short. A generate_image call is an answer, even with no prose.
+      if (!imageCall && final.stats && !cancelled && !answerOnly(acc.text).trim()) {
         const noRoom =
           final.stats.stopReason === "context" ||
           (!!model?.nCtx && final.stats.promptTokens >= model.nCtx);
@@ -2233,16 +2248,34 @@ export default function App() {
         acc.text += (acc.text ? "\n\n" : "") + t(key);
         renderMsg();
       }
+      let savedByImage = false;
+      if (imageCall) {
+        const caption = stripGenerateImageMarkup(acc.text);
+        acc.text = caption;
+        renderMsg();
+        savedByImage = await runImageGenJob(asstId, convId, imageCall.prompt, {
+          freshConv: opts.freshConv,
+          titleSource: text,
+          caption,
+        });
+      }
       setBusy(false);
       setStreamingId(null);
       try {
-        if (acc.text.trim()) await saveMessage(asstId, convId, "assistant", acc.text);
-        await refreshConversations();
+        if (!savedByImage && acc.text.trim()) {
+          await saveMessage(
+            asstId,
+            convId,
+            "assistant",
+            imageGen ? stripGenerateImageMarkup(acc.text) : acc.text,
+          );
+        }
+        if (!savedByImage) await refreshConversations();
       } catch (e) {
         reportChatSaveFailure(convId, e);
       }
       // Let the model name a fresh conversation from its first question.
-      if (opts.freshConv && acc.text.trim()) void makeTitle(convId, text);
+      if (!savedByImage && opts.freshConv && acc.text.trim()) void makeTitle(convId, text);
       // Flush the trailing sentence and clear the speaking state once audio ends.
       if (useTTS && speech) {
         pumpSpeech(true);
@@ -2305,23 +2338,24 @@ export default function App() {
     }
   }
 
-  async function streamImageGen(
-    history: UiMessage[],
+  async function runImageGenJob(
     asstId: string,
     convId: string,
-    opts: { freshConv: boolean },
-  ) {
-    const text = [...history].reverse().find((m) => m.role === "user")?.content ?? "";
-    setBusy(true);
-    setStreamingId(asstId);
+    prompt: string,
+    opts: { freshConv: boolean; titleSource: string; caption: string },
+  ): Promise<boolean> {
+    const caption = opts.caption.trim();
+    const showProgressInBubble = !caption;
     setImageGenBusy(t("imageGenLoading"));
-    setMessages((cur) =>
-      cur.map((m) => (m.id === asstId ? { ...m, content: t("imageGenLoading") } : m)),
-    );
+    if (showProgressInBubble) {
+      setMessages((cur) =>
+        cur.map((m) => (m.id === asstId ? { ...m, content: t("imageGenLoading") } : m)),
+      );
+    }
     try {
       const result = await imagegenGenerate(
         {
-          prompt: text,
+          prompt,
           quant: clampImageGenQuant(settings.imageGenQuant),
           width: clampImageGenSize(settings.imageGenSize),
           height: clampImageGenSize(settings.imageGenSize),
@@ -2332,39 +2366,65 @@ export default function App() {
           if (p.type === "phase") {
             const label = p.phase === "generate" ? t("imageGenGenerating") : p.message || t("imageGenLoading");
             setImageGenBusy(label);
-            setMessages((cur) => cur.map((m) => (m.id === asstId ? { ...m, content: label } : m)));
+            if (showProgressInBubble) {
+              setMessages((cur) => cur.map((m) => (m.id === asstId ? { ...m, content: label } : m)));
+            }
           } else if (p.type === "progress") {
             const stepped = p.message && !p.message.startsWith("0/");
             const label = stepped ? `${t("imageGenGenerating")} ${p.message}` : t("imageGenGenerating");
             setImageGenBusy(label);
-            setMessages((cur) => cur.map((m) => (m.id === asstId ? { ...m, content: label } : m)));
+            if (showProgressInBubble) {
+              setMessages((cur) => cur.map((m) => (m.id === asstId ? { ...m, content: label } : m)));
+            }
           }
         },
       );
-      const seedContent = formatImageSeedContent(result.seed);
+      const content = withImageSeed(caption, result.seed);
       setMessages((cur) =>
-        cur.map((m) => (m.id === asstId ? { ...m, content: seedContent, images: [result.path] } : m)),
+        cur.map((m) => (m.id === asstId ? { ...m, content, images: [result.path] } : m)),
       );
       try {
-        await saveMessage(asstId, convId, "assistant", seedContent, [result.path]);
+        await saveMessage(asstId, convId, "assistant", content, [result.path]);
         await refreshConversations();
       } catch (e) {
         reportChatSaveFailure(convId, e);
       }
-      if (opts.freshConv) void makeTitle(convId, text);
+      if (opts.freshConv) void makeTitle(convId, opts.titleSource);
+      return true;
     } catch (e) {
       const msg = preferEnglishBackendMsg(e instanceof Error ? e.message : String(e), lang);
-      setMessages((cur) => cur.map((m) => (m.id === asstId ? { ...m, content: msg } : m)));
+      const content = [caption, msg].filter(Boolean).join("\n\n");
+      setMessages((cur) => cur.map((m) => (m.id === asstId ? { ...m, content } : m)));
       showNotice("error", msg);
       try {
-        if (msg) await saveMessage(asstId, convId, "assistant", msg);
+        if (content) await saveMessage(asstId, convId, "assistant", content);
       } catch (err) {
         reportChatSaveFailure(convId, err);
       }
+      return true;
+    } finally {
+      setImageGenBusy("");
+    }
+  }
+
+  async function streamImageGen(
+    history: UiMessage[],
+    asstId: string,
+    convId: string,
+    opts: { freshConv: boolean },
+  ) {
+    const text = [...history].reverse().find((m) => m.role === "user")?.content ?? "";
+    setBusy(true);
+    setStreamingId(asstId);
+    try {
+      await runImageGenJob(asstId, convId, text, {
+        freshConv: opts.freshConv,
+        titleSource: text,
+        caption: "",
+      });
     } finally {
       setBusy(false);
       setStreamingId(null);
-      setImageGenBusy("");
     }
   }
 
@@ -2382,7 +2442,7 @@ export default function App() {
       await toggleImageGen();
       return;
     }
-    if (imageGen) {
+    if (imageGen && !model) {
       const freshConv = conversationId === null;
       const convId = conversationId ?? uid();
       const userMsg: UiMessage = { id: uid(), role: "user", content: text };
@@ -2393,7 +2453,7 @@ export default function App() {
       try {
         if (freshConv) {
           setConversationId(convId);
-          await saveConversation(convId, convTitle(text, t("newChat")), model?.path ?? null);
+          await saveConversation(convId, convTitle(text, t("newChat")), null);
         }
         await saveMessage(userMsg.id, convId, "user", text);
         await refreshConversations();
@@ -2458,7 +2518,7 @@ export default function App() {
     } catch (e) {
       console.error(e);
     }
-    if (imageGen) {
+    if (imageGen && !model) {
       await streamImageGen(history, newAsst.id, conversationId, { freshConv: false });
     } else {
       await streamAssistant(history, newAsst.id, conversationId, { freshConv: false });
@@ -2486,7 +2546,7 @@ export default function App() {
     } catch (e) {
       console.error(e);
     }
-    if (imageGen) {
+    if (imageGen && !model) {
       await streamImageGen(history, asstMsg.id, conversationId, { freshConv: false });
     } else {
       await streamAssistant(history, asstMsg.id, conversationId, { freshConv: false });
@@ -2495,10 +2555,16 @@ export default function App() {
 
   async function handleStop() {
     try {
-      if (imageGen) await imagegenCancel();
-      else await cancelGeneration();
+      await cancelGeneration();
     } catch (e) {
       console.error(e);
+    }
+    if (imageGen) {
+      try {
+        await imagegenCancel();
+      } catch (e) {
+        console.error(e);
+      }
     }
   }
 
@@ -3220,9 +3286,9 @@ export default function App() {
                         ))}
                       </div>
                     )}
-                    {((m.content.trim() && parseImageSeed(m.content) == null) || streamingId === m.id) && (
+                    {(stripImageSeedLine(m.content).trim() || streamingId === m.id) && (
                     <AssistantMessage
-                      content={m.content}
+                      content={stripImageSeedLine(m.content)}
                       streaming={streamingId === m.id}
                       searching={streamingId === m.id ? searching : ""}
                       composing={streamingId === m.id && composing}
@@ -3759,7 +3825,9 @@ export default function App() {
                 onKeyDown={onKeyDown}
                 placeholder={
                   imageGen
-                    ? t("inputPhImage")
+                    ? model
+                      ? t("inputPhImageTool")
+                      : t("inputPhImage")
                     : !model
                       ? t("inputPhNoModel")
                       : webDesign

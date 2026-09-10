@@ -1247,14 +1247,10 @@ pub async fn image_thumb(path: String, max_dim: Option<u32>) -> Result<String, S
     .map_err(|e| crate::agent::localize_mixed(&format!("缩略图任务异常 (thumbnail task failed): {e}")))?
 }
 
-/// Rebuild the system-tray menu in the given UI language (`"zh"` | `"en"`).
+/// Rebuild the system-tray menu. The UI is English-only.
 #[tauri::command]
-pub fn set_tray_language(app: tauri::AppHandle, lang: String) -> Result<(), String> {
-    let (show, quit) = if lang == "zh" {
-        ("显示 DARIA", "退出")
-    } else {
-        ("Show DARIA", "Quit")
-    };
+pub fn set_tray_language(app: tauri::AppHandle, _lang: String) -> Result<(), String> {
+    let (show, quit) = ("Show DARIA", "Quit");
     let show_i = MenuItem::with_id(&app, "show", show, true, None::<&str>)
         .map_err(|e| e.to_string())?;
     let quit_i = MenuItem::with_id(&app, "quit", quit, true, None::<&str>)

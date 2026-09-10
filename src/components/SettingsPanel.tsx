@@ -395,7 +395,7 @@ export function SettingsPanel({
   /** Called after the user clears all conversations, so the app can reset. */
   onDataCleared?: () => void;
 }) {
-  const { t, lang, setLang } = useI18n();
+  const { t, lang } = useI18n();
   const confirm = useConfirm();
   const [cat, setCat] = useState<CatId>("general");
   const [presetName, setPresetName] = useState("");
@@ -729,12 +729,6 @@ export function SettingsPanel({
           <div className="settings-pane-body">
           {cat === "general" && (
             <>
-              <SetRow label={t("language")}>
-                <div className="lang-switch">
-                  <button type="button" className={lang === "zh" ? "active" : ""} onClick={() => setLang("zh")}>中文</button>
-                  <button type="button" className={lang === "en" ? "active" : ""} onClick={() => setLang("en")}>English</button>
-                </div>
-              </SetRow>
               <SetRow label={t("theme")}>
                 <div className="lang-switch">
                   <button type="button" className={value.theme === "system" ? "active" : ""} onClick={() => set("theme", "system")}>{t("themeSystem")}</button>
