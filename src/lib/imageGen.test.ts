@@ -145,6 +145,9 @@ describe("image gen locales", () => {
       "openImagesDir",
       "imageGenQuant4",
       "inputPhImageTool",
+      "toolImageAsk",
+      "toolImageDirect",
+      "imageGenChipDirect",
     ]) {
       expect(en[key as keyof typeof en]).toBeTruthy();
       expect(zh[key as keyof typeof zh]).toBeTruthy();

@@ -627,6 +627,16 @@ export default function App() {
       return false;
     }
   });
+  /** When Image gen is on, send the user's text straight to Z-Image-Turbo
+   *  instead of asking the chat model to write the diffusion prompt. */
+  const [imageGenDirect, setImageGenDirect] = useState(() => {
+    try {
+      return localStorage.getItem("chaty.imagegen.direct") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const rawImagePrompt = imageGen && (imageGenDirect || !model);
   const [imageGenBusy, setImageGenBusy] = useState("");
   const [searching, setSearching] = useState<"" | "web" | "kb" | "mix">("");
   const [composing, setComposing] = useState(false);
@@ -1052,6 +1062,14 @@ export default function App() {
       /* ignore */
     }
   }, [imageGen]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("chaty.imagegen.direct", imageGenDirect ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+  }, [imageGenDirect]);
 
   // Never keep the sidecar alive after the user turns the mode off.
   useEffect(() => {
@@ -2085,7 +2103,7 @@ export default function App() {
     // engine can resume from cache.
     const sysParts = [
       ...(webDesign ? [WEBDESIGN_PROMPT] : []),
-      ...(imageGen ? [IMAGE_GEN_CHAT_TOOL_DOC] : []),
+      ...(imageGen && !imageGenDirect ? [IMAGE_GEN_CHAT_TOOL_DOC] : []),
       ...(sys ? [sys] : []),
       ...(attachment && attachment.kind !== "vision"
         ? [t("attachInstruction", { name: attachment.name }) + attachment.text.slice(0, 9000)]
@@ -2156,7 +2174,8 @@ export default function App() {
     };
 
     const acc = { text: "" };
-    const visibleText = () => (imageGen ? stripGenerateImageMarkup(acc.text) : acc.text);
+    const visibleText = () =>
+      imageGen && !imageGenDirect ? stripGenerateImageMarkup(acc.text) : acc.text;
     // Coalesce token → state into one re-render per animation frame (was: one
     // setMessages per token = a full re-render of the list on every token).
     let rafId: number | null = null;
@@ -2181,7 +2200,7 @@ export default function App() {
             topK: settings.topK,
             minP: settings.minP,
             repeatPenalty: settings.repeatPenalty,
-            stop: [...new Set([...parseStops(settings.stop), ...(imageGen ? ["</tool_call>"] : [])])],
+            stop: [...new Set([...parseStops(settings.stop), ...(imageGen && !imageGenDirect ? ["</tool_call>"] : [])])],
             think: thinkParam,
             effort: effortParam,
           },
@@ -2225,7 +2244,8 @@ export default function App() {
       }
       renderMsg();
       const cancelled = final.stats?.stopReason === "cancelled";
-      const imageCall = imageGen && !cancelled ? parseGenerateImageCall(acc.text) : null;
+      const imageCall =
+        imageGen && !imageGenDirect && !cancelled ? parseGenerateImageCall(acc.text) : null;
       // A finished turn with no answer in it must say so. It happens two ways:
       // the prompt outgrew the window, so the engine generated nothing at all
       // and the message was never even saved (the turn vanished on reload); or
@@ -2267,7 +2287,7 @@ export default function App() {
             asstId,
             convId,
             "assistant",
-            imageGen ? stripGenerateImageMarkup(acc.text) : acc.text,
+            imageGen && !imageGenDirect ? stripGenerateImageMarkup(acc.text) : acc.text,
           );
         }
         if (!savedByImage) await refreshConversations();
@@ -2292,20 +2312,17 @@ export default function App() {
     }
   }
 
-  async function toggleImageGen() {
-    if (imageGen) {
-      setImageGen(false);
-      return;
-    }
+  async function ensureImageGenOn(): Promise<boolean> {
+    if (imageGen) return true;
     try {
       const st = await imagegenStatus();
       if (!st.supported) {
         showNotice("error", t("imageGenUnsupported"));
-        return;
+        return false;
       }
       if (!st.python) {
         showNotice("error", t("imageGenNeedPython"));
-        return;
+        return false;
       }
       if (!st.runtimeReady) {
         const quant = clampImageGenQuant(settings.imageGenQuant);
@@ -2313,7 +2330,7 @@ export default function App() {
           title: t("imageGenConfirmTitle"),
           message: t("imageGenConfirm", { size: imageGenDiskHintGb(quant) }),
         });
-        if (!ok) return;
+        if (!ok) return false;
         setImageGenBusy(t("imageGenSetup"));
         try {
           await imagegenSetup((p) => {
@@ -2325,17 +2342,48 @@ export default function App() {
           const msg = preferEnglishBackendMsg(e instanceof Error ? e.message : String(e), lang);
           showNotice("error", msg);
           setImageGenBusy("");
-          return;
+          return false;
         }
         setImageGenBusy("");
       }
       setWebDesign(false);
       setWebEnabled(false);
       setImageGen(true);
+      return true;
     } catch (e) {
       const msg = preferEnglishBackendMsg(e instanceof Error ? e.message : String(e), lang);
       showNotice("error", msg);
+      return false;
     }
+  }
+
+  async function toggleImageGen() {
+    if (imageGen) {
+      setImageGen(false);
+      return;
+    }
+    await ensureImageGenOn();
+  }
+
+  async function sendRawImage(text: string) {
+    const freshConv = conversationId === null;
+    const convId = conversationId ?? uid();
+    const userMsg: UiMessage = { id: uid(), role: "user", content: text };
+    const asstMsg: UiMessage = { id: uid(), role: "assistant", content: "" };
+    const history = [...messages, userMsg];
+    setMessages([...history, asstMsg]);
+    setInput("");
+    try {
+      if (freshConv) {
+        setConversationId(convId);
+        await saveConversation(convId, convTitle(text, t("newChat")), model?.path ?? null);
+      }
+      await saveMessage(userMsg.id, convId, "user", text);
+      await refreshConversations();
+    } catch (e) {
+      reportChatSaveFailure(convId, e);
+    }
+    await streamImageGen(history, asstMsg.id, convId, { freshConv });
   }
 
   async function runImageGenJob(
@@ -2437,30 +2485,22 @@ export default function App() {
       setInput("");
       return;
     }
-    if (!override && /^\/imagegen\s*$/i.test(text)) {
-      setInput("");
-      await toggleImageGen();
-      return;
-    }
-    if (imageGen && !model) {
-      const freshConv = conversationId === null;
-      const convId = conversationId ?? uid();
-      const userMsg: UiMessage = { id: uid(), role: "user", content: text };
-      const asstMsg: UiMessage = { id: uid(), role: "assistant", content: "" };
-      const history = [...messages, userMsg];
-      setMessages([...history, asstMsg]);
-      setInput("");
-      try {
-        if (freshConv) {
-          setConversationId(convId);
-          await saveConversation(convId, convTitle(text, t("newChat")), null);
+    if (!override) {
+      const imageSlash = text.match(/^\/image(?:gen)?(?:\s+([\s\S]*))?$/i);
+      if (imageSlash) {
+        const rest = (imageSlash[1] ?? "").trim();
+        setInput("");
+        if (!rest) {
+          await toggleImageGen();
+          return;
         }
-        await saveMessage(userMsg.id, convId, "user", text);
-        await refreshConversations();
-      } catch (e) {
-        reportChatSaveFailure(convId, e);
+        if (!(await ensureImageGenOn())) return;
+        await sendRawImage(rest);
+        return;
       }
-      await streamImageGen(history, asstMsg.id, convId, { freshConv });
+    }
+    if (rawImagePrompt) {
+      await sendRawImage(text);
       return;
     }
     if (!model) {
@@ -2518,7 +2558,7 @@ export default function App() {
     } catch (e) {
       console.error(e);
     }
-    if (imageGen && !model) {
+    if (rawImagePrompt) {
       await streamImageGen(history, newAsst.id, conversationId, { freshConv: false });
     } else {
       await streamAssistant(history, newAsst.id, conversationId, { freshConv: false });
@@ -2546,7 +2586,7 @@ export default function App() {
     } catch (e) {
       console.error(e);
     }
-    if (imageGen && !model) {
+    if (rawImagePrompt) {
       await streamImageGen(history, asstMsg.id, conversationId, { freshConv: false });
     } else {
       await streamAssistant(history, asstMsg.id, conversationId, { freshConv: false });
@@ -2707,6 +2747,17 @@ export default function App() {
       label: imageGen ? t("cmdkImageOff") : t("cmdkImageOn"),
       keywords: "image gen generate z-image 图像 生成",
       run: () => void toggleImageGen(),
+    },
+    {
+      id: "imagegen-direct",
+      label: imageGenDirect ? t("cmdkImageAsk") : t("cmdkImageDirect"),
+      keywords: "image gen prompt direct 图像 提示词",
+      run: () => {
+        void (async () => {
+          if (!imageGen && !(await ensureImageGenOn())) return;
+          setImageGenDirect((v) => !v);
+        })();
+      },
     },
     {
       id: "models-dir",
@@ -3559,7 +3610,24 @@ export default function App() {
                     <circle cx="9" cy="10" r="1.4" />
                     <path d="M8 16l2.5-3 2 2.2L16 11l4 5H4z" />
                   </svg>
-                  {t("imageGenChip")}
+                  <button
+                    type="button"
+                    className="mode-chip-toggle"
+                    disabled={!model}
+                    title={
+                      !model
+                        ? t("toolImageDirect")
+                        : rawImagePrompt
+                          ? t("toolImageAsk")
+                          : t("toolImageDirect")
+                    }
+                    onClick={() => {
+                      if (!model) return;
+                      setImageGenDirect((v) => !v);
+                    }}
+                  >
+                    {rawImagePrompt ? t("imageGenChipDirect") : t("imageGenChip")}
+                  </button>
                   {imageGenBusy && <span className="mode-chip-busy">{imageGenBusy}</span>}
                   <button
                     className="mode-chip-x"
@@ -3748,18 +3816,53 @@ export default function App() {
                       </span>
                     </button>
                     )}
-                    <button
-                      className={`tool-item ${imageGen ? "on" : ""}`}
-                      onClick={() => void toggleImageGen()}
-                    >
-                      <svg className="ti-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
-                        <rect x="4" y="5" width="16" height="14" rx="2" />
-                        <circle cx="9" cy="10" r="1.4" />
-                        <path d="M8 16l2.5-3 2 2.2L16 11l4 5H4z" />
-                      </svg>
-                      <span className="ti-label">{t("toolImage")}</span>
-                      <span className="ti-check">{imageGen ? <Icon name="check" size={12} strokeWidth={2.4} /> : ""}</span>
-                    </button>
+                    <div className="tool-group">
+                      <button
+                        className={`tool-item tool-parent ${imageGen ? "on" : ""}`}
+                        onClick={() => void toggleImageGen()}
+                      >
+                        <svg className="ti-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
+                          <rect x="4" y="5" width="16" height="14" rx="2" />
+                          <circle cx="9" cy="10" r="1.4" />
+                          <path d="M8 16l2.5-3 2 2.2L16 11l4 5H4z" />
+                        </svg>
+                        <span className="ti-label">{t("toolImage")}</span>
+                        <span className="ti-check">{imageGen ? <Icon name="check" size={12} strokeWidth={2.4} /> : ""}</span>
+                        <span className="ti-caret">›</span>
+                      </button>
+                      <div className="tool-submenu">
+                        <button
+                          className={`tool-item ${imageGen && !rawImagePrompt ? "on" : ""}`}
+                          disabled={!model}
+                          title={!model ? t("loadToStart") : undefined}
+                          onClick={() => {
+                            void (async () => {
+                              if (!(await ensureImageGenOn())) return;
+                              setImageGenDirect(false);
+                            })();
+                          }}
+                        >
+                          <span className="ti-label">{t("toolImageAsk")}</span>
+                          <span className="ti-check">
+                            {imageGen && !rawImagePrompt ? <Icon name="check" size={12} strokeWidth={2.4} /> : ""}
+                          </span>
+                        </button>
+                        <button
+                          className={`tool-item ${rawImagePrompt ? "on" : ""}`}
+                          onClick={() => {
+                            void (async () => {
+                              if (!(await ensureImageGenOn())) return;
+                              setImageGenDirect(true);
+                            })();
+                          }}
+                        >
+                          <span className="ti-label">{t("toolImageDirect")}</span>
+                          <span className="ti-check">
+                            {rawImagePrompt ? <Icon name="check" size={12} strokeWidth={2.4} /> : ""}
+                          </span>
+                        </button>
+                      </div>
+                    </div>
                     <button
                       className={`tool-item ${webDesign ? "on" : ""}`}
                       onClick={() => {
@@ -3825,9 +3928,9 @@ export default function App() {
                 onKeyDown={onKeyDown}
                 placeholder={
                   imageGen
-                    ? model
-                      ? t("inputPhImageTool")
-                      : t("inputPhImage")
+                    ? rawImagePrompt
+                      ? t("inputPhImage")
+                      : t("inputPhImageTool")
                     : !model
                       ? t("inputPhNoModel")
                       : webDesign

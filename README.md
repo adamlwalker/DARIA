@@ -135,7 +135,7 @@ Text-only models keep the OCR path, so nothing regresses — and updating from a
 
 ## On-device image generation (Apple Silicon)
 
-Turn on **Image gen** in the chat tools menu (or `/imagegen`). With a chat model loaded, ask in plain language — the model writes a Z-Image-Turbo prompt and calls the generator. Without a model, your message is the prompt itself. Click the image to open it full-size in Preview. The **seed** is shown under the picture; click it to copy and reuse it for the next generate.
+Turn on **Image gen** in the chat tools menu (or `/imagegen`). Two ways to prompt: **Ask the model** (plain language; the chat model writes the Z-Image-Turbo prompt) or **I write the prompt** (your message goes straight to the generator). Hover Image gen in the tools menu to pick, or click the chip. `/image a red cube on marble` always sends your text as the prompt. Click the image to open it full-size in Preview. The **seed** is shown under the picture; click it to copy and reuse it for the next generate.
 
 - **Z-Image-Turbo** via a local **MLX** sidecar ([mflux](https://pypi.org/project/mflux/)). Generation stays on the Mac.
 - **Lazy load** — the sidecar never starts with the app. Weights load on the first generate, and turning Image gen off kills the process so the memory comes back.
